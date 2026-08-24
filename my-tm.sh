@@ -18,6 +18,7 @@ MY_TM_VERSION="0.9.1"
 #############################################################################
 
 AUTODETECT_LOCAL_TM_BACKUPS=1
+AUTO_MOUNT_DESTINATIONS=1
 DEFAULT_CMD="--status"
 TM_GROUP=""
 CACHE_DIR="/var/lib/my-tm"
@@ -90,6 +91,9 @@ EXIT_RC=0
 ## variable set there dies with it -- leaving the snapshot mounted, which is
 ## exactly what blocks Time Machine's thinning.
 TRANSIENT_LIST="${TMPDIR:-/tmp}/.my-tm.transient.$$"
+## Volumes WE mounted, to be put back exactly as they were. A file for the
+## same reason as above: every caller reaches this through a subshell.
+TRANSIENT_VOLUMES="${TMPDIR:-/tmp}/.my-tm.volumes.$$"
 
 #############################################################################
 ## OUTPUT
@@ -160,6 +164,9 @@ _default_config_content() {
 # Locations live in $CACHE_DIR/locations.tsv, maintained by --add / --forget --
 # not in this file.
 AUTODETECT_LOCAL_TM_BACKUPS=1   # also pick up destinations tmutil reports
+AUTO_MOUNT_DESTINATIONS=1       # a destination that is attached but not
+                                # mounted is invisible to every read; mount
+                                # it, use it, and put it back as it was
 DEFAULT_CMD="--status"          # what a bare `my-tm` runs; params allowed
 TM_GROUP=""                     # group with read access to the shared cache;
                                 # "" = the invoking user's primary group
@@ -337,7 +344,7 @@ human_bytes() {
 		split("B K M G T P", u, " ");
 		i = 1;
 		while (b >= 1024 && i < 6) { b /= 1024; i++ }
-		if (i == 1)      printf "%d\n", b;
+		if (i == 1)      printf "%dB\n", b;
 		else if (b < 10) printf "%.2f%s\n", b, u[i];
 		else             printf "%.1f%s\n", b, u[i];
 	}'
@@ -932,7 +939,7 @@ snapshots_all() {
 	_locs=$(locations_all | awk -F'\t' '{print $1}')
 	while IFS= read -r _h; do
 		[ -n "$_h" ] || continue
-		loc_reachable "$_h" || continue
+		loc_ready "$_h" || continue
 		snapshots_get "$_h"
 	done <<_EOF
 $_locs
@@ -1057,6 +1064,66 @@ mount_table_find_snapshot() {
 
 mount_table_has() {
 	mount | awk -v p="$1" 'index($0, " on " p " (") > 0 { f = 1 } END { exit(f ? 0 : 1) }'
+}
+
+## mounted | unmounted | absent -- the three states a destination volume can
+## be in, which need three different things said about them
+volume_state() {
+	_i=$(diskutil info "$1" 2>/dev/null)
+	if [ -z "$_i" ] || printf '%s' "$_i" | grep -q "Could not find disk"; then
+		printf 'absent\n'
+	elif printf '%s' "$_i" | grep -qE '^ *Mounted: *Yes'; then
+		printf 'mounted\n'
+	else
+		printf 'unmounted\n'
+	fi
+	return 0
+}
+
+## Make a location readable if that is cheaply possible. A destination that
+## is attached but not mounted is invisible to every read in here, and the
+## answer "no backups" would be a lie. Mount it, and remember that WE did,
+## so it goes back exactly as it was found.
+loc_open() {
+	_h="$1"
+	_t=$(loc_target "$_h")
+	case "$_t" in local) return 0 ;; esac
+	is_remote_target "$_t" && return 0
+	[ -d "$_t" ] && return 0
+	[ "${AUTO_MOUNT_DESTINATIONS:-1}" = "1" ] || return 1
+	_name=$(basename "$_t")
+	[ "$(volume_state "$_name")" = "unmounted" ] || return 1
+	msg "'$_name' is attached but not mounted -- mounting it"
+	why "and unmounting it again when this command is done, so it is left as it was found"
+	if ! run diskutil mount "$_name" >/dev/null 2>&1; then
+		warn "could not mount $_name -- it will not be searched"
+		return 1
+	fi
+	printf '%s\n' "$_name" >>"$TRANSIENT_VOLUMES"
+	return 0
+}
+
+## usable now? -- opening it first if that is what it takes
+loc_ready() {
+	loc_open "$1" >&2
+	loc_reachable "$1"
+}
+
+## Put back only what we mounted; anything already mounted is left alone.
+## Runs AFTER the snapshot mounts are released -- a volume with a snapshot
+## still mounted inside it is busy.
+cleanup_volumes() {
+	[ -f "$TRANSIENT_VOLUMES" ] || return 0
+	while IFS= read -r _v; do
+		[ -n "$_v" ] || continue
+		if run diskutil unmount "$_v" >/dev/null 2>&1; then
+			dbg "unmounted $_v again, as it was found"
+		else
+			warn "could not unmount $_v again -- it was not mounted before this ran"
+		fi
+	done <"$TRANSIENT_VOLUMES"
+	rm -f "$TRANSIENT_VOLUMES"
+	return 0
 }
 
 ## the sweep never acts on a record alone: the live mount table must confirm a
@@ -1189,9 +1256,10 @@ cleanup_transient() {
 	return $_rc
 }
 
-trap 'cleanup_transient' EXIT
-trap 'cleanup_transient; exit 130' INT
-trap 'cleanup_transient; exit 143' TERM
+cleanup_all() { cleanup_transient; cleanup_volumes; }
+trap 'cleanup_all' EXIT
+trap 'cleanup_all; exit 130' INT
+trap 'cleanup_all; exit 143' TERM
 
 ## transient_snapshot <loc> <ts> -- echo the mountpoint, release it at exit.
 ## Safe to call from inside $(...): the list it appends to is a file.
@@ -1375,7 +1443,7 @@ tm_refresh() {
 	[ -n "$_locs" ] || _locs=$(locations_all | awk -F'\t' '{print $1}')
 	while IFS= read -r _h; do
 		[ -n "$_h" ] || continue
-		loc_reachable "$_h" || continue
+		loc_ready "$_h" || continue
 		dbg "refreshing tree for $_h"
 		tm_refresh_loc "$_h"
 	done <<_EOF
@@ -1533,6 +1601,16 @@ cmd_status() {
 	_locs=$(locations_all)
 	[ -n "$_locs" ] || { note "no locations. Add one: $US --add <FOLDER> [<HANDLE>]"; return 0; }
 
+	## Open every store BEFORE the table starts: mounting one prints a line, and
+	## a line printed between the header and a row splits the table in half.
+	while IFS="$(printf '\t')" read -r _h _t _idir; do
+		[ -n "${_h:-}" ] || continue
+		[ -n "$_only" ] && [ "$_h" != "$_only" ] && continue
+		loc_open "$_h" || true
+	done <<_EOF
+$_locs
+_EOF
+
 	## the LOC column is as wide as the widest handle: truncating a handle would
 	## make the one word the reader has to type back unusable
 	_w=$(printf '%s\n' "$_locs" | awk -F'\t' '{if (length($1) > m) m = length($1)} END {print (m < 3 ? 3 : m)}')
@@ -1547,7 +1625,7 @@ cmd_status() {
 		[ "$_t" = "local" ] && _dest="/ + /System/Volumes/Data"
 		_snaps="-"; _span="-"; _last="-"; _space="-"; _mark=""
 
-		if loc_reachable "$_h"; then
+		if loc_ready "$_h"; then
 			_rows=$(snapshots_get "$_h")
 		else
 			## not attached (ejected, unplugged, network destination): show the
@@ -1622,7 +1700,7 @@ json_ls() {
 	_first=1
 	while IFS= read -r _h; do
 		[ -n "$_h" ] || continue
-		loc_reachable "$_h" || continue
+		loc_ready "$_h" || continue
 		_rows=$(snapshots_get "$_h")
 		[ -n "$_rows" ] || continue
 		printf '%s\n' "$_rows" | sort -t"$(printf '\t')" -k3,3nr |
@@ -1658,7 +1736,7 @@ cmd_ls() {
 	while IFS= read -r _h; do
 		[ -n "$_h" ] || continue
 		_detached=0
-		if loc_reachable "$_h"; then
+		if loc_ready "$_h"; then
 			_rows=$(snapshots_get "$_h")
 		else
 			## the disk is away: the last known table is still worth showing
@@ -1751,7 +1829,7 @@ locs_covering_path() {
 	_locs=$(locations_all | awk -F'\t' '{print $1}')
 	while IFS= read -r _h; do
 		[ -n "$_h" ] || continue
-		loc_reachable "$_h" || continue
+		loc_ready "$_h" || continue
 		loc_is_remote "$_h" && continue
 		if [ "$(loc_target "$_h")" = "local" ]; then
 			[ "$_uuid" = "$(vol_uuid /System/Volumes/Data)" ] && { printf '%s\n' "$_h"; _any=1; }
@@ -2550,15 +2628,41 @@ cmd_verify() {
 	[ "${_vol:--}" = "-" ] && _vol="Data"
 	transient_snapshot "$_loc" "$_ts" >/dev/null || err "could not mount"
 	_base=$(mnt_volume_path "$_loc" "$_ts" "$_vol")
+	## tmutil verifychecksums says NOTHING when everything is fine, which is
+	## indistinguishable from "the check never ran". Report the outcome.
+	_probs=0; _checked=0
 	if [ "$#" -eq 0 ]; then
 		note "verifying the whole snapshot is slow; a directory or one file is quick"
-		run tmutil verifychecksums "$_base"
+		set -- "$_base"
+		_whole=1
 	else
-		for _p in "$@"; do
-			run tmutil verifychecksums "$_base$(path_in_volume "$(abs_path "$_p")")"
-		done
+		_whole=0
 	fi
-	return 0
+	for _p in "$@"; do
+		if [ "$_whole" = "1" ]; then _t="$_p"; else
+			_t="$_base$(path_in_volume "$(abs_path "$_p")")"
+		fi
+		if [ ! -e "$_t" ]; then
+			warn "not in that snapshot: $_p"
+			continue
+		fi
+		_checked=$(( _checked + 1 ))
+		run_echo tmutil verifychecksums "$_t"
+		_out=$(tmutil verifychecksums "$_t" 2>&1)
+		if [ -n "$_out" ]; then
+			printf '%s\n' "$_out"
+			_n=$(printf '%s\n' "$_out" | count_lines)
+			_probs=$(( _probs + _n ))
+		fi
+	done
+	if [ "$_checked" -eq 0 ]; then
+		note "nothing was checked"
+	elif [ "$_probs" -eq 0 ]; then
+		note "$_checked path(s) verified against the checksums stored at backup time: no problems"
+	else
+		note "$_probs problem(s) reported -- ! is a mismatch, ? an unusable stored checksum"
+	fi
+	[ "$_probs" -eq 0 ]
 }
 
 #############################################################################
@@ -2677,7 +2781,7 @@ _EOF
 	## local snapshots present at all?
 	_lsn=$(tmutil listlocalsnapshots /System/Volumes/Data 2>/dev/null | count_match 'com.apple')
 	[ "$_lsn" -eq 0 ] &&
-		health_say warn "no local APFS snapshots -- the only history that works with the backup disk detached"
+		health_say warn "no local APFS snapshots -- the only history that works with no backup disk attached"
 
 	## paths that MUST be backed up
 	if [ -n "$HEALTH_WATCH_PATHS" ]; then
@@ -2907,7 +3011,7 @@ cmd_thin() {
 
 	while IFS= read -r _h; do
 		[ -n "$_h" ] || continue
-		loc_reachable "$_h" || continue
+		loc_ready "$_h" || continue
 		## CLI beats per-location beats global
 		_p="$_policy"
 		if [ -z "$_p" ]; then
@@ -3435,7 +3539,7 @@ cmd_maintenance() {
 	_locs=$(locations_all | awk -F'\t' '{print $1}')
 	while IFS= read -r _h; do
 		[ -n "$_h" ] || continue
-		loc_reachable "$_h" || continue
+		loc_ready "$_h" || continue
 		_t=$(loc_target "$_h")
 		_stamp="$(cache_write_dir)/.manifest.$_h"
 		_m=0
@@ -3974,6 +4078,7 @@ case "\$1" in
   destinationinfo) printf '====================================================\nName          : TestStore\nKind          : Local\nMount Point   : $T_ROOT/store\nID            : 11111111-2222-3333-4444-555555555555\n====================================================\nName          : EjectedStore\nKind          : Local\nID            : 99999999-8888-7777-6666-555555555555\n' ;;
   listlocalsnapshots) printf 'Snapshots for disk %s:\ncom.apple.TimeMachine.2026-08-23-005931.local\ncom.apple.TimeMachine.2026-08-23-020001.local\n' "\$2" ;;
   uniquesize) printf '12345678 %s\n' "\$2" ;;
+  verifychecksums) case "\$2" in *BADSUM*) printf '! %s\n' "\$2" ;; esac ;;
   status) printf 'Backup session status:\n{\n    Running = 0;\n}\n' ;;
   isexcluded) printf '[Included]    %s\n' "\$2" ;;
   *) : ;;
@@ -3983,6 +4088,17 @@ _EOF
 	cat >"$_s/diskutil" <<_EOF
 #!/bin/sh
 printf 'diskutil %s\n' "\$*" >>"$(t_calls)"
+case "\$1" in
+  mount|unmount) exit 0 ;;
+esac
+if [ "\$1" = "info" ] && [ "\$2" != "-plist" ]; then
+  case "\$2" in
+    UnmountedStore) printf '   Volume Name: UnmountedStore\n   Mounted: No\n' ;;
+    MountedStore)   printf '   Volume Name: MountedStore\n   Mounted: Yes\n' ;;
+    *)              printf 'Could not find disk: %s\n' "\$2" ;;
+  esac
+  exit 0
+fi
 case "\$1 \$2" in
   "info -plist")
     printf '<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict><key>DeviceIdentifier</key><string>disk9s1</string><key>VolumeUUID</key><string>AAAABBBB-CCCC-DDDD-EEEE-FFFF00001111</string></dict></plist>\n' ;;
@@ -4640,6 +4756,93 @@ t_test_local_list_never_cached() {
 	t_match "while the live ones still are" "$_rows" "2026-08-23"
 }
 
+## REGRESSION: a destination that is attached but NOT mounted was skipped in
+## silence, so my-tm answered "no backups" about a disk that was sitting right
+## there. It is mounted, used, and put back exactly as it was found -- and
+## anything that was already mounted is never touched.
+t_test_auto_mount_destinations() {
+	printf '\nAttached but unmounted destinations\n'
+	_saved="$AUTO_MOUNT_DESTINATIONS"
+	_savedv="$TRANSIENT_VOLUMES"
+	TRANSIENT_VOLUMES="$T_ROOT/volumes.list"
+	rm -f "$TRANSIENT_VOLUMES"
+
+	t_eq "an unmounted volume is recognised" "$(volume_state UnmountedStore)" "unmounted"
+	t_eq "a mounted one is recognised"       "$(volume_state MountedStore)"   "mounted"
+	t_eq "an absent one is recognised"       "$(volume_state NoSuchThing)"    "absent"
+
+	## a location pointing at a volume that is attached but not mounted
+	printf 'unmounted\t/Volumes/UnmountedStore\t\n' >>"$T_ROOT/cache/locations.tsv"
+	AUTO_MOUNT_DESTINATIONS=1
+	: >"$(t_calls)"
+	loc_open unmounted >/dev/null 2>&1
+	t_eq "it is mounted" "$(count_match 'diskutil mount UnmountedStore' < "$(t_calls)")" "1"
+	t_eq "and remembered as ours to put back" \
+		"$(count_match 'UnmountedStore' < "$TRANSIENT_VOLUMES")" "1"
+
+	: >"$(t_calls)"
+	cleanup_volumes >/dev/null 2>&1
+	t_eq "and unmounted again when the command is done" \
+		"$(count_match 'diskutil unmount UnmountedStore' < "$(t_calls)")" "1"
+	t_eq "the list is cleared" "$([ -f "$TRANSIENT_VOLUMES" ] && echo left || echo gone)" "gone"
+
+	## the important half: what we did NOT mount, we must NOT unmount
+	printf 'alreadyup\t/Volumes/MountedStore\t\n' >>"$T_ROOT/cache/locations.tsv"
+	: >"$(t_calls)"
+	loc_open alreadyup >/dev/null 2>&1
+	t_eq "an already-mounted destination is not touched" \
+		"$(count_match 'diskutil mount' < "$(t_calls)")" "0"
+	t_eq "and never recorded for unmounting" \
+		"$([ -f "$TRANSIENT_VOLUMES" ] && echo recorded || echo clean)" "clean"
+
+	## and it stays off when it is switched off
+	AUTO_MOUNT_DESTINATIONS=0
+	: >"$(t_calls)"
+	loc_open unmounted >/dev/null 2>&1
+	t_eq "AUTO_MOUNT_DESTINATIONS=0 mounts nothing" \
+		"$(count_match 'diskutil mount' < "$(t_calls)")" "0"
+
+	grep -vE '^(unmounted|alreadyup)\t' "$T_ROOT/cache/locations.tsv" \
+		>"$T_ROOT/cache/l.tmp" && mv "$T_ROOT/cache/l.tmp" "$T_ROOT/cache/locations.tsv"
+	rm -f "$TRANSIENT_VOLUMES"
+	AUTO_MOUNT_DESTINATIONS="$_saved"
+	TRANSIENT_VOLUMES="$_savedv"
+}
+
+## REGRESSION: tmutil verifychecksums prints nothing when a file is intact, so
+## --verify used to produce no output whatsoever -- a clean bill of health and
+## a check that never ran looked exactly alike.
+t_test_verify_reports() {
+	printf '\nChecksum verification always reports\n'
+	_f="$T_ROOT/vfy_good.txt"; : >"$_f"
+	_out=$( ( cmd_verify_report_probe "$_f" ) 2>&1 )
+	t_match "a clean verify says so" "$_out" "no problems"
+	_bad="$T_ROOT/BADSUM.txt"; : >"$_bad"
+	_out=$( ( cmd_verify_report_probe "$_bad" ) 2>&1 )
+	t_match "a problem is surfaced" "$_out" "problem"
+	t_match "and the offending line is shown" "$_out" "!"
+}
+
+## the reporting half of --verify, without needing a real snapshot to mount
+cmd_verify_report_probe() {
+	_probs=0; _checked=0
+	for _p in "$@"; do
+		[ -e "$_p" ] || continue
+		_checked=$(( _checked + 1 ))
+		_out=$(tmutil verifychecksums "$_p" 2>&1)
+		if [ -n "$_out" ]; then
+			printf '%s\n' "$_out"
+			_probs=$(( _probs + $(printf '%s\n' "$_out" | count_lines) ))
+		fi
+	done
+	if [ "$_probs" -eq 0 ]; then
+		note "$_checked path(s) verified against the checksums stored at backup time: no problems"
+	else
+		note "$_probs problem(s) reported -- ! is a mismatch, ? an unusable stored checksum"
+	fi
+	return 0
+}
+
 run_tests() {
 	T_WITH_SNAPSHOTS=0
 	for _a in "$@"; do
@@ -4670,6 +4873,8 @@ run_tests() {
 	t_test_help
 	t_test_paths
 	t_test_ejected_destination
+	t_test_auto_mount_destinations
+	t_test_verify_reports
 	t_test_volume_paths
 	t_test_mount_root_fallback
 	t_test_version_store_generation
