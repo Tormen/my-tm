@@ -11,7 +11,7 @@
 set -u
 
 US="${0##*/}"
-MY_TM_VERSION="0.9"
+MY_TM_VERSION="0.9.1"
 
 #############################################################################
 ## DEFAULTS -- all neutral.  Site values belong in the config file, never here.
@@ -67,6 +67,14 @@ TRANSIENT_TTL=900
 ## how many snapshots --lookup holds mounted at once.  Bounded on purpose: each
 ## mount pins its snapshot against thinning, and releasing one is not free.
 LOOKUP_CHUNK=16
+
+## Version-store generation.  Snapshots are immutable, so a recorded stat is
+## a permanent fact -- but only if my-tm looked in the RIGHT PLACE. A bug in
+## path resolution once recorded "absent" for files that were plainly there,
+## and "permanent fact" then means "permanently wrong". Bump this whenever
+## anything about how a path inside a snapshot is resolved changes: rows from
+## an older generation are discarded rather than trusted.
+VS_GENERATION=2
 
 #############################################################################
 ## RUNTIME STATE (never in the config)
@@ -501,6 +509,21 @@ cache_write_dir() {
 	fi
 }
 
+## Where mounts really go.  $MOUNT_ROOT is the shared location --install
+## creates; an ordinary user who has never run --install cannot create it,
+## and must still be able to mount a snapshot, so fall back to their own
+## overlay.  Resolved once at startup, so every later use agrees.
+mount_root_resolve() {
+	if [ -d "$MOUNT_ROOT" ] && [ -w "$MOUNT_ROOT" ]; then
+		printf '%s\n' "$MOUNT_ROOT"
+	elif [ ! -e "$MOUNT_ROOT" ] && mkdir -p "$MOUNT_ROOT" 2>/dev/null; then
+		printf '%s\n' "$MOUNT_ROOT"
+	else
+		printf '%s/mount\n' "$CACHE_DIR_USER"
+	fi
+	return 0
+}
+
 ## every dir a reader must consult, shared first
 cache_read_dirs() {
 	[ -d "$CACHE_DIR" ] && printf '%s\n' "$CACHE_DIR"
@@ -528,12 +551,20 @@ locations_registered() {
 
 ## tmutil's own destinations -> handle <TAB> mountpoint <TAB> "" <TAB> uuid
 destinations_scan() {
+	## A destination with NO "Mount Point:" line is ejected or otherwise not
+	## attached. tmutil still knows it, and it MUST still be listed: dropping it
+	## would hide exactly the case --status exists for -- a disk that has not
+	## been backed up to for days. Its conventional path stands in as the label
+	## while it is away; nothing reads that path until it is really mounted.
 	tmutil destinationinfo 2>/dev/null | awk '
 		/^Name +:/        { sub(/^[^:]*: */, ""); name = $0 }
 		/^Kind +:/        { sub(/^[^:]*: */, ""); kind = $0 }
 		/^Mount Point +:/ { sub(/^[^:]*: */, ""); mp   = $0 }
 		/^ID +:/          { sub(/^[^:]*: */, ""); id   = $0;
-		                    if (mp != "") printf "%s\t%s\t%s\t%s\n", name, mp, id, kind;
+		                    if (name != "") {
+		                        if (mp == "") mp = "/Volumes/" name;
+		                        printf "%s\t%s\t%s\t%s\n", name, mp, id, kind;
+		                    }
 		                    name = ""; kind = ""; mp = ""; id = "" }
 	'
 }
@@ -854,6 +885,9 @@ snapshots_get() {
 		_age=$(( $(now_epoch) - $(stat -f '%m' "$_cf" 2>/dev/null || echo 0) ))
 		[ "$_age" -lt "$CACHE_TTL" ] && _fresh=1
 	fi
+	## Local snapshots are purgeable and churn constantly, and listing them is
+	## one cheap call -- caching that list only ever produces wrong answers.
+	[ "$(loc_target "$_h")" = "local" ] && _fresh=0
 	if [ "$_fresh" = "1" ]; then
 		_cached=$(awk -F'\t' -v l="$_h" '$1 == l' "$_cf" 2>/dev/null)
 		if [ -n "$_cached" ]; then
@@ -879,6 +913,17 @@ snapshots_cache_put() {
 		[ -n "$_old" ] && printf '%s\n' "$_old"
 		printf '%s\n' "$_rows"
 	} | atomic_write "$_cf" 2>/dev/null || dbg "snapshots cache not writable: $_cf"
+	return 0
+}
+
+## Rows straight from the cache, never scanning: what --status and --ls fall
+## back to when the disk is not attached. A location that has gone away must
+## still report its last known state -- that is the whole point of --status.
+snapshots_cached_only() {
+	for _d in $(cache_read_dirs); do
+		[ -f "$_d/snapshots.cache" ] || continue
+		awk -F'\t' -v l="$1" '$1 == l' "$_d/snapshots.cache" 2>/dev/null
+	done
 	return 0
 }
 
@@ -966,15 +1011,48 @@ snapshot_gone() {
 mnt_private_root() { printf '%s/.mnt\n' "$MOUNT_ROOT"; }
 mnt_point_for()    { printf '%s/.mnt/%s/%s\n' "$MOUNT_ROOT" "$1" "$2"; }
 
-## where the volume actually sits inside a mounted snapshot
-mnt_volume_path() {
-	_loc="$1"; _ts="$2"; _vol="$3"
-	_m=$(mnt_point_for "$_loc" "$_ts")
-	if [ "$(loc_target "$_loc")" = "local" ]; then
-		printf '%s/%s\n' "$_m" "$_vol"
+## Given where a snapshot IS mounted, the directory holding the volume files.
+## A backup-store snapshot carries an inner <ts>.backup/<vol> wrapper; a local
+## one is the volume root itself, so its mountpoint already ends in the volume
+## name -- ours by construction, and macOS's own by its layout.
+snap_volume_root_at() {
+	_mp="$1"; _l="$2"; _t="$3"; _v="$4"
+	if [ "$(loc_target "$_l")" = "local" ]; then
+		case "$_mp" in
+			*/"$_v") printf '%s\n' "$_mp" ;;
+			*)       printf '%s/%s\n' "$_mp" "$_v" ;;
+		esac
 	else
-		printf '%s/%s.backup/%s\n' "$_m" "$_ts" "$_vol"
+		printf '%s/%s.backup/%s\n' "$_mp" "$_t" "$_v"
 	fi
+	return 0
+}
+
+## Where WE would put it -- the stable path the /tm tree points at, whether or
+## not anything is mounted right now.
+mnt_volume_path_expected() {
+	snap_volume_root_at "$(mnt_point_for "$1" "$2")" "$1" "$2" "$3"
+}
+
+## Where the files can be read RIGHT NOW: a snapshot macOS has already mounted
+## somewhere of its own accord is read there, because a second mount_apfs of
+## the same snapshot fails with "Resource busy".
+mnt_volume_path() {
+	_live=$(mount_table_find_snapshot "$(snap_apfs_name "$1" "$2")")
+	if [ -n "$_live" ]; then
+		snap_volume_root_at "$_live" "$1" "$2" "$3"
+	else
+		mnt_volume_path_expected "$1" "$2" "$3"
+	fi
+	return 0
+}
+
+## Where a given APFS snapshot is mounted, if it is mounted at all (anywhere).
+mount_table_find_snapshot() {
+	mount | awk -v s="$1@" 'index($0, s) == 1 && !f {
+			i = index($0, " on "); r = substr($0, i + 4);
+			j = index(r, " ("); print substr(r, 1, j - 1); f = 1
+		}'
 }
 
 mount_table_has() {
@@ -1034,10 +1112,29 @@ snap_mount() {
 	_apfs=$(snap_apfs_name "$_loc" "$_ts")
 	_id=$(snap_id "$(loc_uuid "$_loc")" "$_ts")
 
+	## A local snapshot IS the volume root, so it must be mounted at the path
+	## that root is expected at -- mounting one level up would put every file
+	## one directory away from where every reader looks for it.
+	if [ -z "${5:-}" ] && [ "$(loc_target "$_loc")" = "local" ]; then
+		_mp=$(snap_volume_root_at "$_mp" "$_loc" "$_ts" "Data")
+	fi
+
 	if mount_table_has "$_mp"; then
 		dbg "already mounted: $_mp"
 		mount_record_add "$_id" "$_loc" "$_mp" "$_ttl" "$_flags"
 		printf '%s\n' "$_mp"
+		return 0
+	fi
+
+	## Already mounted elsewhere -- macOS mounts local snapshots under
+	## /Volumes/com.apple.TimeMachine.localsnapshots/ for its own purposes, and
+	## a second mount_apfs of the same snapshot fails with "Resource busy".
+	## Use what is there, and never record it as ours: unmounting a mount we
+	## did not make is not our business.
+	_foreign=$(mount_table_find_snapshot "$_apfs")
+	if [ -n "$_foreign" ]; then
+		dbg "$_apfs is already mounted by the system at $_foreign -- reusing it"
+		printf '%s\n' "$_foreign"
 		return 0
 	fi
 	need_dir "$_mp" || { warn "cannot create mountpoint: $_mp"; return 1; }
@@ -1047,7 +1144,15 @@ snap_mount() {
 		printf '%s\n' "$_mp"
 		return 0
 	fi
-	warn "mount failed: $_apfs on $_vol_src"
+	if [ "$(loc_target "$_loc")" = "local" ] &&
+	   ! tmutil listlocalsnapshots /System/Volumes/Data 2>/dev/null |
+	       grep -q "$_apfs"; then
+		## local snapshots are purgeable: macOS deletes them under space
+		## pressure at any age, so a list read a minute ago can already be wrong
+		warn "$(ts_display "$_ts"): purged by macOS since the list was read"
+	else
+		warn "mount failed: $_apfs on $_vol_src"
+	fi
 	rmdir "$_mp" 2>/dev/null
 	return 1
 }
@@ -1250,7 +1355,7 @@ tm_refresh_loc() {
 		[ "${_vol:-}" = "-" ] && _vol="Data"
 		[ -n "${_vol:-}" ] || _vol="Data"
 		need_dir "$_base/$_ts" || continue
-		_target=$(mnt_volume_path "$_l" "$_ts" "$_vol")
+		_target=$(mnt_volume_path_expected "$_l" "$_ts" "$_vol")
 		if [ ! -L "$_base/$_ts/$_vol" ]; then
 			rm -rf "${_base:?}/${_ts:?}/${_vol:?}" 2>/dev/null
 			ln -s "$_target" "$_base/$_ts/$_vol" 2>/dev/null
@@ -1314,8 +1419,23 @@ _EOF
 
 vs_file() { printf '%s/index/versions.tsv\n' "$(cache_write_dir)"; }
 
+## Discard a store written by a different generation of the path logic.
+vs_check_generation() {
+	for _d in $(cache_read_dirs); do
+		[ -f "$_d/index/versions.tsv" ] || continue
+		_g=""
+		[ -f "$_d/index/versions.gen" ] && _g=$(cat "$_d/index/versions.gen" 2>/dev/null)
+		[ "$_g" = "$VS_GENERATION" ] && continue
+		dbg "version store in $_d was written by generation ${_g:-0}, not $VS_GENERATION -- discarding it"
+		rm -f "$_d/index/versions.tsv" 2>/dev/null
+		printf '%s\n' "$VS_GENERATION" >"$_d/index/versions.gen" 2>/dev/null || true
+	done
+	return 0
+}
+
 vs_lookup() {
 	_loc="$1"; _ts="$2"; _p="$3"
+	vs_check_generation
 	for _d in $(cache_read_dirs); do
 		_f="$_d/index/versions.tsv"
 		[ -f "$_f" ] || continue
@@ -1329,6 +1449,7 @@ vs_lookup() {
 ## vs_put reads rows from stdin: ts <TAB> path <TAB> inode <TAB> size <TAB> mtime
 vs_put() {
 	_loc="$1"
+	vs_check_generation
 	_f=$(vs_file)
 	need_dir "$(dirname "$_f")" || return 1
 	_new=$(mktemp /tmp/my-tm.vs.XXXXXX) || return 1
@@ -1337,6 +1458,7 @@ vs_put() {
 		[ -f "$_f" ] && cat "$_f"
 		cat "$_new"
 	} | sort -u | atomic_write "$_f" 2>/dev/null || dbg "version store not writable: $_f"
+	printf '%s\n' "$VS_GENERATION" >"$(dirname "$_f")/versions.gen" 2>/dev/null || true
 	rm -f "$_new"
 	return 0
 }
@@ -1427,23 +1549,28 @@ cmd_status() {
 
 		if loc_reachable "$_h"; then
 			_rows=$(snapshots_get "$_h")
-			if [ -n "$_rows" ]; then
-				_snaps=$(printf '%s\n' "$_rows" | count_lines)
-				_first=$(printf '%s\n' "$_rows" | sort -t"$(printf '\t')" -k3,3n | head -n 1 | awk -F'\t' '{print $2}')
-				_lastts=$(printf '%s\n' "$_rows" | sort -t"$(printf '\t')" -k3,3n | tail -n 1 | awk -F'\t' '{print $2}')
-				_lastep=$(printf '%s\n' "$_rows" | sort -t"$(printf '\t')" -k3,3n | tail -n 1 | awk -F'\t' '{print $3}')
-				_span="${_first%-*}..${_lastts%-*}"
-				_span=$(printf '%s' "$_span" | cut -c1-24)
-				[ -n "$_lastep" ] && _last=$(human_age $(( _now - _lastep )))
-			fi
-			if [ "$_t" != "local" ] && [ -d "$_t" ]; then
-				_space=$(df -k "$_t" 2>/dev/null | awk 'NR == 2 {printf "%s/%s\n", $3 * 1024, $4 * 1024}')
-				_used=$(human_bytes "${_space%%/*}")
-				_free=$(human_bytes "${_space##*/}")
-				_space="$_used/$_free"
-			fi
 		else
+			## not attached (ejected, unplugged, network destination): show the
+			## last known table marked "?", never nothing -- a disk that has not
+			## been written to for weeks is the thing --status exists to surface
 			_mark="?"
+			_rows=$(snapshots_cached_only "$_h")
+		fi
+		if [ -n "$_rows" ]; then
+			_snaps=$(printf '%s\n' "$_rows" | count_lines)
+			_sorted=$(printf '%s\n' "$_rows" | sort -t"$(printf '\t')" -k3,3n)
+			_first=$(printf '%s\n' "$_sorted" | head -n 1 | awk -F'\t' '{print $2}')
+			_lastts=$(printf '%s\n' "$_sorted" | tail -n 1 | awk -F'\t' '{print $2}')
+			_lastep=$(printf '%s\n' "$_sorted" | tail -n 1 | awk -F'\t' '{print $3}')
+			_span="${_first%-*}..${_lastts%-*}"
+			_span=$(printf '%s' "$_span" | cut -c1-24)
+			[ -n "$_lastep" ] && _last=$(human_age $(( _now - _lastep )))
+		fi
+		if [ "$_t" != "local" ] && [ -d "$_t" ]; then
+			_space=$(df -k "$_t" 2>/dev/null | awk 'NR == 2 {printf "%s/%s\n", $3 * 1024, $4 * 1024}')
+			_used=$(human_bytes "${_space%%/*}")
+			_free=$(human_bytes "${_space##*/}")
+			_space="$_used/$_free"
 		fi
 		printf " %-${_w}s %-30s %6s  %-24s %5s%1s  %s\n" \
 			"$_h" "$(printf '%s' "$_dest" | cut -c1-30)" \
@@ -1530,10 +1657,30 @@ cmd_ls() {
 	_now=$(now_epoch)
 	while IFS= read -r _h; do
 		[ -n "$_h" ] || continue
-		loc_reachable "$_h" || continue
-		_rows=$(snapshots_get "$_h")
-		[ -n "$_rows" ] || continue
+		_detached=0
+		if loc_reachable "$_h"; then
+			_rows=$(snapshots_get "$_h")
+		else
+			## the disk is away: the last known table is still worth showing
+			_rows=$(snapshots_cached_only "$_h")
+			_detached=1
+		fi
+		if [ -z "$_rows" ]; then
+			## asked about ONE location and there is nothing to show: say why.
+			## Printing nothing reads like "no backups exist", which may be the
+			## opposite of the truth -- the disk may simply be detached.
+			if [ -n "$_only" ]; then
+				if [ "$_detached" = "1" ]; then
+					note "$_h is not attached, and nothing is remembered about it yet -- attach it, then: $US --refresh $_h"
+				else
+					note "$_h has no snapshots"
+				fi
+			fi
+			continue
+		fi
 		[ -z "$_only" ] && printf '\n%s:\n' "$_h"
+		[ "$_detached" = "1" ] &&
+			note "$_h is not attached -- this is the last known table"
 
 		_max="${LIMIT:-20}"
 		[ "$OPT_ALL" = "1" ] && _max=0
@@ -1567,10 +1714,14 @@ cmd_ls() {
 					"${_vol:--}" "$_st"
 			done
 		}
+		## local snapshots carry no manifest, so there is no ADDED to average:
+		## saying "median 0" would state a measurement that was never made
+		_med=""
+		[ "$_avg" -gt 0 ] && _med=" · ADDED median $(human_bytes "$_avg")"
 		if [ "$_max" -gt 0 ] && [ "$_total" -gt "$_max" ]; then
-			note "$(( _total - _max )) more (--all) · ADDED median $(human_bytes "$_avg")"
+			note "$(( _total - _max )) more (--all)$_med"
 		else
-			note "$_total snapshots · ADDED median $(human_bytes "$_avg")"
+			note "$_total snapshots$_med"
 		fi
 	done <<_EOF
 $_locs
@@ -1717,6 +1868,12 @@ _EOF
 				fi
 			done <"$_work/todo"
 			lookup_flush "$_work" "$_h" "$_rel"
+			## could-not-read is NOT the same answer as not-there
+			_got=$(count_lines < "$_work/known")
+			_missed=$(( _nknown + _ntodo - _got ))
+			if [ "$_missed" -gt 0 ]; then
+				warn "$_missed of $_ntodo snapshots could not be read (see the errors above) -- that is not the same as the file being absent from them"
+			fi
 		fi
 
 		## collapse identical versions (inode+size+mtime), newest row per group
@@ -1876,7 +2033,19 @@ cmd_show() {
 		fi
 		printf ' %-10s %s\n' VOLUME "$_vol"
 		printf ' %-10s %s\n' STATE "${_state:-ok}"
-		printf ' %-10s %s/%s/%s/%s\n' BROWSE "$(tm_root)" "$_loc" "$_ts" "$_vol"
+		## only advertise the browsable path when it is really there: a tree
+		## that --refresh has never built is a path that does not exist
+		_browse="$(tm_root)/$_loc/$_ts/$_vol"
+		if [ -e "$_browse" ]; then
+			printf ' %-10s %s\n' BROWSE "$_browse"
+		elif [ -L "$_browse" ] || [ -d "$(dirname "$_browse")" ]; then
+			## the tree entry is there; it is simply not mounted yet
+			printf ' %-10s %s  (%s --mount %s <TTL> to fill it)\n' \
+				BROWSE "$_browse" "$US" "$_id"
+		else
+			printf ' %-10s %s  (%s --refresh %s to build the tree)\n' \
+				BROWSE "$_browse" "$US" "$_loc"
+		fi
 		return 0
 	fi
 
@@ -2006,11 +2175,9 @@ cmd_mount() {
 				need_dir "$_mp"
 			fi
 			_got=$(snap_mount "$_h" "$_ts" "$_ttl" "" "$_mp") || continue
-			if [ -n "$_where" ]; then
-				printf '%s\n' "$_got"
-			else
-				printf '%s/%s/%s/%s\n' "$(tm_root)" "$_h" "$_ts" "$_vol"
-			fi
+			## print where the files ACTUALLY are: a snapshot macOS already had
+			## mounted is reused where it sits, not at our tree path
+			snap_volume_root_at "$_got" "$_h" "$_ts" "$_vol"
 		done <<_EOF
 $_list
 _EOF
@@ -2027,11 +2194,7 @@ _EOF
 	_mp=""
 	[ -n "$_where" ] && { _mp=$(abs_path "$_where"); need_dir "$_mp"; }
 	_got=$(snap_mount "$_loc" "$_ts" "$_ttl" "" "$_mp") || err "mount failed"
-	if [ -n "$_where" ]; then
-		printf '%s\n' "$_got"
-	else
-		printf '%s/%s/%s/%s\n' "$(tm_root)" "$_loc" "$_ts" "$_vol"
-	fi
+	snap_volume_root_at "$_got" "$_loc" "$_ts" "$_vol"
 	return 0
 }
 
@@ -2942,6 +3105,11 @@ cmd_forget() {
 cmd_refresh() {
 	_only="${1:-}"
 	snapshots_cache_invalidate
+	## drop remembered per-file facts too: --refresh is what someone reaches
+	## for when they suspect my-tm is telling them something stale or wrong
+	for _d in $(cache_read_dirs); do
+		rm -f "$_d/index/versions.tsv" 2>/dev/null
+	done
 	if [ -n "$_only" ]; then
 		snapshots_get "$_only" >/dev/null
 		tm_refresh "$_only"
@@ -3703,6 +3871,13 @@ main() {
 
 	load_config || true
 
+	## a mount root we cannot write to is no mount root at all
+	_mr=$(mount_root_resolve)
+	if [ "$_mr" != "$MOUNT_ROOT" ]; then
+		dbg "$MOUNT_ROOT is not writable; mounting under $_mr instead (run --install to share one)"
+		MOUNT_ROOT="$_mr"
+	fi
+
 	## a bare name given to -D/-DD is a file in the per-user log dir
 	case "${DBG_PATH:-}" in
 		"") : ;;
@@ -3796,7 +3971,7 @@ t_make_stubs() {
 #!/bin/sh
 printf 'tmutil %s\n' "\$*" >>"$(t_calls)"
 case "\$1" in
-  destinationinfo) printf '====================================================\nName          : TestStore\nKind          : Local\nMount Point   : $T_ROOT/store\nID            : 11111111-2222-3333-4444-555555555555\n' ;;
+  destinationinfo) printf '====================================================\nName          : TestStore\nKind          : Local\nMount Point   : $T_ROOT/store\nID            : 11111111-2222-3333-4444-555555555555\n====================================================\nName          : EjectedStore\nKind          : Local\nID            : 99999999-8888-7777-6666-555555555555\n' ;;
   listlocalsnapshots) printf 'Snapshots for disk %s:\ncom.apple.TimeMachine.2026-08-23-005931.local\ncom.apple.TimeMachine.2026-08-23-020001.local\n' "\$2" ;;
   uniquesize) printf '12345678 %s\n' "\$2" ;;
   status) printf 'Backup session status:\n{\n    Running = 0;\n}\n' ;;
@@ -4307,6 +4482,164 @@ t_test_local_snapshots() {
 	export PATH
 }
 
+## REGRESSION: a Time Machine destination that is ejected has no "Mount Point:"
+## line in tmutil destinationinfo. It used to be dropped on the floor, so the
+## backup disk silently VANISHED from --status -- hiding the one failure the
+## tool exists to report. It must be listed, marked "?", with its last known
+## snapshot table intact.
+t_test_ejected_destination() {
+	printf '\nEjected / unattached destinations\n'
+	_old_auto="$AUTODETECT_LOCAL_TM_BACKUPS"
+	AUTODETECT_LOCAL_TM_BACKUPS=1
+
+	_d=$(destinations_scan)
+	t_eq "both destinations are reported, mounted or not" \
+		"$(printf '%s\n' "$_d" | count_lines)" "2"
+	t_match "the ejected one is present" "$_d" "EjectedStore"
+	t_eq "and stands in with its conventional path" \
+		"$(printf '%s\n' "$_d" | awk -F'\t' '$1 == "EjectedStore" {print $2}')" \
+		"/Volumes/EjectedStore"
+	t_eq "its destination ID survives, so snapshot IDs stay stable" \
+		"$(printf '%s\n' "$_d" | awk -F'\t' '$1 == "EjectedStore" {print $3}')" \
+		"99999999-8888-7777-6666-555555555555"
+
+	_all=$(locations_all)
+	t_match "it becomes a location" "$_all" "ejectedstore"
+
+	## give it a remembered snapshot, as a real cache would have
+	_cf=$(snapshots_cache_file)
+	printf 'ejectedstore\t2026-08-20-155805\t1755698285\tzz1234\t-\t100\t200\t300\t-\tok\tData\n' >>"$_cf"
+	t_eq "the cache-only reader finds it without touching the disk" \
+		"$(snapshots_cached_only ejectedstore | count_lines)" "1"
+
+	_st=$(cmd_status 2>&1)
+	t_match "--status still lists the detached disk" "$_st" "ejectedstore"
+	t_match "with its last known snapshot count" "$_st" "ejectedstore.* 1 "
+	t_match "and marked as not-current" "$_st" "?"
+
+	_ls=$(cmd_ls ejectedstore 2>&1)
+	t_match "--ls falls back to the remembered table" "$_ls" "2026-08-20_1558.05"
+	t_match "and says why it may be out of date" "$_ls" "not attached"
+
+	## this row HAS an ADDED figure, so a median is owed
+	t_match "a location with size data still reports its median" "$_ls" "median"
+
+	## local snapshots carry no manifest and therefore no ADDED at all:
+	## the footer must stay silent rather than report a median of zero
+	_lsl=$(cmd_ls local 2>&1)
+	t_eq "no ADDED data -> no median claimed" \
+		"$(printf '%s\n' "$_lsl" | count_match 'median')" "0"
+	t_match "but the snapshots are still listed" "$_lsl" "2026-08-23"
+
+
+	## REGRESSION: detached AND nothing remembered used to print NOTHING at
+	## all, which reads as "this disk has no backups" -- the opposite of the
+	## truth. It must say why and what to do about it.
+	grep -v '^ejectedstore' "$_cf" > "$_cf.tmp" 2>/dev/null && mv "$_cf.tmp" "$_cf"
+	_empty=$(cmd_ls ejectedstore 2>&1)
+	t_ne "an empty answer is never silent" "$_empty" ""
+	t_match "it says the disk is away" "$_empty" "not attached"
+	t_match "and what to do about it" "$_empty" "refresh"
+
+	AUTODETECT_LOCAL_TM_BACKUPS="$_old_auto"
+}
+
+## REGRESSION: a local snapshot IS the volume root. my-tm used to mount it one
+## level up and then look for <mnt>/Data/..., a path that cannot exist -- so
+## every file in every local snapshot came back "absent". Silently wrong
+## answers about whether a backup holds your file is the worst failure this
+## tool has, so the path arithmetic is pinned here.
+t_test_volume_paths() {
+	printf '\nVolume paths inside a mounted snapshot\n'
+	_ts=2026-08-20-155805
+	t_eq "a backup snapshot has the <ts>.backup wrapper" \
+		"$(snap_volume_root_at /m/base store "$_ts" Data)" \
+		"/m/base/$_ts.backup/Data"
+	t_eq "a local snapshot mounted one level up gets the volume appended" \
+		"$(snap_volume_root_at /m/local/$_ts local "$_ts" Data)" \
+		"/m/local/$_ts/Data"
+	t_eq "a local snapshot mounted AT the volume root is left alone" \
+		"$(snap_volume_root_at /m/local/$_ts/Data local "$_ts" Data)" \
+		"/m/local/$_ts/Data"
+	_exp=$(mnt_volume_path_expected local "$_ts" Data)
+	t_eq "so the volume name is never doubled" \
+		"$(printf '%s' "$_exp" | count_match '/Data/Data')" "0"
+	t_match "and the expected path ends at the volume" "$_exp" "/Data\$"
+
+	## REGRESSION: --show advertised a browsable path even when the tree had
+	## never been built, sending the reader to a directory that is not there
+	_rows=$(snapshots_get store)
+	_id=$(printf '%s\n' "$_rows" | head -n 1 | awk -F'\t' '{print $4}')
+	if [ -n "$_id" ]; then
+		_sh=$(cmd_show "$_id" 2>&1)
+		t_match "an unbuilt tree says how to build it" "$_sh" "refresh"
+	fi
+
+	## REGRESSION: macOS mounts local snapshots itself, and --mount reuses
+	## those. It used to print our tree path regardless, sending the reader to
+	## an empty directory while the files sat somewhere else entirely.
+	if true; then
+		_sys=/Volumes/com.apple.TimeMachine.localsnapshots/Backups.backupdb/h/2026-08-20-155805/Data
+		t_eq "a system-mounted local snapshot is reported where it really is" \
+			"$(snap_volume_root_at "$_sys" local 2026-08-20-155805 Data)" "$_sys"
+	fi
+}
+
+## REGRESSION: without --install an ordinary user cannot create /var/lib/my-tm,
+## so every mount failed and --lookup answered "0 versions" -- indistinguishable
+## from "your file was never backed up".
+t_test_mount_root_fallback() {
+	printf '\nMount root without --install\n'
+	_saved="$MOUNT_ROOT"
+	MOUNT_ROOT="$T_ROOT/mount"
+	t_eq "a writable mount root is used as configured" \
+		"$(mount_root_resolve)" "$T_ROOT/mount"
+	mkdir -p "$T_ROOT/nowrite/mount"
+	chmod 0555 "$T_ROOT/nowrite/mount"
+	MOUNT_ROOT="$T_ROOT/nowrite/mount"
+	t_eq "an unwritable one falls back to the per-user overlay" \
+		"$(mount_root_resolve)" "$CACHE_DIR_USER/mount"
+	MOUNT_ROOT="$T_ROOT/nowrite/mount/cannot/be/made"
+	t_eq "and so does one that cannot be created" \
+		"$(mount_root_resolve)" "$CACHE_DIR_USER/mount"
+	chmod 0755 "$T_ROOT/nowrite/mount"
+	MOUNT_ROOT="$_saved"
+}
+
+## REGRESSION: a recorded stat is a permanent fact only if my-tm looked in the
+## right place. When a path bug recorded false absences, they were served
+## forever without ever being re-checked.
+t_test_version_store_generation() {
+	printf '\nVersion store generation\n'
+	_f=$(vs_file)
+	need_dir "$(dirname "$_f")"
+	printf 'store\t2026-08-20-155805\t/x/y.txt\t-\t-\t-\n' >"$_f"
+	printf '1\n' >"$(dirname "$_f")/versions.gen"
+	t_eq "a row from an older generation is not trusted" \
+		"$(vs_lookup store 2026-08-20-155805 /x/y.txt >/dev/null 2>&1 && echo served || echo discarded)" \
+		"discarded"
+	t_eq "the stale store file is gone" "$([ -f "$_f" ] && echo present || echo gone)" "gone"
+	printf '2026-08-20-155805\t/x/y.txt\t111\t222\t333\n' | vs_put store
+	t_eq "a freshly written store carries the current generation" \
+		"$(cat "$(dirname "$_f")/versions.gen" 2>/dev/null)" "$VS_GENERATION"
+	t_eq "and its rows are served again" \
+		"$(vs_lookup store 2026-08-20-155805 /x/y.txt)" "$(printf '111\t222\t333')"
+	rm -f "$_f"
+}
+
+## REGRESSION: local snapshots are purgeable -- macOS deletes them at any age.
+## A cached list produced mounts of snapshots that no longer existed.
+t_test_local_list_never_cached() {
+	printf '\nLocal snapshot list is never served from cache\n'
+	_cf=$(snapshots_cache_file)
+	snapshots_get local >/dev/null 2>&1
+	printf 'local\t1999-01-01-000000\t915148800\tgone01\t-\t-\t-\t-\t-\tok\tData\n' >>"$_cf"
+	_rows=$(snapshots_get local)
+	t_eq "a snapshot macOS no longer lists is not reported" \
+		"$(printf '%s\n' "$_rows" | count_match '1999-01-01')" "0"
+	t_match "while the live ones still are" "$_rows" "2026-08-23"
+}
+
 run_tests() {
 	T_WITH_SNAPSHOTS=0
 	for _a in "$@"; do
@@ -4336,6 +4669,11 @@ run_tests() {
 	t_test_rm_dryrun
 	t_test_help
 	t_test_paths
+	t_test_ejected_destination
+	t_test_volume_paths
+	t_test_mount_root_fallback
+	t_test_version_store_generation
+	t_test_local_list_never_cached
 	t_test_local_snapshots
 
 	t_teardown
