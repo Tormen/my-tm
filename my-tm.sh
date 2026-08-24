@@ -950,7 +950,21 @@ snapshots_get() {
 	fi
 	## Local snapshots are purgeable and churn constantly, and listing them is
 	## one cheap call -- caching that list only ever produces wrong answers.
-	[ "$(loc_target "$_h")" = "local" ] && _fresh=0
+	[ "$(loc_kind "$_h")" = "local" ] && _fresh=0
+
+	## For a store that is ALREADY open, enumerating snapshot names is two
+	## cheap calls, so the cached set is checked against reality rather than
+	## trusted for an hour: Time Machine adds and thins snapshots constantly,
+	## and "newest backup" is the number this tool exists to get right. An
+	## image is exempt -- validating it would mean attaching it over a share.
+	if [ "$_fresh" = "1" ] && [ "$(loc_kind "$_h")" = "disk" ] && loc_reachable "$_h"; then
+		_live=$(snap_names "$_h" | LC_ALL=C sort)
+		_have=$(awk -F'\t' -v l="$_h" '$1 == l {print $2}' "$_cf" 2>/dev/null | LC_ALL=C sort)
+		if [ "$_live" != "$_have" ]; then
+			dbg "snapshots: the store no longer matches the cache for '$_h' -- rescanning"
+			_fresh=0
+		fi
+	fi
 	if [ "$_fresh" = "1" ]; then
 		_cached=$(awk -F'\t' -v l="$_h" '$1 == l' "$_cf" 2>/dev/null)
 		if [ -n "$_cached" ]; then
@@ -1328,12 +1342,10 @@ snap_mount() {
 		printf '%s\n' "$_mp"
 		return 0
 	fi
-	if [ "$(loc_target "$_loc")" = "local" ] &&
-	   ! tmutil listlocalsnapshots /System/Volumes/Data 2>/dev/null |
-	       grep -q "$_apfs"; then
-		## local snapshots are purgeable: macOS deletes them under space
-		## pressure at any age, so a list read a minute ago can already be wrong
-		warn "$(ts_display "$_ts"): purged by macOS since the list was read"
+	if ! snap_names "$_loc" 2>/dev/null | grep -qx "$_ts"; then
+		## Time Machine adds and thins constantly, and local snapshots are
+		## purgeable at any age: a list read a minute ago can already be wrong
+		warn "$(ts_display "$_ts"): gone from '$_loc' since the list was read ($US --refresh $_loc)"
 	else
 		warn "mount failed: $_apfs on $_vol_src"
 	fi
@@ -1815,6 +1827,11 @@ _EOF
 	[ -d "$(index_dir)" ] &&
 		_isize=$(human_bytes "$(find "$(index_dir)" -type f -exec wc -c {} + 2>/dev/null |
 			awk 'END {print $1 + 0}')")
+	_scanned=""
+	if [ -f "$_cf" ]; then
+		_sa=$(( $(now_epoch) - $(stat -f '%m' "$_cf" 2>/dev/null || now_epoch) ))
+		_scanned=" · scanned $(human_age "$_sa") ago"
+	fi
 	_note="cache $_csize · index $_isize"
 	_first_loc=$(printf '%s\n' "$_locs" | awk -F'\t' '$2 != "local" && !f {print $1; f = 1}')
 	if [ -n "$_first_loc" ]; then
@@ -1822,7 +1839,7 @@ _EOF
 		_tot=$(snapshots_get "$_first_loc" | count_lines)
 		[ "$_tot" -gt 0 ] && _note="$_note ($_cov/$_tot snaps, $US --index $_first_loc)"
 	fi
-	note "$_note"
+	note "$_note$_scanned"
 	return 0
 }
 
@@ -5124,6 +5141,30 @@ t_test_lookup_collapse() {
 		"$(lookup_collapse <"$T_ROOT/c3.in" | count_lines)" "3"
 }
 
+## REGRESSION: the snapshot list for a mounted store was trusted for a whole
+## CACHE_TTL. Time Machine adds and thins constantly, so --status reported
+## "newest backup 1h ago" three minutes after a backup, and offered snapshot
+## IDs that had already been thinned away. For a store that is already open,
+## the cached set is checked against reality instead of trusted.
+t_test_snapshot_set_is_validated() {
+	printf '\nCached snapshot set is checked against the store\n'
+	_cf=$(snapshots_cache_file)
+	snapshots_get store >/dev/null 2>&1
+	_before=$(snapshots_get store | count_lines)
+	t_ne "the fixture store has snapshots" "$_before" "0"
+
+	## a snapshot the store does not have (thinned away since the scan)
+	printf 'store\t1999-12-31-235959\t946684799\tgone99\t-\t-\t-\t-\t-\tok\tData\n' >>"$_cf"
+	_rows=$(snapshots_get store)
+	t_eq "a snapshot that is no longer there is not offered" \
+		"$(printf '%s\n' "$_rows" | count_match '1999-12-31')" "0"
+	t_eq "and the real ones are still listed" \
+		"$(printf '%s\n' "$_rows" | count_lines)" "$_before"
+
+	## --status says how old its picture is, rather than implying it is current
+	t_match "the footer dates the scan" "$(cmd_status 2>&1)" "scanned .* ago"
+}
+
 run_tests() {
 	T_WITH_SNAPSHOTS=0
 	for _a in "$@"; do
@@ -5159,6 +5200,7 @@ run_tests() {
 	t_test_locate_toolchain
 	t_test_indexer_exemption_expires
 	t_test_lookup_collapse
+	t_test_snapshot_set_is_validated
 	t_test_volume_paths
 	t_test_mount_root_fallback
 	t_test_version_store_generation
