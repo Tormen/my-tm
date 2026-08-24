@@ -841,6 +841,25 @@ comes back as one clear line — `host1: my-tm not installed there. Run: my-tm
 config. `--install <SSH-HOST>` does that one host; `--install` with no argument
 does the local machine and every configured host.
 
+### What my-tm does not cover
+
+**Legacy HFS+ `Backups.backupdb` stores are deliberately out of scope.** They
+have been legacy since macOS 11 (Big Sur, 2020):
+
+* **cannot be created** — macOS 11+ refuses to start a new backup to an HFS+
+  destination and insists on reformatting to APFS;
+* **can still be read and restored** — the OS keeps mount and browse support for
+  an existing hierarchy, including via Migration Assistant, and the dated
+  directories are plain directories that `ls`, `cp` and `rsync` already read;
+* **cannot be inherited or continued** — an HFS+ chain cannot be extended after
+  an upgrade; a fresh APFS chain starts instead.
+
+A store that can no longer grow, and that the OS still opens by itself, does not
+justify a second snapshot model threaded through every command here.
+
+Network destinations — a `<host>.sparsebundle` on an SMB/AFP share — **are** in
+scope; see `,design-every-kind-of-store.md`.
+
 ## 12. What a location knows *(spec)*
 
 Read once, cached — and, as it turns out, **without mounting anything at all**:

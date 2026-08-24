@@ -13,7 +13,7 @@ only see a Time Machine store that is a **mounted APFS volume**, plus the
 |---|---|
 | `<share>/<host>.sparsebundle` on an SMB/AFP share (NAS, Time Capsule) | the store is inside a disk image that must be attached first |
 | `<share>/<otherhost>.sparsebundle` | same, and it belongs to another Mac |
-| a legacy `Backups.backupdb/<host>/<date>/` tree | snapshots are directories, not APFS snapshots |
+| a legacy `Backups.backupdb/<host>/<date>/` tree | *(decided: out of scope, see §4)* |
 | a destination whose volume is attached but **not mounted** | `[ -d "$target" ]` is false, so it is skipped in silence |
 | a destination that is not attached at all | *(fixed: listed with `?` and the last known table)* |
 
@@ -61,10 +61,20 @@ directories *are* the snapshots, which makes it the cheapest kind to read.
 `apfs-image` is identical to `apfs-disk` once attached: `backup_manifest.plist`
 at the volume root, APFS snapshots, every size column as today.
 
-`hfs-dir` has no manifest. Snapshots are `Backups.backupdb/<host>/<ts>/<Volume>/`
-directories, so `FILES`, `ADDED` and `TOTAL` are simply unavailable and print
-`-`; `UNIQUE` needs a walk as it does everywhere. Everything else — `--lookup`,
-`--find`, `--cat`, `--cp`, `--diff` — works, and without a single mount.
+**`hfs-dir` is out of scope — decided.** HFS+ `Backups.backupdb` stores have
+been legacy since macOS 11 (Big Sur, 2020). Their status today:
+
+* **Cannot be created** — macOS 11+ refuses to start a new backup to an HFS+
+  destination and insists on reformatting to APFS.
+* **Can still be read and restored** — macOS keeps mount and browse support for
+  an existing `Backups.backupdb` hierarchy, including through Migration
+  Assistant. So nothing is lost by my-tm not touching them: the OS still opens
+  them, and they are plain directories that `ls`, `cp` and `rsync` already read.
+* **Cannot be inherited or continued** — an HFS+ chain cannot be extended after
+  an upgrade; a fresh APFS chain starts instead.
+
+A store that can no longer grow, and that the OS itself still browses, does not
+justify a second snapshot model running through every command here.
 
 ## 5. Identity, so IDs stay stable
 
@@ -103,10 +113,20 @@ Two rules follow:
   fourth is the same silent-wrong-answer failure as reporting a file "absent"
   because we looked in the wrong directory.
 
-## 8. Open questions
+## 8. Decisions
 
-1. Should `AUTO_MOUNT_DESTINATIONS` default to `1` instead?
-2. Are legacy `hfs-dir` (`Backups.backupdb`) stores in scope, or APFS only?
-3. Should other hosts' sparsebundles on a shared volume be listable (read-only)?
-4. What should happen when a sparsebundle's lock says another host holds it?
-5. Build this now, or land the destination-state warnings first and images after?
+1. **`AUTO_MOUNT_DESTINATIONS=1` by default** — mount it, use it, put it back.
+   *(implemented)*
+2. **Legacy `hfs-dir` stores: out of scope**, with the reasoning recorded in §4
+   and a note in the README so the omission is deliberate and visible.
+3. **Other hosts' sparsebundles are listable**, read-only, through the same
+   cache mechanism as everything else — so once a store has been read, its
+   snapshot table answers without the share being mounted at all.
+4. **A sparsebundle that cannot be opened read-only** is a *warning* when my-tm
+   met it while doing something else (a `--status` sweep over every location),
+   and an *error* when the command named that store specifically.
+5. **Build now.**
+
+## 9. Still open
+
+* Nothing. Raise anything here as it comes up.

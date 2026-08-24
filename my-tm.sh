@@ -1299,6 +1299,18 @@ vol_free_pct() {
 	df -k "$1" 2>/dev/null | awk 'NR == 2 { if ($2 > 0) printf "%d\n", ($4 * 100) / $2; else print 100 }'
 }
 
+## Should the sweep leave this mount alone? Only while the --index run that
+## made it is still ALIVE: kill -9 cannot be trapped, and a dead indexer
+## would otherwise pin its snapshot against thinning for good.
+indexer_still_running() {
+	case "${1:-}" in
+		*indexer*) : ;;
+		*) return 1 ;;
+	esac
+	[ -n "${2:-}" ] || return 1
+	kill -0 "$2" 2>/dev/null
+}
+
 sweep() {
 	_now=$(now_epoch)
 	_records=$(mounts_read_all)
@@ -1319,15 +1331,21 @@ sweep() {
 			mount_record_drop "$_mp"
 			continue
 		fi
+		if indexer_still_running "${_flags:-}" "${_pid:-}"; then
+			dbg "sweep: indexer mount exempt, pid $_pid still running ($_mp)"
+			continue
+		fi
 		case "${_flags:-}" in
 			*indexer*)
-				dbg "sweep: indexer mount exempt ($_mp)"
-				continue
+				dbg "sweep: indexer pid ${_pid:-?} is gone -- its mount is no longer exempt ($_mp)"
+				_expired_indexer=1
 				;;
 		esac
 		_age=$(( _now - ${_made:-0} ))
 		_expired=0
 		[ "$_age" -ge "${_ttl:-0}" ] && _expired=1
+		[ "${_expired_indexer:-0}" = "1" ] && _expired=1
+		_expired_indexer=0
 		if [ "$_urgent" = "1" ]; then
 			_expired=1
 			dbg "sweep: a backup is running -- TTL overridden for $_mp"
@@ -1548,6 +1566,21 @@ vs_covered_count() {
 #############################################################################
 
 index_dir() { printf '%s/index\n' "$(cache_write_dir)"; }
+
+## The locate build tools ship in /usr/libexec and are NOT on PATH. Calling
+## them by bare name exits 127, which would leave --index cheerfully
+## reporting success while building nothing at all.
+locate_tool() {
+	if command -v "$1" >/dev/null 2>&1; then
+		command -v "$1"
+		return 0
+	fi
+	if [ -x "/usr/libexec/$1" ]; then
+		printf '/usr/libexec/%s\n' "$1"
+		return 0
+	fi
+	return 1
+}
 
 ## every database to query for a location, colon-joined, system db first
 index_dbs() {
@@ -2434,6 +2467,10 @@ cmd_diff() {
 #############################################################################
 
 cmd_index() {
+	## check the toolchain BEFORE walking anything: discovering it is missing
+	## after a twenty-minute walk would be a poor way to find out
+	locate_tool locate.mklocatedb >/dev/null ||
+		err "locate.mklocatedb not found (looked on PATH and in /usr/libexec). The name index --find uses cannot be built without it."
 	_targets="$*"
 	_locs=""
 	_snaps=""
@@ -2516,11 +2553,20 @@ index_one() {
 
 	_paths=$(mktemp /tmp/my-tm.idx.XXXXXX) || { snap_umount "$_mp"; return 1; }
 	run_echo find "$_base" -print
-	find "$_base" -print 2>/dev/null | sed "s|^$_base||" | sort >"$_paths"
+	find "$_base" -print 2>/dev/null | sed "s|^$_base||" | LC_ALL=C sort >"$_paths"
 	_count=$(count_lines < "$_paths")
 	if [ "$_count" -gt 0 ]; then
-		locate.mklocatedb <"$_paths" >"$_inc" 2>/dev/null ||
-			warn "$_ts: mklocatedb failed"
+		if _mk=$(locate_tool locate.mklocatedb); then
+			if ! "$_mk" <"$_paths" >"$_inc" 2>/dev/null || [ ! -s "$_inc" ]; then
+				warn "$_ts: building the name index failed -- nothing was written"
+				rm -f "$_inc"
+			fi
+		else
+			warn "locate.mklocatedb not found (looked on PATH and in /usr/libexec) -- the name index cannot be built"
+			rm -f "$_paths"
+			snap_umount "$_mp" >/dev/null 2>&1
+			return 1
+		fi
 	fi
 
 	## exclusive size on the same trip over the disk
@@ -2547,12 +2593,16 @@ index_consolidate() {
 	[ "$_incs" -ge "$INDEX_INC_MAX" ] || { dbg "index: $_incs increments, no consolidation yet"; return 0; }
 	msg "consolidating $_incs index increments for '$_h'"
 	why "one sort -u now, in a run that already took a while, instead of at an arbitrary later moment"
+	_mk=$(locate_tool locate.mklocatedb) || {
+		warn "locate.mklocatedb not found -- leaving the increments as they are"
+		return 1
+	}
 	_all=$(mktemp /tmp/my-tm.cons.XXXXXX) || return 1
 	for _f in "$_dir/$_h.db" "$_dir/$_h".inc.*.db; do
 		[ -f "$_f" ] || continue
 		locate -d "$_f" '*' 2>/dev/null >>"$_all"
 	done
-	sort -u "$_all" | locate.mklocatedb >"$_dir/$_h.db.new" 2>/dev/null &&
+	LC_ALL=C sort -u "$_all" | "$_mk" >"$_dir/$_h.db.new" 2>/dev/null &&
 		mv -f "$_dir/$_h.db.new" "$_dir/$_h.db" &&
 		rm -f "$_dir/$_h".inc.*.db
 	rm -f "$_all" "$_dir/$_h.db.new"
@@ -3975,6 +4025,20 @@ main() {
 
 	load_config || true
 
+	## Without --install there is no maintenance daemon, so nothing would ever
+	## reap a mount leaked by a kill -9. Reconcile and release expired ones on
+	## ordinary runs; a mount still inside its TTL is never touched.
+	case "${CMD:-}" in
+		--run-tests|--maintenance|--sweep|--umount) : ;;
+		*)
+			if [ ! -f "/Library/LaunchDaemons/$MAINT_JOB.plist" ] &&
+			   [ -n "$(mounts_read_all)" ]; then
+				dbg "no maintenance daemon installed -- sweeping opportunistically"
+				sweep >/dev/null 2>&1 || true
+			fi
+			;;
+	esac
+
 	## a mount root we cannot write to is no mount root at all
 	_mr=$(mount_root_resolve)
 	if [ "$_mr" != "$MOUNT_ROOT" ]; then
@@ -4843,6 +4907,53 @@ cmd_verify_report_probe() {
 	return 0
 }
 
+## REGRESSION: locate.mklocatedb and locate.concatdb live in /usr/libexec and
+## are NOT on PATH. my-tm called them by bare name, so every --index run exited
+## 127 per snapshot and built an empty index while reporting success.
+t_test_locate_toolchain() {
+	printf '\nlocate toolchain\n'
+	_mk=$(locate_tool locate.mklocatedb) || _mk=""
+	if [ -z "$_mk" ]; then
+		t_skip "locate.mklocatedb" "not present on this system"
+		return 0
+	fi
+	t_true test -x "$_mk"
+	t_eq "a missing tool is reported, not invented" \
+		"$(locate_tool no.such.tool.here >/dev/null 2>&1 && echo found || echo missing)" "missing"
+
+	## and the primitive actually works end to end, through the resolver
+	case "$_mk" in
+		/usr/libexec/*)
+			_db="$T_ROOT/t.db"
+			printf '/a/one.txt\n/a/two.pdf\n' | LC_ALL=C sort | "$_mk" >"$_db" 2>/dev/null
+			t_true test -s "$_db"
+			t_eq "a glob query finds the right path" \
+				"$(locate -d "$_db" '*.pdf' 2>/dev/null)" "/a/two.pdf"
+			;;
+		*) t_skip "index build through the real tool" "a stub is on PATH" ;;
+	esac
+}
+
+## REGRESSION: an --index run marks its mount exempt from the sweep. A killed
+## indexer (kill -9 cannot be trapped) left that exemption in place forever,
+## pinning a snapshot against Time Machine's thinning for good.
+t_test_indexer_exemption_expires() {
+	printf '\nIndexer exemption dies with its process\n'
+	## a pid that has certainly exited: started and reaped right here
+	( exit 0 ) & _dead=$!
+	wait "$_dead" 2>/dev/null
+
+	t_true indexer_still_running "indexer" "$$"
+	t_eq "a dead indexer is no longer exempt" \
+		"$(indexer_still_running "indexer" "$_dead" && echo exempt || echo swept)" "swept"
+	t_eq "an indexer record with no pid is not exempt" \
+		"$(indexer_still_running "indexer" "" && echo exempt || echo swept)" "swept"
+	t_eq "an ordinary transient mount is never exempt" \
+		"$(indexer_still_running "transient" "$$" && echo exempt || echo swept)" "swept"
+	t_eq "and neither is an unflagged one" \
+		"$(indexer_still_running "" "$$" && echo exempt || echo swept)" "swept"
+}
+
 run_tests() {
 	T_WITH_SNAPSHOTS=0
 	for _a in "$@"; do
@@ -4875,6 +4986,8 @@ run_tests() {
 	t_test_ejected_destination
 	t_test_auto_mount_destinations
 	t_test_verify_reports
+	t_test_locate_toolchain
+	t_test_indexer_exemption_expires
 	t_test_volume_paths
 	t_test_mount_root_fallback
 	t_test_version_store_generation
