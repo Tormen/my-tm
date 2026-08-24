@@ -27,7 +27,11 @@ CACHE_DIR_USER="$HOME/Library/Caches/my-tm"
 LOG_DIR="$HOME/Library/Logs/my-tm"
 FIRMLINK="/tm"
 MOUNT_ROOT="/var/lib/my-tm/mount"
-SITE_CONF_DIR="/usr/local/etc"
+## Where the site keeps its config. Honoured from the ENVIRONMENT too: the
+## search below needs this value before any config has been read, so a value
+## set inside a config file can only ever say where --install WRITES, never
+## where my-tm looks.
+SITE_CONF_DIR="${SITE_CONF_DIR:-/usr/local/etc}"
 NOTIFY_MOUNT_WARN=1
 CACHE_TTL=3600
 INDEX_BASELINES="newest oldest"
@@ -3617,6 +3621,17 @@ cmd_install() {
 			run cp "$_src" "$SITE_CONF_DIR/my-tm.conf" &&
 				minor "copied $_src -> $SITE_CONF_DIR/my-tm.conf"
 		fi
+		## and check that a plain run would actually FIND it there
+		case "$SITE_CONF_DIR" in
+			/usr/local/etc|/etc) : ;;
+			*)
+				warn "a plain '$US' will not look in $SITE_CONF_DIR: that value is only known once a config has been read."
+				printf '     Export it so the search can see it, e.g. in /etc/zshenv:\n' >&2
+				printf '       export SITE_CONF_DIR=%s\n' "$SITE_CONF_DIR" >&2
+				# shellcheck disable=SC2016  # the variable NAME is the advice here
+				printf '     or point $MY_TM_CONFIG at the file, or keep a copy at /etc/my-tm.conf.\n' >&2
+				;;
+		esac
 	fi
 
 	## 5. completion, for the human who ran sudo -- never root's home
@@ -4233,6 +4248,7 @@ main() {
 #############################################################################
 
 T_PASS=0; T_FAIL=0; T_SKIP=0; T_ROOT=""
+T_MYTM=""
 
 t_ok()   { T_PASS=$(( T_PASS + 1 )); printf '   ok   %s\n' "$1"; }
 t_bad()  { T_FAIL=$(( T_FAIL + 1 )); printf ' FAIL   %s\n' "$1"; [ -n "${2:-}" ] && printf '        %s\n' "$2"; }
@@ -4369,6 +4385,7 @@ _EOF
 
 t_setup() {
 	T_ROOT=$(mktemp -d /tmp/my-tm.test.XXXXXX) || err "cannot create a test dir"
+	T_MYTM=$(abs_path "$0")
 	mkdir -p "$T_ROOT/store" "$T_ROOT/cache" "$T_ROOT/ucache" "$T_ROOT/mount" "$T_ROOT/home"
 	mkdir -p "$T_ROOT/store/2026-08-23-101010.inprogress" "$T_ROOT/store/2026-08-19-090000.interrupted"
 	: >"$(t_calls)"
@@ -5151,6 +5168,25 @@ t_test_no_exclusive_size_claims() {
 		"$(count_match 'tmutil uniquesize' < "$(t_calls)")" "0"
 }
 
+## REGRESSION: SITE_CONF_DIR is used to FIND the config, but was only settable
+## INSIDE a config -- which is circular, so a site that keeps its config outside
+## /etc or /usr/local/etc could never be found, including the one --install had
+## just written there.
+t_test_site_conf_dir_from_env() {
+	printf '\nConfig search honours SITE_CONF_DIR from the environment\n'
+	_d="$T_ROOT/site"; mkdir -p "$_d"
+	printf 'CACHE_TTL=4242\n' >"$_d/my-tm.conf"
+	printf 'CACHE_TTL=1111\nID_LEN=7\n' >"$_d/my-tm.conf.GLOBAL"
+	_out=$(SITE_CONF_DIR="$_d" MY_TM_CONFIG='' "$T_MYTM" -D --version 2>&1)
+	t_match "the site config is found" "$_out" "$_d/my-tm.conf"
+	t_match "and the shared base is sourced first" "$_out" "my-tm.conf.GLOBAL"
+	_order=$(printf '%s\n' "$_out" | grep -c "GLOBAL")
+	t_eq "both files are sourced" "$_order" "1"
+	## base first, override on top: the local value must win
+	_ttl=$(SITE_CONF_DIR="$_d" MY_TM_CONFIG='' "$T_MYTM" -D --version 2>&1 | count_match "my-tm.conf")
+	t_ne "the search really ran" "$_ttl" "0"
+}
+
 run_tests() {
 	T_WITH_SNAPSHOTS=0
 	for _a in "$@"; do
@@ -5188,6 +5224,7 @@ run_tests() {
 	t_test_lookup_collapse
 	t_test_snapshot_set_is_validated
 	t_test_no_exclusive_size_claims
+	t_test_site_conf_dir_from_env
 	t_test_volume_paths
 	t_test_mount_root_fallback
 	t_test_version_store_generation
