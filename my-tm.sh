@@ -884,26 +884,23 @@ _EOF
 		fi
 	fi
 	snap_states "$_h" >"$_tmpd/states" 2>/dev/null || : >"$_tmpd/states"
-	unique_cache_dump "$_h" >"$_tmpd/unique" 2>/dev/null || : >"$_tmpd/unique"
 
 	awk -F'\t' -v loc="$_h" '
 		FILENAME ~ /manifest$/ { mf[$1] = $2 "\t" $3 "\t" $4 "\t" $5 "\t" $6; next }
 		FILENAME ~ /states$/   { st[$1] = $2; next }
-		FILENAME ~ /unique$/   { uq[$1] = $2; next }
 		FILENAME ~ /snaps$/ {
 			ep = $1; ts = $2;
 			files = "-"; added = "-"; total = "-"; vol = "-"; xid = "-";
 			if (ep in mf) { split(mf[ep], m, "\t");
 				files = m[1]; added = m[2]; total = m[3]; vol = m[4]; xid = m[5] }
 			state = (ts in st) ? st[ts] : "ok";
-			uniq  = (ts in uq) ? uq[ts] : "-";
 			## every field carries a placeholder, never an empty string: tab is
 			## an IFS *whitespace* character, so two adjacent tabs would count
 			## as ONE delimiter and shift every later column left.
-			printf "%s\t%s\t%s\t-\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
-			       loc, ts, ep, xid, files, added, total, uniq, state, vol;
+			printf "%s\t%s\t%s\t-\t%s\t%s\t%s\t%s\t-\t%s\t%s\n",
+			       loc, ts, ep, xid, files, added, total, state, vol;
 		}
-	' "$_tmpd/manifest" "$_tmpd/states" "$_tmpd/unique" "$_tmpd/snaps" |
+	' "$_tmpd/manifest" "$_tmpd/states" "$_tmpd/snaps" |
 	while IFS="$(printf '\t')" read -r _l _ts _ep _id _xid _files _added _total _uniq _state _vol; do
 		_id=$(snap_id "$_uuid" "$_ts")
 		## the manifest names the volume; a local snapshot has no manifest, and
@@ -1727,7 +1724,7 @@ index_dbs() {
 
 index_covered_file() { printf '%s/%s.covered\n' "$(index_dir)" "$1"; }
 
-## ts <TAB> uniquesize for every indexed snapshot of a location
+## every snapshot of a location the index already covers
 unique_cache_dump() {
 	for _d in $(cache_read_dirs); do
 		_f="$_d/index/$1.covered"
@@ -1742,14 +1739,14 @@ index_covered_count() {
 }
 
 index_mark_covered() {
-	_loc="$1"; _ts="$2"; _uniq="${3:--}"
+	_loc="$1"; _ts="$2"
 	_f=$(index_covered_file "$_loc")
 	need_dir "$(dirname "$_f")" || return 1
 	_old=""
 	[ -f "$_f" ] && _old=$(awk -F'\t' -v t="$_ts" '$1 != t' "$_f" 2>/dev/null)
 	{
 		[ -n "$_old" ] && printf '%s\n' "$_old"
-		printf '%s\t%s\n' "$_ts" "$_uniq"
+		printf '%s\n' "$_ts"
 	} | atomic_write "$_f" 2>/dev/null
 	return 0
 }
@@ -1935,8 +1932,8 @@ cmd_ls() {
 		## 0.0x and a real spike no longer stands out.
 		_avg=$(added_median "$_rows")
 
-		printf ' %-8s %-20s %5s %6s %6s %6s %6s %7s  %s\n' \
-			ID SNAPSHOT AGE FILES ADDED DRIFT TOTAL UNIQUE VOL
+		printf ' %-8s %-20s %5s %6s %6s %6s %6s  %s\n' \
+			ID SNAPSHOT AGE FILES ADDED DRIFT TOTAL VOL
 		printf '%s\n' "$_rows" | sort -t"$(printf '\t')" -k3,3nr |
 		{
 			_i=0
@@ -1951,11 +1948,10 @@ cmd_ls() {
 				fi
 				_st=""
 				[ "${_state:-ok}" != "ok" ] && _st=" [$_state]"
-				printf ' %-8s %-20s %5s %6s %6s %6s %6s %7s  %s%s\n' \
+				printf ' %-8s %-20s %5s %6s %6s %6s %6s  %s%s\n' \
 					"$_id" "$(ts_display "$_ts")" "$_age" \
 					"$(human_count "$_files")" "$(human_bytes "$_added")" "$_drift" \
 					"$(human_bytes "$_total2")" \
-					"$(size_or_q "${_uniq:--}")" \
 					"${_vol:--}" "$_st"
 			done
 		}
@@ -2281,11 +2277,6 @@ cmd_show() {
 		printf ' %-10s %s\n' FILES "$(human_count "$_files")"
 		printf ' %-10s %s\n' ADDED "$(human_bytes "$_added")"
 		printf ' %-10s %s\n' TOTAL "$(human_bytes "$_total")"
-		if [ "${_uniq:--}" = "-" ]; then
-			printf ' %-10s ? (%s --unique %s)\n' UNIQUE "$US" "$_id"
-		else
-			printf ' %-10s %s\n' UNIQUE "$(human_bytes "$_uniq")"
-		fi
 		printf ' %-10s %s\n' VOLUME "$_vol"
 		printf ' %-10s %s\n' STATE "${_state:-ok}"
 		## only advertise the browsable path when it is really there: a tree
@@ -2713,14 +2704,12 @@ index_one() {
 		fi
 	fi
 
-	## exclusive size on the same trip over the disk
-	_uniq="-"
-	_u=$(tmutil uniquesize "$_base" 2>/dev/null | awk '{print $1; exit}')
-	case "${_u:-}" in
-		[0-9]*) _uniq="$_u" ;;
-	esac
-	index_mark_covered "$_h" "$_ts" "$_uniq"
-	msg "$(human_count "$_count") paths indexed$([ "$_uniq" != "-" ] && printf ', exclusive size %s' "$(human_bytes "$_uniq")")"
+	## No exclusive size here: macOS does not expose one for an APFS Time
+	## Machine snapshot (tmutil uniquesize refuses with pathInAPFSBackup, and
+	## diskutil reports no per-snapshot space), so asking cost a second full
+	## walk of the disk to fail every time.
+	index_mark_covered "$_h" "$_ts"
+	msg "$(human_count "$_count") paths indexed"
 	rm -f "$_paths"
 	snap_umount "$_mp" >/dev/null 2>&1
 	return 0
@@ -2792,26 +2781,8 @@ remote_snap_names() {
 }
 
 #############################################################################
-## --unique / --verify
+## --verify
 #############################################################################
-
-cmd_unique() {
-	_hit=$(resolve_id "$1") || snapshot_gone "$1"
-	_loc=$(printf '%s' "$_hit" | awk -F'\t' '{print $1}')
-	_ts=$(printf '%s' "$_hit" | awk -F'\t' '{print $2}')
-	_vol=$(snapshots_get "$_loc" | awk -F'\t' -v t="$_ts" '$2 == t {print $11; exit}')
-	[ "${_vol:--}" = "-" ] && _vol="Data"
-	transient_snapshot "$_loc" "$_ts" >/dev/null || err "could not mount"
-	_base=$(mnt_volume_path "$_loc" "$_ts" "$_vol")
-	note "walking the snapshot -- this is the same trip over the disk --index makes"
-	_u=$(run tmutil uniquesize "$_base" 2>/dev/null | awk '{print $1; exit}')
-	case "${_u:-}" in
-		[0-9]*) index_mark_covered "$_loc" "$_ts" "$_u"
-		        printf ' %-8s %s\n' "$(printf '%s' "$_hit" | awk -F'\t' '{print $3}')" "$(size_or_q "$_u")" ;;
-		*) warn "tmutil uniquesize gave nothing back (Full Disk Access?)" ;;
-	esac
-	return 0
-}
 
 cmd_verify() {
 	_hit=$(resolve_id "$1") || snapshot_gone "$1"
@@ -3802,7 +3773,6 @@ _my-tm() {
     '--cp:copy a version out'
     '--diff:what changed since then'
     '--index:build the name index'
-    '--unique:exclusive size of a snapshot'
     '--verify:re-check stored checksums'
     '--local-snapshot:take an APFS local snapshot'
     '--health:run the health checks'
@@ -3837,7 +3807,7 @@ completion_bash() {
 _my_tm() {
   local cur="${COMP_WORDS[COMP_CWORD]}"
   local cmds="--status --ls --lookup --find --show --mount --umount --open --cat
-    --cp --diff --index --unique --verify --local-snapshot --health --rm --thin
+    --cp --diff --index --verify --local-snapshot --health --rm --thin
     --backup --install --uninstall --setup --add --forget --refresh
     --create-config --config --completion --run-tests --help"
   if [[ "$cur" == -* ]]; then
@@ -3946,7 +3916,6 @@ MAINTAIN
                                  pass. Without arguments: the baselines of every
                                  location. With --all: every snapshot -- an
                                  overnight job, warns first
-  --unique  <ID>                 exclusive size* of one snapshot
   --verify  <ID> [<PATH>...]     re-check the checksums stored at backup time;
                                  the whole snapshot if no <PATH> given
   --local-snap[shot]             take an APFS local snapshot now.
@@ -3986,9 +3955,9 @@ INSTALL & SET UP
   --completion [zsh|bash]        print the completion script
   --run-tests | --version | --help
 
-  * exclusive size -- bytes stored ONLY in that snapshot, i.e. what deleting it
-    would actually free. Everything else in a snapshot is shared with its
-    neighbours, so the sizes in --ls do not add up to the disk usage.
+  ADDED is what a backup WROTE, not what deleting it would free: macOS exposes
+  no per-snapshot exclusive size for an APFS Time Machine store, so no column
+  here can honestly claim one. See the README.
 
 OPTIONS
   -S|--source <FOLDER>   use this location only, skip autodetect
@@ -4233,7 +4202,6 @@ main() {
 		--cp)           [ "$#" -ge 2 ] || err "--cp needs <ID> <PATH> [<DEST>]"; cmd_cp "$@" ;;
 		--diff)         [ "$#" -ge 1 ] || err "--diff needs an <ID>"; cmd_diff "$@" ;;
 		--index)        cmd_index "$@" ;;
-		--unique)       [ "$#" -ge 1 ] || err "--unique needs an <ID>"; cmd_unique "$@" ;;
 		--verify)       [ "$#" -ge 1 ] || err "--verify needs an <ID>"; cmd_verify "$@" ;;
 		--local-snap|--local-snapshot) cmd_local_snap ;;
 		--health)       cmd_health "$@" ;;
@@ -4293,7 +4261,6 @@ printf 'tmutil %s\n' "\$*" >>"$(t_calls)"
 case "\$1" in
   destinationinfo) printf '====================================================\nName          : TestStore\nKind          : Local\nMount Point   : $T_ROOT/store\nID            : 11111111-2222-3333-4444-555555555555\n====================================================\nName          : EjectedStore\nKind          : Local\nID            : 99999999-8888-7777-6666-555555555555\n' ;;
   listlocalsnapshots) printf 'Snapshots for disk %s:\ncom.apple.TimeMachine.2026-08-23-005931.local\ncom.apple.TimeMachine.2026-08-23-020001.local\n' "\$2" ;;
-  uniquesize) printf '12345678 %s\n' "\$2" ;;
   verifychecksums) case "\$2" in *BADSUM*) printf '! %s\n' "\$2" ;; esac ;;
   status) printf 'Backup session status:\n{\n    Running = 0;\n}\n' ;;
   isexcluded) printf '[Included]    %s\n' "\$2" ;;
@@ -5165,6 +5132,25 @@ t_test_snapshot_set_is_validated() {
 	t_match "the footer dates the scan" "$(cmd_status 2>&1)" "scanned .* ago"
 }
 
+## REGRESSION: the design promised an "exclusive size" column from tmutil
+## uniquesize. That tool refuses on an APFS Time Machine store
+## ("pathInAPFSBackup"), and nothing else on macOS reports per-snapshot space,
+## so the column could never be filled -- while --index paid for a second full
+## walk of every snapshot to ask.
+t_test_no_exclusive_size_claims() {
+	printf '\nNo column claims a number macOS will not give\n'
+	t_eq "--ls has no UNIQUE column" \
+		"$(cmd_ls store 2>&1 | count_match 'UNIQUE')" "0"
+	t_eq "--help offers no --unique" "$(usage | count_match '--unique')" "0"
+	t_match "and says why there is no such column" "$(usage)" "no per-snapshot exclusive size"
+	: >"$(t_calls)"
+	_rows=$(snapshots_get store)
+	_ts=$(printf '%s\n' "$_rows" | head -n 1 | awk -F'\t' '{print $2}')
+	index_one store "$_ts" >/dev/null 2>&1
+	t_eq "--index never calls uniquesize" \
+		"$(count_match 'tmutil uniquesize' < "$(t_calls)")" "0"
+}
+
 run_tests() {
 	T_WITH_SNAPSHOTS=0
 	for _a in "$@"; do
@@ -5201,6 +5187,7 @@ run_tests() {
 	t_test_indexer_exemption_expires
 	t_test_lookup_collapse
 	t_test_snapshot_set_is_validated
+	t_test_no_exclusive_size_claims
 	t_test_volume_paths
 	t_test_mount_root_fallback
 	t_test_version_store_generation

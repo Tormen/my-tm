@@ -65,8 +65,7 @@ INSPECT
   --status  [<LOCATION>]         one line per location: snapshots, span, space,
                                  index state; all locations if omitted
   --ls      [<LOCATION>]         snapshot table: when, how much each backup
-                                 added, restore size, exclusive size*;
-                                 every location if omitted
+                                 added, restore size; every location if omitted
   --lookup  <PATH> [<LOCATION>]  the distinct versions of PATH and where they
                                  are; searches the locations backing up PATH's
                                  volume if <LOCATION> is omitted, --all for every
@@ -100,12 +99,10 @@ USE
 
 MAINTAIN
   --index   [<LOCATION>|<ID>...] [--all]
-                                 build the name index --find uses, and record
-                                 each snapshot's exclusive size* on the same
-                                 pass. Without arguments: the baselines of every
+                                 build the name index --find uses.
+                                 Without arguments: the baselines of every
                                  location. With --all: every snapshot -- an
                                  overnight job, warns first
-  --unique  <ID>                 exclusive size* of one snapshot
   --verify  <ID> [<PATH>...]     re-check the checksums stored at backup time;
                                  the whole snapshot if no <PATH> given
   --local-snap[shot]             take an APFS local snapshot now.
@@ -146,9 +143,9 @@ INSTALL & SET UP
   --completion [zsh|bash]        print the completion script
   --run-tests | --help
 
-  * exclusive size -- bytes stored ONLY in that snapshot, i.e. what deleting it
-    would actually free. Everything else in a snapshot is shared with its
-    neighbours, so the sizes in --ls do not add up to the disk usage.
+  ADDED is what a backup WROTE, not what deleting it would free: macOS exposes
+  no per-snapshot exclusive size for an APFS Time Machine store, so no column
+  here can honestly claim one (see "Exclusive size" below).
 
 OPTIONS
   -S|--source <FOLDER>   use this location only, skip autodetect
@@ -208,10 +205,10 @@ $ my-tm                                            # = --status
  --> cache 1.4M · index 212M (12/412 snaps, my-tm --index backup) · scanned 3m ago
 
 $ my-tm backup                                     # = --ls backup
- ID      SNAPSHOT             AGE  FILES  ADDED  DRIFT  TOTAL  UNIQUE  VOL
- k7f2q9  2026-08-22_1456.25   14m  17.9k   5.3G   1.4x  1.59T   4.1G   Data
- m3x8b1  2026-08-20_1558.05    2d  12.1k   3.9G   1.0x  1.58T      ?   Data
- q4d7h2  2026-07-30_1558.05   23d  91.2k  84.7G  22.0x! 1.51T      ?   Data
+ ID      SNAPSHOT             AGE  FILES  ADDED  DRIFT  TOTAL  VOL
+ k7f2q9  2026-08-22_1456.25   14m  17.9k   5.3G   1.4x  1.59T   Data
+ m3x8b1  2026-08-20_1558.05    2d  12.1k   3.9G   1.0x  1.58T   Data
+ q4d7h2  2026-07-30_1558.05   23d  91.2k  84.7G  22.0x! 1.51T  Data
  ...409 more (--all) · ADDED avg 3.8G
 
 $ my-tm ~/Documents/report.odt                     # = --lookup
@@ -228,8 +225,7 @@ $ my-tm 'invoice*.pdf'                             # = --find
  --> my-tm <path> for the version table · --all to expand every version here
 ```
 
-Rows from cache for an unmounted location are marked `?`; an unmeasured
-`UNIQUE` is `?` until `--index` or `--unique` fills it in. Anything longer than
+Rows from cache for an unmounted location are marked `?`. Anything longer than
 ~2 lines of prose belongs in `--help`, not in runtime output.
 
 ### The size columns, precisely
@@ -239,7 +235,6 @@ Rows from cache for an unmounted location are marked `?`; an unmeasured
 | **ADDED** | `stats.changed.physicalSize` | bytes this backup **wrote to the backup disk that were not already there** — the delta against the *previous backup*. The churn |
 | **DRIFT** | ADDED ÷ the **median** ADDED | the same number as a ratio, with `!` past `HEALTH_DRIFT_FACTOR`. A normal night is `1.0x`; `22.0x!` means something big got swept in (a VM image, a Downloads folder, a restored archive) — usually something you then want in `--setup`'s exclusions. The median, not the mean: measured on a real store, a handful of huge backups drags a mean so far up that every ordinary night reads `0.0x` and a genuine spike no longer stands out — the outliers would be hiding themselves |
 | **TOTAL** | `stats.propagated.logicalSize` | the **absolute** logical size of everything in that snapshot: what a full restore would occupy **on an empty disk**. It is *not* a delta against your current live disk |
-| **UNIQUE** | `tmutil uniquesize` | **exclusive size**: bytes stored *only* in that snapshot — what deleting it would actually free. Everything else is shared with neighbouring snapshots, so the column does not sum to the disk usage |
 
 The fourth question — *how much would restoring this change my disk as it is
 now?* — is a comparison, not a stored statistic: that is `--diff <ID>`, which
@@ -248,10 +243,22 @@ just runs — after printing one warning line with an ETA derived from the
 snapshot's file count and the last measured walk rate:
 `~4.5M files, roughly 6-9 min. Ctrl-C is safe.`
 
-**UNIQUE is collected during `--index`.** The expensive part of both is
-traversing the snapshot, so `--index` runs `tmutil uniquesize` for each
-snapshot it walks and caches the result — one trip over the disk, both answers.
-After that the column is free; `--unique <ID>` is the one-off form.
+### Exclusive size: macOS does not tell us
+
+There is deliberately **no "how much would deleting this snapshot free?" column**.
+On an APFS Time Machine store macOS exposes no such number:
+
+* `tmutil uniquesize` refuses outright — *"Path is inside an APFS backup"*,
+  `pathInAPFSBackup`. It is an HFS+ `Backups.backupdb` measurement, and HFS+
+  stores are out of scope (below).
+* `diskutil apfs listSnapshots` reports flags (`Purgeable`,
+  `LimitingContainerShrink`) but no per-snapshot space at all.
+* `tmutil compare` walks two trees and reports a delta between them, which is a
+  different question and costs a full traversal.
+
+So the honest columns are the ones the manifest really holds: **ADDED**, what a
+backup wrote, and **TOTAL**, what it would restore. Asking for exclusive size
+also cost `--index` a second full walk of every snapshot — to fail each time.
 
 ## 5. Snapshot IDs *(spec)*
 
@@ -334,7 +341,7 @@ several databases at once, with globs. No dependency, no daemon, no new format.
 $CACHE_DIR/index/system.db     -> the live volume: reuse /var/db/locate.database (free)
 $CACHE_DIR/index/<loc>.db      -> consolidated union of paths seen in that history
 $CACHE_DIR/index/<loc>.inc.NN.db -> per-run increments, folded in on consolidation
-$CACHE_DIR/index/<loc>.covered -> snapshot IDs already indexed, + their exclusive size
+$CACHE_DIR/index/<loc>.covered -> snapshot IDs already indexed
 $CACHE_DIR/index/<loc>.versions/ -> the version store: per-snapshot delta rows
                                   (path, inode, size, mtime; add/del/mod), §6
 ```
@@ -342,9 +349,8 @@ $CACHE_DIR/index/<loc>.versions/ -> the version store: per-snapshot delta rows
 * **Tier 1, free**: every path that exists *now* is already in the system
   `locate` database, refreshed by macOS. Costs nothing, covers most searches.
 * **Tier 2, `--index`**: walks snapshots to catch paths that no longer exist
-  anywhere live, and records each snapshot's exclusive size on the same pass.
-  `find <snapshot> | locate.mklocatedb` per snapshot, merged with
-  `locate.concatdb`.
+  anywhere live. `find <snapshot> | locate.mklocatedb` per snapshot, merged with
+  `locate.concatdb` — both of which live in `/usr/libexec`, not on `PATH`.
 * **The same walk fills the version store.** Each indexed snapshot is diffed
   against the previously walked one (`comm` of the two sorted `find` lists —
   the sort already happens for `mklocatedb`): added, removed and modified
@@ -746,7 +752,6 @@ after a reboot, which `--uninstall` says in one line. It asks before deleting
 
   Resolution order: the CLI argument beats `THIN_POLICY_PER_LOCATION` for that
   handle, which beats the global `THIN_POLICY_TO_KEEP`.
-* **`--unique <ID>`** — the exclusive size of one snapshot; see §4.
 * **`--verify <ID> [<PATH>…]`** — `tmutil verifychecksums`, which takes *paths*,
   so it works at **snapshot, directory or single-file** granularity. Whole
   snapshots are slow; a directory or one file is quick. Reports `!` (checksum
@@ -928,7 +933,7 @@ A `PATH` is *covered* by a location when the volume UUID of `PATH`
     locations.cache         handle, UUID, mountpoint, kind, source volumes,
                             snapshot count, span, scanned-at
     snapshots.cache         one line per snapshot, ALL locations: ID, loc,
-                            timestamp, xid, files, added, total, unique, state
+                            timestamp, xid, files, added, total, state
     mounts.cache            root's own mount records (§8)
     index/                  the search databases (§7)
     mount/                  the /tm tree (§8)
