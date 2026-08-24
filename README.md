@@ -34,7 +34,7 @@ unambiguous: a file called `status` in `$PWD` can never be mistaken for a verb.
 
 | Term | Meaning |
 |---|---|
-| **location** | a Time Machine backup disk (`/Volumes/TimeMachine.Backup`), a machine dir under `/Volumes/.timemachine/<host>/`, an `ssh` target (`host1:/Volumes/…`), or the pseudo-location `local` (APFS local snapshots, §8) |
+| **location** | a Time Machine backup disk (`/Volumes/TimeMachine.Backup`), a network store (`<share>/<host>.sparsebundle`), an `ssh` target (`host1:/Volumes/…`), or the pseudo-location `local` (APFS local snapshots, §8) |
 | **handle** | your short name for a location — `backup`, `host1`. Set with `--add`. Anywhere `<LOCATION>` appears, a handle or a path both work |
 | **snapshot** | one backup inside a location, `2026-08-20_1558.05` |
 | **ID** | 6-char handle for one snapshot, `k7f2q9`. Stable, machine-independent (§5). Short enough to double-click-select in a terminal |
@@ -286,8 +286,11 @@ or `-S` narrows, `--all` widens to every known location.
 
 * The path need not exist locally — a **deleted** file looks up the same way;
   my-tm walks up to the nearest existing ancestor to identify the volume.
-* Identical versions collapse by inode + size + mtime (APFS clones make
-  unchanged files share an inode), so you see *distinct versions*, not 412 rows.
+* Identical versions collapse by **size + mtime**, so you see *distinct
+  versions*, not 412 rows. Deliberately not the inode: Time Machine does not
+  keep one stable across snapshots of every store -- measured on a network
+  sparsebundle, a file untouched since 2020 had a different inode in all 100
+  snapshots, which would report 100 versions of a file that never changed.
 * Snapshots are immutable, so every answer is a **permanent fact**. my-tm
   keeps them in the version store (§7): a snapshot already covered — fully, by
   an `--index` walk, or for this path, by any earlier lookup of it — is
@@ -841,6 +844,33 @@ comes back as one clear line — `host1: my-tm not installed there. Run: my-tm
 config. `--install <SSH-HOST>` does that one host; `--install` with no argument
 does the local machine and every configured host.
 
+### Network stores: `<host>.sparsebundle` *(spec)*
+
+A Time Machine destination on a NAS or Time Capsule is a **sparsebundle** on an
+SMB/AFP share holding an ordinary APFS store -- same manifest, same APFS
+snapshots, same size columns. my-tm treats it as one more kind of location:
+
+```text
+my-tm --add /Volumes/<share>/<host>.sparsebundle nas
+```
+
+* **Attached read-only, always** (`hdiutil attach -readonly -nobrowse -noverify`):
+  the bundle belongs to the Mac that backs up into it, and a writable attach
+  could collide with it. Read-only also means no `fsck` and no risk to a backup.
+* **Attached only when the store must really be read.** A fresh cache answers
+  `--status` and `--ls` with no attach at all; a stale one pays for it once.
+* **Detached again on the way out**, after the snapshots mounted inside it are
+  released -- an image with a live mount inside it is busy. Only images my-tm
+  attached itself are ever detached.
+* **Identity comes from `Info.plist`'s `uuid`, readable without attaching**, so
+  snapshot IDs are stable while the share is offline and survive the share being
+  mounted somewhere else.
+* **A bundle that will not open read-only** is a warning when my-tm met it while
+  sweeping every location, and an error when the command named that store.
+* Bundles belonging to **other** Macs on the same share are never picked up
+  automatically -- they are someone else's backups -- but `--add` takes one, and
+  the cache then answers for it like any other location.
+
 ### What my-tm does not cover
 
 **Legacy HFS+ `Backups.backupdb` stores are deliberately out of scope.** They
@@ -1152,7 +1182,8 @@ mount or root **skips with a printed reason** — never a silent pass.
   collision escalation 6→7→8, prefix resolution, `latest` / `-N` /
   `<handle>@<date>`, and the "snapshot gone" message
 * lookup: absolute, relative-to-`$PWD`, deleted path via nearest existing
-  ancestor, version collapsing by inode+size+mtime, coverage by volume UUID,
+  ancestor, version collapsing by size+mtime with differing inodes, coverage
+  by volume UUID,
   excluded-path handling; a version-store-covered snapshot is answered with no
   `mount_apfs` call (proven via the stub `PATH` log), and a live-`stat`ed row
   lands in the store so the rerun reads it from there

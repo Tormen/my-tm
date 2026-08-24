@@ -94,6 +94,8 @@ TRANSIENT_LIST="${TMPDIR:-/tmp}/.my-tm.transient.$$"
 ## Volumes WE mounted, to be put back exactly as they were. A file for the
 ## same reason as above: every caller reaches this through a subshell.
 TRANSIENT_VOLUMES="${TMPDIR:-/tmp}/.my-tm.volumes.$$"
+## Disk images WE attached, to be detached again on the way out.
+TRANSIENT_IMAGES="${TMPDIR:-/tmp}/.my-tm.images.$$"
 
 #############################################################################
 ## OUTPUT
@@ -626,6 +628,26 @@ loc_line() {
 loc_target() { loc_line "$1" | awk -F'\t' '{print $2}'; }
 loc_install_dir() { loc_line "$1" | awk -F'\t' '{print $3}'; }
 
+## A sparsebundle is a Time Machine store inside a disk image: the store is
+## only readable once the image is attached, but its identity is readable
+## from Info.plist without attaching anything.
+is_image_target() {
+	case "$1" in
+		*.sparsebundle|*.sparseimage|*.dmg) return 0 ;;
+	esac
+	return 1
+}
+
+## local | ssh | image | disk
+loc_kind() {
+	_t=$(loc_target "$1")
+	case "$_t" in local) printf 'local\n'; return 0 ;; esac
+	is_remote_target "$_t" && { printf 'ssh\n'; return 0; }
+	is_image_target "$_t" && { printf 'image\n'; return 0; }
+	printf 'disk\n'
+	return 0
+}
+
 is_remote_target() {
 	case "$1" in
 		local|/*) return 1 ;;
@@ -639,14 +661,32 @@ loc_is_remote() { is_remote_target "$(loc_target "$1")"; }
 remote_host() { printf '%s\n' "${1%%:*}"; }
 remote_path() { printf '%s\n' "${1#*:}"; }
 
-## the volume whose APFS snapshots this location holds
-loc_volume() {
-	_t=$(loc_target "$1")
-	case "$_t" in
+## The directory holding the store: the target itself for a plain disk, and
+## for an image the volume inside it, attaching it on demand. Called only
+## when the store must really be READ, so a fresh cache costs no attach.
+loc_store_path() {
+	_h="$1"
+	_t=$(loc_target "$_h")
+	case "$(loc_kind "$_h")" in
 		local) printf '/System/Volumes/Data\n' ;;
-		*)     printf '%s\n' "$_t" ;;
+		image)
+			if _mp=$(image_attach "$_t"); then
+				printf '%s\n' "$_mp"
+			else
+				## warning here, error where a command named this store: this is
+				## reached both from a sweep over every location and from a direct
+				## request, and only the caller knows which
+				warn "$_h: could not open $_t read-only -- it is not readable right now"
+				return 1
+			fi
+			;;
+		*) printf '%s\n' "$_t" ;;
 	esac
+	return 0
 }
+
+## the volume whose APFS snapshots this location holds
+loc_volume() { loc_store_path "$1"; }
 
 ## device node of a mounted volume (disk5s2)
 vol_device() {
@@ -677,6 +717,13 @@ loc_uuid() {
 		local) vol_uuid /System/Volumes/Data; return 0 ;;
 	esac
 	is_remote_target "$_t" && { printf '%s\n' "$_t"; return 0; }
+	## a sparsebundle carries its own uuid in Info.plist, readable WITHOUT
+	## attaching it -- so snapshot IDs are stable even for a store that is
+	## offline, and survive the share being mounted somewhere else
+	if is_image_target "$_t" && [ -f "$_t/Info.plist" ]; then
+		_iu=$(plutil -extract uuid raw -o - "$_t/Info.plist" 2>/dev/null)
+		[ -n "$_iu" ] && { printf '%s\n' "$_iu"; return 0; }
+	fi
 	_d=$(destinations_scan | awk -F'\t' -v mp="$_t" '$2 == mp && !f { print $3; f = 1 }')
 	if [ -n "$_d" ]; then
 		printf '%s\n' "$_d"
@@ -692,6 +739,8 @@ loc_reachable() {
 		local) return 0 ;;
 	esac
 	is_remote_target "$_t" && return 0
+	## an image only has to BE there; opening it is a separate, later cost
+	is_image_target "$_t" && { [ -f "$_t/Info.plist" ] || [ -f "$_t" ]; return $?; }
 	[ -d "$_t" ]
 }
 
@@ -713,8 +762,9 @@ snap_names() {
 			;;
 	esac
 	is_remote_target "$_t" && { remote_snap_names "$_h"; return 0; }
-	[ -d "$_t" ] || return 0
-	_dev=$(vol_device "$_t")
+	_sp=$(loc_store_path "$_h") || return 0
+	[ -d "$_sp" ] || return 0
+	_dev=$(vol_device "$_sp")
 	[ -n "$_dev" ] || return 0
 	diskutil apfs listSnapshots "$_dev" 2>/dev/null |
 		sed -nE 's/.*com\.apple\.TimeMachine\.([0-9-]+)\.backup.*/\1/p' | sort
@@ -734,6 +784,7 @@ snap_states() {
 	_t=$(loc_target "$1")
 	case "$_t" in local) return 0 ;; esac
 	is_remote_target "$_t" && return 0
+	_t=$(loc_store_path "$1") || return 0
 	[ -d "$_t" ] || return 0
 	for _e in "$_t"/*.inprogress "$_t"/*.interrupted "$_t"/*.previous; do
 		[ -e "$_e" ] || continue
@@ -822,10 +873,15 @@ snapshots_build() {
 $_names
 _EOF
 
-	if [ "$(loc_target "$_h")" = "local" ]; then
+	if [ "$(loc_kind "$_h")" = "local" ]; then
 		: >"$_tmpd/manifest"
 	else
-		manifest_parse "$(loc_target "$_h")" >"$_tmpd/manifest" 2>/dev/null || : >"$_tmpd/manifest"
+		_sp=$(loc_store_path "$_h") || _sp=""
+		if [ -n "$_sp" ]; then
+			manifest_parse "$_sp" >"$_tmpd/manifest" 2>/dev/null || : >"$_tmpd/manifest"
+		else
+			: >"$_tmpd/manifest"
+		fi
 	fi
 	snap_states "$_h" >"$_tmpd/states" 2>/dev/null || : >"$_tmpd/states"
 	unique_cache_dump "$_h" >"$_tmpd/unique" 2>/dev/null || : >"$_tmpd/unique"
@@ -1014,6 +1070,67 @@ snapshot_gone() {
 ##   layout uniform: a backup-store snapshot mounts with an inner <ts>.backup/
 ##   wrapper, a local one does not, and neither shape reaches the user.
 #############################################################################
+
+## Where an image is attached right now, if it is attached at all -- by us or
+## by anyone else. hdiutil knows; the mount table alone does not say which
+## volume came from which image.
+image_mountpoint() {
+	_pl=$(mktemp /tmp/my-tm.hdi.XXXXXX) || return 1
+	hdiutil info -plist >"$_pl" 2>/dev/null || { rm -f "$_pl"; return 1; }
+	_mp=$(plutil -p "$_pl" 2>/dev/null | awk -v img="$1" '
+		/"image-path" =>/ { p = $0; sub(/^[^>]*=> /, "", p); gsub(/"/, "", p);
+		                    here = (p == img) }
+		here && /"mount-point" =>/ && !f { m = $0; sub(/^[^>]*=> /, "", m);
+		                    gsub(/"/, "", m); print m; f = 1 }')
+	rm -f "$_pl"
+	[ -n "$_mp" ] || return 1
+	printf '%s\n' "$_mp"
+	return 0
+}
+
+## Attach read-only, always: a Time Machine sparsebundle belongs to the Mac
+## that backs up into it, and a writable attach could collide with it.
+## Read-only also means no fsck and no risk to the backup.
+image_attach() {
+	_img="$1"
+	if _mp=$(image_mountpoint "$_img"); then
+		dbg "$_img is already attached at $_mp"
+		printf '%s\n' "$_mp"
+		return 0
+	fi
+	_pl=$(mktemp /tmp/my-tm.att.XXXXXX) || return 1
+	run_echo hdiutil attach -readonly -nobrowse -noverify -noautofsck "$_img"
+	why "read-only, so it cannot collide with the Mac that backs up into it"
+	if ! hdiutil attach -readonly -nobrowse -noverify -noautofsck -plist "$_img" \
+			>"$_pl" 2>/dev/null; then
+		rm -f "$_pl"
+		return 1
+	fi
+	_mp=$(plutil -p "$_pl" 2>/dev/null |
+		awk '/"mount-point" =>/ && !f { m = $0; sub(/^[^>]*=> /, "", m);
+		                                gsub(/"/, "", m); print m; f = 1 }')
+	rm -f "$_pl"
+	[ -n "$_mp" ] || return 1
+	printf '%s\n' "$_img" >>"$TRANSIENT_IMAGES"
+	printf '%s\n' "$_mp"
+	return 0
+}
+
+## Detach only images WE attached, and only after the snapshots mounted
+## inside them are gone -- an image with a live mount inside it is busy.
+cleanup_images() {
+	[ -f "$TRANSIENT_IMAGES" ] || return 0
+	while IFS= read -r _i; do
+		[ -n "$_i" ] || continue
+		if run hdiutil detach "$(image_mountpoint "$_i" 2>/dev/null)" -quiet >/dev/null 2>&1; then
+			dbg "detached $_i again, as it was found"
+		else
+			warn "could not detach $_i again"
+		fi
+	done <"$TRANSIENT_IMAGES"
+	rm -f "$TRANSIENT_IMAGES"
+	return 0
+}
 
 mnt_private_root() { printf '%s/.mnt\n' "$MOUNT_ROOT"; }
 mnt_point_for()    { printf '%s/.mnt/%s/%s\n' "$MOUNT_ROOT" "$1" "$2"; }
@@ -1256,7 +1373,7 @@ cleanup_transient() {
 	return $_rc
 }
 
-cleanup_all() { cleanup_transient; cleanup_volumes; }
+cleanup_all() { cleanup_transient; cleanup_images; cleanup_volumes; }
 trap 'cleanup_all' EXIT
 trap 'cleanup_all; exit 130' INT
 trap 'cleanup_all; exit 143' TERM
@@ -1885,6 +2002,24 @@ path_in_volume() {
 	esac
 }
 
+## Collapse consecutive snapshots holding the SAME version into one row.
+##
+## The key is size+mtime, deliberately NOT the inode. Time Machine does not
+## keep an inode stable across snapshots of every store: measured on a
+## network sparsebundle, a file untouched since 2020 had a different inode
+## in all 100 snapshots, which reported 100 "distinct versions" of a file
+## that never changed. Size+mtime is right in both cases.
+lookup_collapse() {
+	awk -F'\t' '
+		{
+			key = $5 "|" $6;
+			if (NR > 1 && key == prev) next;
+			prev = key;
+			print $0;
+		}
+	'
+}
+
 ## stat one chunk of mounted snapshots in a single exec, file the facts, and
 ## release that chunk again.  <workdir> <location> <relative path>
 lookup_flush() {
@@ -1990,15 +2125,7 @@ _EOF
 		## collapse identical versions (inode+size+mtime), newest row per group
 		printf ' %-8s %-20s %5s %6s  %s\n' ID SNAPSHOT AGE SIZE STATE
 		_now=$(now_epoch)
-		sort -t"$(printf '\t')" -k2,2nr "$_work/known" | awk -F'\t' -v now="$_now" \
-			-v li="${_live_i:--}" -v ls="${_live_s:--}" -v lm="${_live_m:--}" '
-			{
-				key = $4 "|" $5 "|" $6;
-				if (key == prev) next;
-				prev = key;
-				print $0;
-			}
-		' >"$_work/distinct"
+		sort -t"$(printf '\t')" -k2,2nr "$_work/known" | lookup_collapse >"$_work/distinct"
 
 		_ndist=0
 		while IFS="$(printf '\t')" read -r _ts _ep _id _i _s _m; do
@@ -2964,7 +3091,7 @@ cmd_rm() {
 		if [ "$(loc_target "$_loc")" = "local" ]; then
 			run tmutil deletelocalsnapshots "$_ts" || warn "$_id: delete failed"
 		else
-			run tmutil delete -d "$(loc_target "$_loc")" -t "$_ts" || warn "$_id: delete failed"
+			run tmutil delete -d "$(loc_store_path "$_loc")" -t "$_ts" || warn "$_id: delete failed"
 		fi
 	done <"$_plan"
 	rm -f "$_plan"
@@ -3096,7 +3223,7 @@ cmd_thin() {
 			if [ "$(loc_target "$_h")" = "local" ]; then
 				run tmutil deletelocalsnapshots "$_ts" || warn "$_ts: delete failed"
 			else
-				run tmutil delete -d "$(loc_target "$_h")" -t "$_ts" || warn "$_ts: delete failed"
+				run tmutil delete -d "$(loc_store_path "$_h")" -t "$_ts" || warn "$_ts: delete failed"
 			fi
 		done
 		snapshots_cache_invalidate
@@ -3215,7 +3342,15 @@ cmd_add() {
 		err "handle '$_handle' is already registered"
 
 	## probe before writing anything
-	if ! is_remote_target "$_folder"; then
+	if is_image_target "$_folder"; then
+		## a store inside a disk image: its manifest is only readable once the
+		## image is attached, but Info.plist identifies it without attaching
+		if [ -f "$_folder/Info.plist" ]; then
+			minor "disk image store, uuid $(plutil -extract uuid raw -o - "$_folder/Info.plist" 2>/dev/null)"
+		else
+			warn "$_folder has no Info.plist -- it does not look like a sparsebundle"
+		fi
+	elif ! is_remote_target "$_folder"; then
 		_vols=$(manifest_parse "$_folder" 2>/dev/null | awk -F'\t' '{print $5}' | sort -u | tr '\n' ' ')
 		if [ -z "$(printf '%s' "$_vols" | tr -d ' ')" ]; then
 			warn "$_folder has no readable backup_manifest.plist -- adding it anyway, but it may not be a Time Machine store"
@@ -4954,6 +5089,41 @@ t_test_indexer_exemption_expires() {
 		"$(indexer_still_running "" "$$" && echo exempt || echo swept)" "swept"
 }
 
+## REGRESSION: the collapse used to key on inode+size+mtime, on the assumption
+## that an unchanged file keeps its inode across snapshots. It does not: on a
+## network sparsebundle a file untouched since 2020 had a different inode in
+## every one of 100 snapshots, so my-tm reported 100 distinct versions of a
+## file that had never changed.
+t_test_lookup_collapse() {
+	printf '\nCollapsing identical versions\n'
+	_in="$T_ROOT/collapse.in"
+	## same size+mtime, different inode every time -- one version, not three
+	{
+		printf '2026-08-03-000000\t300\tc3\t1072655\t14\t1584627176\n'
+		printf '2026-08-02-000000\t200\tb2\t5206697\t14\t1584627176\n'
+		printf '2026-08-01-000000\t100\ta1\t6410596\t14\t1584627176\n'
+	} >"$_in"
+	t_eq "an unchanged file is one version, whatever the inode says" \
+		"$(lookup_collapse <"$_in" | count_lines)" "1"
+	t_eq "and it is the newest row that is kept" \
+		"$(lookup_collapse <"$_in" | head -n 1 | cut -f1)" "2026-08-03-000000"
+
+	## a real change must still show up
+	printf '2026-08-04-000000\t400\td4\t99\t22\t1584627999\n' >"$T_ROOT/c2.in"
+	cat "$_in" >>"$T_ROOT/c2.in"
+	t_eq "a changed size or mtime is a new version" \
+		"$(lookup_collapse <"$T_ROOT/c2.in" | count_lines)" "2"
+
+	## present -> absent -> present must not be flattened
+	{
+		printf '2026-08-03-000000\t300\tc3\t1\t14\t100\n'
+		printf '2026-08-02-000000\t200\tb2\t-\t-\t-\n'
+		printf '2026-08-01-000000\t100\ta1\t2\t14\t100\n'
+	} >"$T_ROOT/c3.in"
+	t_eq "a gap in the middle is kept" \
+		"$(lookup_collapse <"$T_ROOT/c3.in" | count_lines)" "3"
+}
+
 run_tests() {
 	T_WITH_SNAPSHOTS=0
 	for _a in "$@"; do
@@ -4988,6 +5158,7 @@ run_tests() {
 	t_test_verify_reports
 	t_test_locate_toolchain
 	t_test_indexer_exemption_expires
+	t_test_lookup_collapse
 	t_test_volume_paths
 	t_test_mount_root_fallback
 	t_test_version_store_generation
