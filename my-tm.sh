@@ -11,7 +11,7 @@
 set -u
 
 US="${0##*/}"
-MY_TM_VERSION="1.0.0"
+MY_TM_VERSION="0.9"
 
 #############################################################################
 ## DEFAULTS -- all neutral.  Site values belong in the config file, never here.
@@ -3510,7 +3510,7 @@ INSTALL & SET UP
   --create-config [<FILE>]       print the default config, or write it to <FILE>
   --config <FILE>                use this config instead of the search order
   --completion [zsh|bash]        print the completion script
-  --run-tests | --help
+  --run-tests | --version | --help
 
   * exclusive size -- bytes stored ONLY in that snapshot, i.e. what deleting it
     would actually free. Everything else in a snapshot is shared with its
@@ -4240,7 +4240,8 @@ t_test_rm_dryrun() {
 t_test_help() {
 	printf '\n--help and command coverage\n'
 	_u=$(usage)
-	t_match "usage starts with the standard line" "$_u" "^usage: my-tm \[OPTIONS\]"
+	## the usage line names the tool as it was INVOKED (my-tm, my-tm.sh, ...)
+	t_match "usage starts with the standard line" "$_u" "^usage: $US \[OPTIONS\]"
 	t_match "--mount --help explains the TTL" "$(usage_mount)" "CANNOT BE DELETED"
 	## every --command named in the usage block must be dispatchable
 	_missing=""
@@ -4315,7 +4316,7 @@ run_tests() {
 		printf ' !!! do not run the tests as root -- they must pass unprivileged.\n' >&2
 		exit 1
 	fi
-	printf 'my-tm %s -- self test\n' "$MY_TM_VERSION"
+	printf '%s %s -- self test\n' "$US" "$MY_TM_VERSION"
 	t_setup
 
 	t_test_ids
