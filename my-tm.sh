@@ -34,6 +34,7 @@ MOUNT_ROOT="/var/lib/my-tm/mount"
 SITE_CONF_DIR="${SITE_CONF_DIR:-/usr/local/etc}"
 NOTIFY_MOUNT_WARN=1
 CACHE_TTL=3600
+USAGE_SAMPLE_INTERVAL=900
 INDEX_BASELINES="newest oldest"
 INDEX_INC_MAX=16
 INDEX_REMOTE_COPY=1
@@ -107,9 +108,14 @@ TRANSIENT_IMAGES="${TMPDIR:-/tmp}/.my-tm.images.$$"
 ##   ~~~  debug             ~    fine debug (-DD)
 #############################################################################
 
-msg()   { printf ' >>> %s\n' "$*"; }
-med()   { printf '  >> %s\n' "$*"; }
-minor() { printf '    > %s\n' "$*"; }
+## Progress and diagnostics go to STDERR; results go to stdout.
+##
+## Not cosmetic: snap_mount and image_attach are called inside $(...) to capture
+## the path they produce, so anything they print on stdout is captured INTO that
+## path. Under -V that silently corrupted every mountpoint my-tm handled.
+msg()   { printf ' >>> %s\n' "$*" >&2; }
+med()   { printf '  >> %s\n' "$*" >&2; }
+minor() { printf '    > %s\n' "$*" >&2; }
 warn()  { printf ' !!! %s\n' "$*" >&2; }
 note()  { printf ' --> %s\n' "$*"; }
 
@@ -134,20 +140,20 @@ err() {
 ## run CMD...  -- echo it under -V, then execute it.  The echoed line and the
 ## executed line come from the same argv, so they can never drift.
 run() {
-	[ "$VRB" = "1" ] && printf ' >>> %s\n' "$*"
+	[ "$VRB" = "1" ] && printf ' >>> %s\n' "$*" >&2
 	"$@"
 }
 
 ## same, but for a command whose output is captured: caller does the exec.
 run_echo() {
-	[ "$VRB" = "1" ] && printf ' >>> %s\n' "$*"
+	[ "$VRB" = "1" ] && printf ' >>> %s\n' "$*" >&2
 	return 0
 }
 
 ## a `    > ` explanation belonging to the command echoed just above
 why() {
 	[ "$VRB" = "1" ] || return 0
-	printf '    > %s\n' "$*"
+	printf '    > %s\n' "$*" >&2
 	return 0
 }
 
@@ -702,6 +708,29 @@ vol_device() {
 	return 0
 }
 
+## The volume a path lives on. diskutil says nothing useful about a plain file,
+## so df names the mountpoint and the mountpoint carries the UUID -- the same
+## UUID the backup manifest keys its volumeStoreInfo by.
+path_volume_mount() { df -P "$1" 2>/dev/null | awk 'NR == 2 {print $6}'; }
+
+path_volume_uuid() {
+	_m=$(path_volume_mount "$1")
+	[ -n "$_m" ] || return 1
+	vol_uuid "$_m"
+}
+
+## the source volumes a store holds backups OF, straight from its manifest
+loc_source_uuids() {
+	_sp=$(loc_store_path "$1" 2>/dev/null) || return 1
+	[ -f "$_sp/backup_manifest.plist" ] || return 1
+	plutil -p "$_sp/backup_manifest.plist" 2>/dev/null | awk '
+		/"volumeStoreInfo" =>/ { inv = 1; next }
+		inv && /^      "[0-9A-Fa-f-]+" => \{/ {
+			u = $1; gsub(/"/, "", u); print u; inv = 0
+		}
+	' | sort -u
+}
+
 vol_uuid() {
 	_plist=$(mktemp /tmp/my-tm.disk.XXXXXX) || return 1
 	if diskutil info -plist "$1" >"$_plist" 2>/dev/null; then
@@ -1247,7 +1276,7 @@ loc_open() {
 
 ## usable now? -- opening it first if that is what it takes
 loc_ready() {
-	loc_open "$1" >&2
+	loc_open "$1"
 	loc_reachable "$1"
 }
 
@@ -1265,6 +1294,35 @@ cleanup_volumes() {
 		fi
 	done <"$TRANSIENT_VOLUMES"
 	rm -f "$TRANSIENT_VOLUMES"
+	return 0
+}
+
+## How much of the store is actually in use, sampled over time.
+##
+## Ground truth from df, unlike ADDED which is Time Machine's own accounting.
+## What it CANNOT give is "what would deleting this snapshot free": that is a
+## property of the CURRENT snapshot set, not of history -- blocks become shared
+## when the next backup keeps them, and exclusive again when a neighbour is
+## deleted. What it does give is growth, thinning and a capacity forecast, and
+## those need a series -- so sampling starts early and cheaply.
+usage_sample() {
+	_h="$1"
+	[ "$(loc_kind "$_h")" = "disk" ] || return 0
+	loc_reachable "$_h" || return 0
+	_f="$(cache_write_dir)/usage.$_h.tsv"
+	_now=$(now_epoch)
+	if [ -f "$_f" ]; then
+		_last=$(awk -F'\t' 'END {print $1 + 0}' "$_f" 2>/dev/null)
+		[ $(( _now - ${_last:-0} )) -lt "${USAGE_SAMPLE_INTERVAL:-900}" ] && return 0
+	fi
+	_sp=$(loc_store_path "$_h" 2>/dev/null) || return 0
+	[ -d "$_sp" ] || return 0
+	_du=$(df -k "$_sp" 2>/dev/null | awk 'NR == 2 {printf "%s\t%s", $3 * 1024, $4 * 1024}')
+	[ -n "$_du" ] || return 0
+	_n=$(snapshots_cached_only "$_h" | count_lines)
+	need_dir "$(dirname "$_f")" || return 0
+	printf '%s\t%s\t%s\n' "$_now" "$_du" "$_n" >>"$_f" 2>/dev/null || true
+	dbg "usage sample for '$_h': $_du ($_n snapshots)"
 	return 0
 }
 
@@ -1347,7 +1405,10 @@ snap_mount() {
 		return 0
 	fi
 	need_dir "$_mp" || { warn "cannot create mountpoint: $_mp"; return 1; }
-	if run mount_apfs -s "$_apfs" "$_vol_src" "$_mp" >/dev/null 2>&1; then
+	## echo the command, then silence only ITS output: "run cmd >/dev/null 2>&1"
+	## swallows the echo too, which made -V hide the very calls it exists to show
+	run_echo mount_apfs -s "$_apfs" "$_vol_src" "$_mp"
+	if mount_apfs -s "$_apfs" "$_vol_src" "$_mp" >/dev/null 2>&1; then
 		why "read-only snapshot mount; no root needed, and it pins the snapshot until released"
 		mount_record_add "$_id" "$_loc" "$_mp" "$_ttl" "$_flags"
 		printf '%s\n' "$_mp"
@@ -1372,9 +1433,11 @@ snap_umount() {
 		return 0
 	fi
 	if [ "$_force" = "1" ]; then
-		run umount -f "$_mp" >/dev/null 2>&1 || return 1
+		run_echo umount -f "$_mp"
+		umount -f "$_mp" >/dev/null 2>&1 || return 1
 	else
-		run umount "$_mp" >/dev/null 2>&1 || return 1
+		run_echo umount "$_mp"
+		umount "$_mp" >/dev/null 2>&1 || return 1
 	fi
 	mount_record_drop "$_mp"
 	rmdir "$_mp" 2>/dev/null
@@ -1643,6 +1706,135 @@ _EOF
 ##   inode "-" means: verified absent from that snapshot.
 #############################################################################
 
+## The version store proper.
+##
+##   <loc>.versions/base.<XX>.gz   the first indexed snapshot, in 256 buckets
+##   <loc>.versions/d.<ts>.tsv     what changed in each later snapshot
+##   <loc>.versions/base.ts        which snapshot the baseline is
+##
+## A full snapshot is ~4.4M rows of path+size+mtime: 722 MB raw, 35 MB gzipped
+## (measured). Keeping one per snapshot would be gigabytes, so only the first is
+## stored whole and the rest as deltas -- at the measured 0.4 % churn that is a
+## couple of hundred KB each. The baseline is bucketed by a hash of the path so
+## a single-path query decompresses ~140 KB instead of 35 MB.
+vs_dir() { printf '%s/index/%s.versions\n' "$(cache_write_dir)" "$1"; }
+
+## Which baseline bucket a path lives in. Must match vs_write_baseline exactly:
+## the last two characters of the path, with anything awkward folded to "_".
+vs_bucket() {
+	_p="$1"
+	case "$_p" in
+		?) _l="$_p" ;;
+		*) _l=${_p#"${_p%??}"} ;;
+	esac
+	printf '%s' "$_l" | sed 's/[^0-9a-zA-Z]/_/g'
+	printf '\n'
+}
+
+## Every version of PATH the index knows about, with no mount at all.
+## Emits: ts <TAB> size <TAB> mtime   ("-" for a snapshot that lacks the file)
+vs_versions_for() {
+	_loc="$1"; _p="$2"
+	_d=$(vs_dir "$_loc")
+	[ -f "$_d/base.ts" ] || return 1
+	_bts=$(cat "$_d/base.ts" 2>/dev/null)
+	[ -n "$_bts" ] || return 1
+	_b=$(vs_bucket "$_p")
+	_cur=$(gzip -cd "$_d/base.$_b.gz" 2>/dev/null |
+		awk -F'\t' -v p="$_p" '$1 == p {printf "%s\t%s", $2, $3; exit}')
+	[ -n "$_cur" ] || _cur=$(printf -- '-\t-')
+	printf '%s\t%s\n' "$_bts" "$_cur"
+	## then replay the deltas in time order, carrying the last known state
+	for _df in "$_d"/d.*.tsv; do
+		[ -f "$_df" ] || continue
+		_dts=$(basename "$_df"); _dts=${_dts#d.}; _dts=${_dts%.tsv}
+		_row=$(awk -F'\t' -v p="$_p" '$1 == p {printf "%s\t%s", $2, $3; exit}' "$_df")
+		[ -n "$_row" ] && _cur="$_row"
+		printf '%s\t%s\n' "$_dts" "$_cur"
+	done
+	return 0
+}
+
+## Write this snapshot's rows: the whole thing if it is the first one indexed
+## for this location, otherwise only what differs from the previous walk.
+vs_record_snapshot() {
+	_loc="$1"; _ts="$2"; _stats="$3"
+	_d=$(vs_dir "$_loc")
+	need_dir "$_d" || return 1
+	_prev="$_d/.prev"
+
+	if [ ! -f "$_d/base.ts" ]; then
+		dbg "version store: writing the baseline from $_ts"
+		vs_write_baseline "$_d" "$_stats" || return 1
+		printf '%s\n' "$_ts" >"$_d/base.ts"
+		gzip -c "$_stats" >"$_prev.gz" 2>/dev/null
+		return 0
+	fi
+
+	## a delta: added and changed rows, plus removals marked absent
+	_dl="$_d/d.$_ts.tsv"
+	if [ -f "$_prev.gz" ]; then
+		_pp=$(mktemp /tmp/my-tm.prev.XXXXXX) || return 1
+		gzip -cd "$_prev.gz" >"$_pp" 2>/dev/null
+		{
+			LC_ALL=C comm -13 "$_pp" "$_stats" || true
+			LC_ALL=C comm -23 "$_pp" "$_stats" | cut -f1 |
+				while IFS= read -r _gonep; do
+					[ -n "$_gonep" ] && printf '%s\t-\t-\n' "$_gonep"
+				done
+		} | LC_ALL=C sort -u >"$_dl" 2>/dev/null
+		dbg "version store: $_ts delta is $(count_lines <"$_dl") rows"
+		rm -f "$_pp"
+	else
+		cp "$_stats" "$_dl" 2>/dev/null
+	fi
+	gzip -c "$_stats" >"$_prev.gz" 2>/dev/null
+	return 0
+}
+
+## bucket + compress a full snapshot listing
+vs_write_baseline() {
+	_d="$1"; _stats="$2"
+	_tmp=$(mktemp -d /tmp/my-tm.base.XXXXXX) || return 1
+	## Bucket on the last two characters of the path. Written by SORTING on the
+	## bucket and closing each file as the key changes: awk keeps every output
+	## file open otherwise and runs out of descriptors long before 256 buckets,
+	## which silently produced no baseline at all.
+	## LC_ALL=C throughout: a real backup contains filenames that are not valid
+	## UTF-8, and awk aborts on those in a UTF-8 locale -- which produced an empty
+	## baseline while every command still reported success.
+	_err=$(mktemp /tmp/my-tm.bkerr.XXXXXX) || return 1
+	LC_ALL=C awk -F'\t' '{
+		n = length($1);
+		if (n == 0) next;
+		b = (n >= 2 ? substr($1, n - 1, 2) : $1);
+		gsub(/[^0-9a-zA-Z]/, "_", b);
+		if (b == "") b = "_";
+		print b "\t" $0
+	}' "$_stats" 2>>"$_err" | LC_ALL=C sort -k1,1 -s 2>>"$_err" |
+	LC_ALL=C awk -F'\t' -v t="$_tmp" '
+		$1 == "" { next }
+		$1 != b { if (b != "") close(f); b = $1; f = t "/" b }
+		f == "" { next }
+		{ sub(/^[^\t]*\t/, ""); print > f }
+		END { if (b != "") close(f) }
+	' 2>>"$_err"
+	for _bf in "$_tmp"/*; do
+		[ -f "$_bf" ] || continue
+		gzip -c "$_bf" >"$_d/base.$(basename "$_bf").gz" 2>/dev/null
+	done
+	_nb=$(ls "$_d"/base.*.gz 2>/dev/null | count_lines)
+	rm -rf "$_tmp"
+	if [ "$_nb" -le 0 ]; then
+		warn "the version baseline could not be written$([ -s "$_err" ] && printf ': %s' "$(head -n 1 "$_err")")"
+		rm -f "$_err"
+		return 1
+	fi
+	rm -f "$_err"
+	dbg "version baseline: $_nb buckets"
+	return 0
+}
+
 vs_file() { printf '%s/index/versions.tsv\n' "$(cache_write_dir)"; }
 
 ## Discard a store written by a different generation of the path logic.
@@ -1843,6 +2035,10 @@ _EOF
 		_sa=$(( $(now_epoch) - $(stat -f '%m' "$_cf" 2>/dev/null || now_epoch) ))
 		_scanned=" · scanned $(human_age "$_sa") ago"
 	fi
+	## the store is open right here, so a sample costs one df
+	for _uh in $(printf '%s\n' "$_locs" | awk -F'\t' '{print $1}'); do
+		usage_sample "$_uh"
+	done
 	_note="cache $_csize · index $_isize"
 	_first_loc=$(printf '%s\n' "$_locs" | awk -F'\t' '$2 != "local" && !f {print $1; f = 1}')
 	if [ -n "$_first_loc" ]; then
@@ -2003,15 +2199,26 @@ locs_covering_path() {
 	## nearest existing ancestor identifies the volume even for a deleted file
 	_a="$_p"
 	while [ ! -e "$_a" ] && [ "$_a" != "/" ]; do _a=$(dirname "$_a"); done
-	_uuid=$(vol_uuid "$_a")
+	_uuid=$(path_volume_uuid "$_a")
 	_any=0
 	_locs=$(locations_all | awk -F'\t' '{print $1}')
 	while IFS= read -r _h; do
 		[ -n "$_h" ] || continue
 		loc_ready "$_h" || continue
 		loc_is_remote "$_h" && continue
-		if [ "$(loc_target "$_h")" = "local" ]; then
-			[ "$_uuid" = "$(vol_uuid /System/Volumes/Data)" ] && { printf '%s\n' "$_h"; _any=1; }
+		if [ "$(loc_kind "$_h")" = "local" ]; then
+			[ "$_uuid" = "$(path_volume_uuid /System/Volumes/Data)" ] &&
+				{ printf '%s\n' "$_h"; _any=1; }
+			continue
+		fi
+		## A store that is open can say exactly which volumes it holds. One that is
+		## away cannot, and assuming it does NOT cover the path would answer "no
+		## backups" about a disk we simply cannot see -- so it stays in the list.
+		_su=$(loc_source_uuids "$_h" 2>/dev/null) || _su=""
+		if [ -n "$_su" ] && [ -n "$_uuid" ]; then
+			if printf '%s\n' "$_su" | grep -qxF "$_uuid"; then
+				printf '%s\n' "$_h"; _any=1
+			fi
 			continue
 		fi
 		printf '%s\n' "$_h"; _any=1
@@ -2107,9 +2314,16 @@ cmd_lookup() {
 		_work=$(mktemp -d /tmp/my-tm.lk.XXXXXX) || return 1
 		: >"$_work/known"
 		: >"$_work/todo"
+		## what the index walk already recorded: every covered snapshot, no mount
+		vs_versions_for "$_h" "$_rel" >"$_work/indexed" 2>/dev/null || : >"$_work/indexed"
+		_nidx=$(count_lines <"$_work/indexed")
+		[ "$_nidx" -gt 0 ] && dbg "lookup $_h: $_nidx snapshots answered from the index"
 		while IFS="$(printf '\t')" read -r _l _ts _ep _id _x _f _a _t2 _u _st _vol; do
 			[ -n "${_ts:-}" ] || continue
-			if _hit=$(vs_lookup "$_h" "$_ts" "$_rel"); then
+			if _hit=$(awk -F'\t' -v t="$_ts" '$1 == t {printf "-\t%s\t%s", $2, $3; exit}' \
+					"$_work/indexed"); [ -n "$_hit" ]; then
+				printf '%s\t%s\t%s\t%s\n' "$_ts" "$_ep" "$_id" "$_hit" >>"$_work/known"
+			elif _hit=$(vs_lookup "$_h" "$_ts" "$_rel"); then
 				printf '%s\t%s\t%s\t%s\n' "$_ts" "$_ep" "$_id" "$_hit" >>"$_work/known"
 			else
 				[ "${_vol:--}" = "-" ] && _vol="Data"
@@ -2703,8 +2917,19 @@ index_one() {
 	_inc="$_dir/$_h.inc.$(printf '%02d' "$_n").db"
 
 	_paths=$(mktemp /tmp/my-tm.idx.XXXXXX) || { snap_umount "$_mp"; return 1; }
-	run_echo find "$_base" -print
-	find "$_base" -print 2>/dev/null | sed "s|^$_base||" | LC_ALL=C sort >"$_paths"
+	## One walk, stats included: path + size + mtime for every entry, batched
+	## through xargs so it is one stat exec per batch and not one per file. The
+	## stats are what makes "which versions of this file do I have" answerable
+	## later without mounting anything.
+	run_echo find "$_base" -print0 \| xargs -0 stat -f '%N%t%z%t%m'
+	_stats=$(mktemp /tmp/my-tm.stat.XXXXXX) || { snap_umount "$_mp"; return 1; }
+	## the same locale discipline for the walk itself
+	find "$_base" -print0 2>/dev/null |
+		xargs -0 stat -f '%N%t%z%t%m' 2>/dev/null |
+		LC_ALL=C sed "s|^$_base||" |
+		LC_ALL=C awk -F'\t' 'length($1) > 0' |
+		LC_ALL=C sort >"$_stats"
+	cut -f1 "$_stats" >"$_paths"
 	_count=$(count_lines < "$_paths")
 	if [ "$_count" -gt 0 ]; then
 		if _mk=$(locate_tool locate.mklocatedb); then
@@ -2724,8 +2949,10 @@ index_one() {
 	## Machine snapshot (tmutil uniquesize refuses with pathInAPFSBackup, and
 	## diskutil reports no per-snapshot space), so asking cost a second full
 	## walk of the disk to fail every time.
+	vs_record_snapshot "$_h" "$_ts" "$_stats"
 	index_mark_covered "$_h" "$_ts"
 	msg "$(human_count "$_count") paths indexed"
+	rm -f "$_stats"
 	rm -f "$_paths"
 	snap_umount "$_mp" >/dev/null 2>&1
 	return 0
@@ -3739,6 +3966,10 @@ cmd_uninstall() {
 #############################################################################
 
 cmd_maintenance() {
+	dbg "maintenance: usage samples"
+	for _uh in $(locations_all | awk -F'\t' '{print $1}'); do
+		usage_sample "$_uh"
+	done
 	dbg "maintenance: sweep"
 	sweep
 	dbg "maintenance: /tm refresh"
@@ -5245,6 +5476,25 @@ t_test_rm_needs_the_store() {
 	grep -v '^gonestore' "$_cf" >"$T_ROOT/c.tmp" 2>/dev/null && mv "$T_ROOT/c.tmp" "$_cf"
 }
 
+## REGRESSION: snap_mount and image_attach are called inside $(...) to capture
+## the path they return. Their progress lines went to stdout, so under -V the
+## captured "path" was the echo plus the path -- every mountpoint my-tm handled
+## was corrupted, and only in verbose mode.
+t_test_progress_goes_to_stderr() {
+	printf '\nProgress never contaminates a captured value\n'
+	_old="$VRB"; VRB=1
+	_v=$( { run true one two; printf 'THEVALUE\n'; } 2>/dev/null )
+	t_eq "run's echo stays out of the value" "$_v" "THEVALUE"
+	_v=$( { why "an explanation"; printf 'THEVALUE\n'; } 2>/dev/null )
+	t_eq "why stays out of the value" "$_v" "THEVALUE"
+	_v=$( { msg "a milestone"; printf 'THEVALUE\n'; } 2>/dev/null )
+	t_eq "msg stays out of the value" "$_v" "THEVALUE"
+	## and they are still visible on stderr
+	_e=$( { run true marker; } 2>&1 >/dev/null )
+	t_match "but they are still shown" "$_e" "marker"
+	VRB="$_old"
+}
+
 run_tests() {
 	T_WITH_SNAPSHOTS=0
 	for _a in "$@"; do
@@ -5280,6 +5530,7 @@ run_tests() {
 	t_test_locate_toolchain
 	t_test_indexer_exemption_expires
 	t_test_lookup_collapse
+	t_test_progress_goes_to_stderr
 	t_test_snapshot_set_is_validated
 	t_test_no_exclusive_size_claims
 	t_test_site_conf_dir_from_env

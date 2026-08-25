@@ -351,15 +351,25 @@ $CACHE_DIR/index/<loc>.versions/ -> the version store: per-snapshot delta rows
 * **Tier 2, `--index`**: walks snapshots to catch paths that no longer exist
   anywhere live. `find <snapshot> | locate.mklocatedb` per snapshot, merged with
   `locate.concatdb` — both of which live in `/usr/libexec`, not on `PATH`.
-* **The same walk fills the version store.** Each indexed snapshot is diffed
-  against the previously walked one (`comm` of the two sorted `find` lists —
-  the sort already happens for `mklocatedb`): added, removed and modified
-  paths, each with inode, size and mtime. At the measured 0.4 % churn that is
-  ~200 KB per snapshot of sorted TSV in `<loc>.versions/`. Because snapshots
-  are immutable these rows are facts, never stale — `--lookup` serves every
-  covered snapshot from them without a mount (§6), and what it has to `stat`
-  live it appends here, so coverage grows with use. Rows of snapshots that no
-  longer exist are dropped at consolidation time.
+* **The same walk fills the version store**, which is what lets my-tm answer
+  *"which versions of this file do I have?"* — the question a restore starts
+  with — without mounting anything. The walk already visits every entry, so it
+  stats them in the same pass (`find -print0 | xargs -0 stat`, batched), and:
+  * the **first** indexed snapshot of a location is stored whole, as
+    `<loc>.versions/base.<XX>.gz` — bucketed by the last two characters of the
+    path, so a single-path query decompresses ~140 KB instead of the lot;
+  * every later snapshot is stored as a **delta** against the previous walk
+    (`comm` of the two sorted lists), `<loc>.versions/d.<ts>.tsv`.
+
+  Measured on a real 4.4 M-file snapshot: the full listing is 722 MB raw and
+  **35 MB gzipped**, and a delta at the observed churn is a few hundred KB. So
+  a whole history costs one baseline plus small deltas, not a baseline per
+  snapshot. Because snapshots are immutable these rows are facts, never stale;
+  `--lookup` serves every covered snapshot from them with no mount (§6), and
+  what it still has to read live it files alongside, so coverage grows with use.
+
+  Each new backup is one more snapshot to index, so keeping up is one
+  incremental walk — the same work the daemon already wakes up to do.
 * **Cost, honestly**: one snapshot walk is minutes, and there is no cheap delta
   — `tmutil compare` walks both trees too. So `--index --all` over 412 snapshots
   is an overnight job. It runs detached, prints progress, and is resumable;
