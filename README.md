@@ -978,6 +978,14 @@ A `PATH` is *covered* by a location when the volume UUID of `PATH`
 ~/Library/Logs/my-tm/      $LOG_DIR: my-tm.log (+ -D/-DD targets)
 ```
 
+**The snapshot cache carries its own checksum**, on its first line rather than
+in a file beside it, so it is swapped atomically with the content it describes —
+several users and root write here, and a separate checksum file would have a
+window where the two disagree. A cache that does not verify is discarded and the
+store read again; individual rows are validated too, since a checksum only
+proves a file is intact, not that what was written made sense. `locations.tsv`
+gets no checksum on purpose: it cannot be rebuilt from anything.
+
 The shared copies are written by root — the daemons, and any `sudo my-tm` run;
 the index is machine-global fact and expensive to build, so no reason for
 several users and root each to rescan. An unprivileged run reads the shared
