@@ -943,6 +943,13 @@ snapshots_scan() {
 ## cache-gated table for one location
 snapshots_get() {
 	_h="$1"
+	## A store that is not there cannot be scanned, and its last known table is
+	## the only honest answer. Centrally, so every caller agrees: --status,
+	## --ls, -J and resolving an <ID> must not each decide this differently.
+	if ! loc_reachable "$_h"; then
+		snapshots_cached_only "$_h"
+		return 0
+	fi
 	_cf=$(snapshots_cache_file)
 	_fresh=0
 	if [ -f "$_cf" ]; then
@@ -1010,7 +1017,10 @@ snapshots_all() {
 	_locs=$(locations_all | awk -F'\t' '{print $1}')
 	while IFS= read -r _h; do
 		[ -n "$_h" ] || continue
-		loc_ready "$_h" || continue
+		## open it if that is cheap, but never SKIP it: snapshots_get falls back
+		## to the last known table, and an <ID> must stay resolvable while its
+		## store is away -- otherwise my-tm prints an ID and then denies it.
+		loc_open "$_h" >/dev/null 2>&1 || true
 		snapshots_get "$_h"
 	done <<_EOF
 $_locs
@@ -1868,7 +1878,8 @@ json_ls() {
 	_first=1
 	while IFS= read -r _h; do
 		[ -n "$_h" ] || continue
-		loc_ready "$_h" || continue
+		_cached=false
+		loc_ready "$_h" 2>/dev/null || _cached=true
 		_rows=$(snapshots_get "$_h")
 		[ -n "$_rows" ] || continue
 		printf '%s\n' "$_rows" | sort -t"$(printf '\t')" -k3,3nr |
@@ -1877,9 +1888,10 @@ json_ls() {
 			[ "$_first" = "1" ] && _first=0 || printf ',\n'
 			printf '  {"location": "%s", "snapshot": "%s", "id": "%s", "epoch": %s,' \
 				"$(json_escape "$_l")" "$_ts" "$_id" "${_ep:-0}"
-			printf ' "files": "%s", "added": "%s", "total": "%s", "unique": "%s",' \
-				"${_f:--}" "${_a:--}" "${_t2:--}" "${_u:--}"
-			printf ' "state": "%s", "volume": "%s"}' "${_st:-ok}" "$(json_escape "${_vol:--}")"
+			printf ' "files": "%s", "added": "%s", "total": "%s",' \
+				"${_f:--}" "${_a:--}" "${_t2:--}"
+			printf ' "state": "%s", "volume": "%s", "from_cache": %s}' \
+				"${_st:-ok}" "$(json_escape "${_vol:--}")" "$_cached"
 		done
 	done <<_EOF
 $_locs
@@ -3035,8 +3047,14 @@ cmd_rm() {
 		_loc=$(printf '%s' "$_hit" | awk -F'\t' '{print $1}')
 		_ts=$(printf '%s' "$_hit" | awk -F'\t' '{print $2}')
 		_id=$(printf '%s' "$_hit" | awk -F'\t' '{print $3}')
-		## the cache is an index, never the authority for a destructive call:
-		## re-verify against the store before naming it for deletion.
+		## The cache is an index, never the authority for a destructive call, so
+		## the store itself is asked. But "I cannot see the store" is NOT "the
+		## snapshot is gone": saying so about a detached disk would report a
+		## deletion that never happened.
+		if ! loc_reachable "$_loc"; then
+			warn "$_id: cannot verify against '$_loc' -- it is not attached, so nothing here can be deleted. Attach it and run this again."
+			continue
+		fi
 		if ! snap_names "$_loc" | grep -qx "$_ts"; then
 			note "$_id ($(ts_display "$_ts")): already deleted"
 			continue
@@ -5187,6 +5205,46 @@ t_test_site_conf_dir_from_env() {
 	t_ne "the search really ran" "$_ttl" "0"
 }
 
+## REGRESSION: a store that is not attached answered -J with an empty array and
+## made every <ID> in it unresolvable, so --rm/--show/--mount all said "no such
+## snapshot" about backups my-tm had listed a moment earlier. The last known
+## table is the honest answer, and one place decides it for every caller.
+t_test_detached_store_still_answers() {
+	printf '\nA detached store answers from its last known table\n'
+	_cf=$(snapshots_cache_file)
+	printf 'gonestore\t/Volumes/NotHere\t\n' >>"$T_ROOT/cache/locations.tsv"
+	printf 'gonestore\t2026-08-20-155805\t1755698285\tzz9999\t-\t1\t2\t3\t-\tok\tData\n' >>"$_cf"
+
+	t_eq "snapshots_get falls back to the cache" \
+		"$(snapshots_get gonestore | count_lines)" "1"
+	t_match "an ID in it still resolves" "$(resolve_id zz9999 2>/dev/null)" "gonestore"
+	_j=$(JSON=1 cmd_ls gonestore 2>/dev/null)
+	t_match "-J reports the snapshot" "$_j" "2026-08-20-155805"
+	t_match "and flags that it came from cache" "$_j" '"from_cache": true'
+
+	grep -v '^gonestore' "$T_ROOT/cache/locations.tsv" >"$T_ROOT/l.tmp" && mv "$T_ROOT/l.tmp" "$T_ROOT/cache/locations.tsv"
+	grep -v '^gonestore' "$_cf" >"$T_ROOT/c.tmp" 2>/dev/null && mv "$T_ROOT/c.tmp" "$_cf"
+}
+
+## REGRESSION: --rm verifies against the store before deleting. When the store
+## was not attached that check found nothing and reported "already deleted" --
+## a deletion that never happened, about a backup that is very likely still
+## there. Unverifiable is its own answer.
+t_test_rm_needs_the_store() {
+	printf '\n--rm will not guess about a store it cannot see\n'
+	_cf=$(snapshots_cache_file)
+	printf 'gonestore\t/Volumes/NotHere\t\n' >>"$T_ROOT/cache/locations.tsv"
+	printf 'gonestore\t2026-08-20-155805\t1755698285\tzz9999\t-\t1\t2\t3\t-\tok\tData\n' >>"$_cf"
+	: >"$(t_calls)"
+	_out=$( ( cmd_rm zz9999 ) 2>&1 )
+	t_match "it says it cannot verify" "$_out" "cannot verify"
+	t_eq "it does not claim the snapshot is already deleted" \
+		"$(printf '%s\n' "$_out" | count_match 'already deleted')" "0"
+	t_eq "and nothing was run" "$(count_match 'tmutil delete' < "$(t_calls)")" "0"
+	grep -v '^gonestore' "$T_ROOT/cache/locations.tsv" >"$T_ROOT/l.tmp" && mv "$T_ROOT/l.tmp" "$T_ROOT/cache/locations.tsv"
+	grep -v '^gonestore' "$_cf" >"$T_ROOT/c.tmp" 2>/dev/null && mv "$T_ROOT/c.tmp" "$_cf"
+}
+
 run_tests() {
 	T_WITH_SNAPSHOTS=0
 	for _a in "$@"; do
@@ -5225,6 +5283,8 @@ run_tests() {
 	t_test_snapshot_set_is_validated
 	t_test_no_exclusive_size_claims
 	t_test_site_conf_dir_from_env
+	t_test_detached_store_still_answers
+	t_test_rm_needs_the_store
 	t_test_volume_paths
 	t_test_mount_root_fallback
 	t_test_version_store_generation
