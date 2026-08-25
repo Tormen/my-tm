@@ -905,6 +905,28 @@ justify a second snapshot model threaded through every command here.
 Network destinations — a `<host>.sparsebundle` on an SMB/AFP share — **are** in
 scope; see `,design-every-kind-of-store.md`.
 
+### Store growth *(spec)*
+
+my-tm samples the store's real disk usage (`df`) and keeps the series, so
+`--status` can say how fast it is filling and how long the free space lasts:
+
+```text
+ --> backup grows 5.30G/day over 14.2d · 1.99T free · full in ~384d
+```
+
+Sampled on **backup events** -- when a new snapshot appears, or when the count
+changes because thinning ran -- not on a clock. One sample per change means each
+delta is exactly one backup's worth; a fixed interval cannot promise that,
+because backups get missed and extra samples between them say nothing.
+`USAGE_SAMPLE_INTERVAL` is only a slow heartbeat for drift no snapshot change
+explains. Nothing is printed until the series spans long enough to mean
+something, and a store that thins as fast as it grows is reported as such rather
+than given a doomsday date.
+
+This is ground truth from `df`, unlike ADDED which is Time Machine's own
+accounting. It still cannot give the exclusive size of one snapshot (above):
+that is a property of the current snapshot set, not of history.
+
 ## 12. What a location knows *(spec)*
 
 Read once, cached — and, as it turns out, **without mounting anything at all**:

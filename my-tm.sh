@@ -34,7 +34,7 @@ MOUNT_ROOT="/var/lib/my-tm/mount"
 SITE_CONF_DIR="${SITE_CONF_DIR:-/usr/local/etc}"
 NOTIFY_MOUNT_WARN=1
 CACHE_TTL=3600
-USAGE_SAMPLE_INTERVAL=900
+USAGE_SAMPLE_INTERVAL=21600
 INDEX_BASELINES="newest oldest"
 INDEX_INC_MAX=16
 INDEX_REMOTE_COPY=1
@@ -1305,25 +1305,64 @@ cleanup_volumes() {
 ## when the next backup keeps them, and exclusive again when a neighbour is
 ## deleted. What it does give is growth, thinning and a capacity forecast, and
 ## those need a series -- so sampling starts early and cheaply.
+## Sampled on BACKUP EVENTS, not on a clock: one sample per change means each
+## delta is exactly one backup's (or one thinning's) worth, which a fixed
+## interval cannot promise -- backups get missed, and sampling four times an
+## hour between them only adds rows that say nothing. USAGE_SAMPLE_INTERVAL is
+## just a slow heartbeat for drift that no snapshot change explains.
+##   epoch <TAB> used <TAB> avail <TAB> snapshots <TAB> newest
 usage_sample() {
 	_h="$1"
 	[ "$(loc_kind "$_h")" = "disk" ] || return 0
 	loc_reachable "$_h" || return 0
 	_f="$(cache_write_dir)/usage.$_h.tsv"
 	_now=$(now_epoch)
+
+	_rows=$(snapshots_cached_only "$_h")
+	_n=$(printf '%s\n' "$_rows" | count_lines)
+	_newest=$(printf '%s\n' "$_rows" | sort -t"$(printf '\t')" -k3,3n |
+		tail -n 1 | awk -F'\t' '{print $2}')
+	[ -n "$_newest" ] || _newest="-"
+
 	if [ -f "$_f" ]; then
-		_last=$(awk -F'\t' 'END {print $1 + 0}' "$_f" 2>/dev/null)
-		[ $(( _now - ${_last:-0} )) -lt "${USAGE_SAMPLE_INTERVAL:-900}" ] && return 0
+		_prevline=$(tail -n 1 "$_f" 2>/dev/null)
+		_pe=$(printf '%s' "$_prevline" | awk -F'\t' '{print $1 + 0}')
+		_pn=$(printf '%s' "$_prevline" | awk -F'\t' '{print $4}')
+		_pnew=$(printf '%s' "$_prevline" | awk -F'\t' '{print $5}')
+		if [ "$_newest" = "${_pnew:-}" ] && [ "$_n" = "${_pn:-}" ] &&
+		   [ $(( _now - ${_pe:-0} )) -lt "${USAGE_SAMPLE_INTERVAL:-21600}" ]; then
+			return 0
+		fi
 	fi
+
 	_sp=$(loc_store_path "$_h" 2>/dev/null) || return 0
 	[ -d "$_sp" ] || return 0
 	_du=$(df -k "$_sp" 2>/dev/null | awk 'NR == 2 {printf "%s\t%s", $3 * 1024, $4 * 1024}')
 	[ -n "$_du" ] || return 0
-	_n=$(snapshots_cached_only "$_h" | count_lines)
 	need_dir "$(dirname "$_f")" || return 0
-	printf '%s\t%s\t%s\n' "$_now" "$_du" "$_n" >>"$_f" 2>/dev/null || true
-	dbg "usage sample for '$_h': $_du ($_n snapshots)"
+	printf '%s\t%s\t%s\t%s\n' "$_now" "$_du" "$_n" "$_newest" >>"$_f" 2>/dev/null || true
+	dbg "usage sample for '$_h': $_du, $_n snapshots, newest $_newest"
 	return 0
+}
+
+## Growth from the series, and how long the free space lasts at that rate.
+## Emits: per-day-bytes <TAB> free <TAB> days-left <TAB> span-days <TAB> samples
+## Nothing at all until the series is long enough to mean something.
+usage_trend() {
+	_f="$(cache_write_dir)/usage.$1.tsv"
+	[ -f "$_f" ] || return 1
+	awk -F'\t' -v minspan="${USAGE_MIN_SPAN:-7200}" '
+		NR == 1 { e0 = $1; u0 = $2 }
+		{ e1 = $1; u1 = $2; free = $3; n++ }
+		END {
+			if (n < 2) exit 1;
+			span = e1 - e0;
+			if (span < minspan) exit 1;
+			per = (u1 - u0) * 86400 / span;
+			days = (per > 0) ? free / per : -1;
+			printf "%d\t%d\t%d\t%.1f\t%d\n", per, free, days, span / 86400, n;
+		}
+	' "$_f"
 }
 
 ## the sweep never acts on a record alone: the live mount table must confirm a
@@ -2047,6 +2086,23 @@ _EOF
 		[ "$_tot" -gt 0 ] && _note="$_note ($_cov/$_tot snaps, $US --index $_first_loc)"
 	fi
 	note "$_note$_scanned"
+
+	## growth, only once the series says something
+	printf '%s\n' "$_locs" | awk -F'\t' '{print $1}' | while IFS= read -r _th; do
+		[ -n "$_th" ] || continue
+		[ -n "$_only" ] && [ "$_th" != "$_only" ] && continue
+		_tr=$(usage_trend "$_th") || continue
+		[ -n "$_tr" ] || continue
+		_per=$(printf '%s' "$_tr" | cut -f1)
+		_free=$(printf '%s' "$_tr" | cut -f2)
+		_days=$(printf '%s' "$_tr" | cut -f3)
+		_span=$(printf '%s' "$_tr" | cut -f4)
+		if [ "$_per" -gt 0 ] 2>/dev/null; then
+			note "$_th grows $(human_bytes "$_per")/day over ${_span}d · $(human_bytes "$_free") free · full in ~${_days}d"
+		else
+			note "$_th is not growing over ${_span}d (thinning keeps up) · $(human_bytes "$_free") free"
+		fi
+	done
 	return 0
 }
 
@@ -5495,6 +5551,42 @@ t_test_progress_goes_to_stderr() {
 	VRB="$_old"
 }
 
+## Usage sampling is driven by backup EVENTS, and the trend it feeds must not
+## extrapolate from a series too short to mean anything.
+t_test_usage_trend() {
+	printf '\nStore growth and capacity\n'
+	_f="$(cache_write_dir)/usage.trendtest.tsv"
+	need_dir "$(dirname "$_f")"
+
+	## a single sample says nothing
+	printf '1000000\t1000\t5000\t10\t2026-08-01-000000\n' >"$_f"
+	t_eq "one sample yields no trend" \
+		"$(usage_trend trendtest >/dev/null 2>&1 && echo yes || echo no)" "no"
+
+	## two samples an hour apart is still too short to extrapolate from
+	printf '1003600\t2000\t4000\t11\t2026-08-01-010000\n' >>"$_f"
+	t_eq "too short a span yields no trend" \
+		"$(usage_trend trendtest >/dev/null 2>&1 && echo yes || echo no)" "no"
+
+	## ten days, growing 100 bytes/day, 1000 free -> 10 days left
+	## (written in one go: redirecting INTO a file you are also reading
+	## truncates it before the read happens)
+	{
+		printf '1000000\t1000\t5000\t10\t2026-08-01-000000\n'
+		printf '1864000\t2000\t1000\t20\t2026-08-10-000000\n'
+	} >"$_f"
+	_tr=$(usage_trend trendtest)
+	t_eq "growth per day"  "$(printf '%s' "$_tr" | cut -f1)" "100"
+	t_eq "free space"      "$(printf '%s' "$_tr" | cut -f2)" "1000"
+	t_eq "days remaining"  "$(printf '%s' "$_tr" | cut -f3)" "10"
+
+	## a store that thins as fast as it grows must not claim a doomsday
+	printf '1000000\t5000\t1000\t10\t2026-08-01-000000\n1864000\t4000\t2000\t9\t2026-08-10-000000\n' >"$_f"
+	_tr=$(usage_trend trendtest)
+	t_eq "shrinking gives no forecast" "$(printf '%s' "$_tr" | cut -f3)" "-1"
+	rm -f "$_f"
+}
+
 run_tests() {
 	T_WITH_SNAPSHOTS=0
 	for _a in "$@"; do
@@ -5531,6 +5623,7 @@ run_tests() {
 	t_test_indexer_exemption_expires
 	t_test_lookup_collapse
 	t_test_progress_goes_to_stderr
+	t_test_usage_trend
 	t_test_snapshot_set_is_validated
 	t_test_no_exclusive_size_claims
 	t_test_site_conf_dir_from_env
