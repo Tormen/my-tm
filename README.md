@@ -874,9 +874,11 @@ my-tm --add /Volumes/<share>/<host>.sparsebundle nas
   could collide with it. Read-only also means no `fsck` and no risk to a backup.
 * **Attached only when the store must really be read.** A fresh cache answers
   `--status` and `--ls` with no attach at all; a stale one pays for it once.
-* **Detached again on the way out**, after the snapshots mounted inside it are
-  released -- an image with a live mount inside it is busy. Only images my-tm
-  attached itself are ever detached.
+* **Kept for `IMAGE_GRACE` (default 10 min) after its last use**, then detached
+  by the sweep. Measured against a NAS store: the first command costs **66 s**
+  of attach and mount, and every command after it **1 s**. Detaching the moment
+  a command ends would make the next one pay the 66 s again. Only images my-tm
+  attached itself are ever detached, and `--umount --all` releases them now.
 * **Identity comes from `Info.plist`'s `uuid`, readable without attaching**, so
   snapshot IDs are stable while the share is offline and survive the share being
   mounted somewhere else.

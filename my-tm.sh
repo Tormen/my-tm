@@ -35,6 +35,7 @@ SITE_CONF_DIR="${SITE_CONF_DIR:-/usr/local/etc}"
 NOTIFY_MOUNT_WARN=1
 CACHE_TTL=3600
 USAGE_SAMPLE_INTERVAL=21600
+IMAGE_GRACE=600
 INDEX_BASELINES="newest oldest"
 INDEX_INC_MAX=16
 INDEX_REMOTE_COPY=1
@@ -195,6 +196,9 @@ INDEX_INC_MAX=16                # consolidate the increments once there are
                                 # this many
 INDEX_REMOTE_COPY=1             # also keep a local copy of a remote index, so
                                 # --find works while that host is offline
+IMAGE_GRACE=600                 # s an attached sparsebundle stays attached after
+                                # its last use; attaching one over a share costs
+                                # minutes, so back-to-back commands reuse it
 ID_LEN=6
 # --- retention ---
 THIN_POLICY_TO_KEEP="24h:hourly 7d:daily 4w:weekly 2y:monthly"
@@ -288,6 +292,18 @@ cmd_create_config() {
 #############################################################################
 
 is_root() { [ "$(id -u)" -eq 0 ]; }
+
+## Full Disk Access, which tmutil delete/verifychecksums/listbackups all need.
+##
+## TCC denies the READ, not the stat, so [ -r ] answers yes and the open then
+## fails -- the probe has to actually read a byte. The path is a variable so the
+## tests can point it at something unreadable and check the negative case.
+FDA_PROBE="/Library/Application Support/com.apple.TCC/TCC.db"
+
+has_full_disk_access() {
+	[ -e "$FDA_PROBE" ] || return 0     # nothing to prove it against; assume fine
+	head -c 1 "$FDA_PROBE" >/dev/null 2>&1
+}
 
 require_root() {
 	is_root && return 0
@@ -455,6 +471,14 @@ parse_interval() {
 #############################################################################
 ## SNAPSHOT IDs  (deterministic; the cache is an index, never the authority)
 #############################################################################
+
+md5_file() {
+	if command -v md5 >/dev/null 2>&1; then
+		md5 -q "$1" 2>/dev/null
+	else
+		openssl md5 <"$1" 2>/dev/null | sed 's/.*= *//'
+	fi
+}
 
 md5_hex() {
 	if command -v md5 >/dev/null 2>&1; then
@@ -886,6 +910,64 @@ manifest_parse() {
 ##   snapshots.cache:  loc ts epoch id xid files added total unique state vol
 #############################################################################
 
+## The snapshot cache is DERIVED data, so it can afford to be strict: anything
+## that does not verify is thrown away and rescanned rather than half-read.
+##
+## The checksum lives in the file's own first line, not beside it, so it is
+## swapped atomically together with the content -- a separate checksum file
+## would have a window where the two disagree, and several users plus root write
+## here. Rows are validated as well: a checksum only proves the file is intact,
+## not that what was written made sense.
+CACHE_MAGIC="#my-tm-cache 1"
+
+## stdin -> <file>, with an integrity header
+cache_write_checked() {
+	_cf="$1"
+	_body=$(mktemp /tmp/my-tm.cw.XXXXXX) || return 1
+	cat >"$_body"
+	{
+		printf '%s %s\n' "$CACHE_MAGIC" "$(md5_file "$_body")"
+		cat "$_body"
+	} | atomic_write "$_cf"
+	_rc=$?
+	rm -f "$_body"
+	return $_rc
+}
+
+## <file> -> its rows on stdout, or nothing at all if it does not verify
+cache_read_checked() {
+	_cf="$1"
+	[ -f "$_cf" ] || return 1
+	_hdr=$(head -n 1 "$_cf" 2>/dev/null)
+	case "$_hdr" in
+		"$CACHE_MAGIC "*) : ;;
+		*)
+			## no header at all: an old cache, or something else entirely
+			dbg "cache has no integrity header, discarding: $_cf"
+			return 1
+			;;
+	esac
+	_want=${_hdr##* }
+	_body=$(mktemp /tmp/my-tm.cr.XXXXXX) || return 1
+	tail -n +2 "$_cf" >"$_body"
+	_have=$(md5_file "$_body")
+	if [ "$_want" != "$_have" ]; then
+		warn "$_cf is damaged (checksum does not match) -- discarding it and reading the store again"
+		rm -f "$_body" "$_cf"
+		return 1
+	fi
+	## structurally sound rows only: a bad row would otherwise be shown as a real
+	## snapshot, and non-numeric arithmetic aborts the run outright
+	awk -F'\t' '
+		NF == 11 && $2 ~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9]$/ &&
+		$3 ~ /^[0-9]+$/ { print; next }
+		{ bad++ }
+		END { if (bad > 0) printf "my-tm: %d unusable row(s) ignored\n", bad > "/dev/stderr" }
+	' "$_body"
+	rm -f "$_body"
+	return 0
+}
+
 snapshots_cache_file() { printf '%s/snapshots.cache\n' "$(cache_write_dir)"; }
 
 ## build the table for one location, live
@@ -996,14 +1078,15 @@ snapshots_get() {
 	## image is exempt -- validating it would mean attaching it over a share.
 	if [ "$_fresh" = "1" ] && [ "$(loc_kind "$_h")" = "disk" ] && loc_reachable "$_h"; then
 		_live=$(snap_names "$_h" | LC_ALL=C sort)
-		_have=$(awk -F'\t' -v l="$_h" '$1 == l {print $2}' "$_cf" 2>/dev/null | LC_ALL=C sort)
+		_have=$(cache_read_checked "$_cf" 2>/dev/null |
+			awk -F'\t' -v l="$_h" '$1 == l {print $2}' | LC_ALL=C sort)
 		if [ "$_live" != "$_have" ]; then
 			dbg "snapshots: the store no longer matches the cache for '$_h' -- rescanning"
 			_fresh=0
 		fi
 	fi
 	if [ "$_fresh" = "1" ]; then
-		_cached=$(awk -F'\t' -v l="$_h" '$1 == l' "$_cf" 2>/dev/null)
+		_cached=$(cache_read_checked "$_cf" 2>/dev/null | awk -F'\t' -v l="$_h" '$1 == l')
 		if [ -n "$_cached" ]; then
 			dbg "snapshots: cache hit for '$_h'"
 			printf '%s\n' "$_cached"
@@ -1022,11 +1105,11 @@ snapshots_cache_put() {
 	_h="$1"; _rows="$2"
 	_cf=$(snapshots_cache_file)
 	_old=""
-	[ -f "$_cf" ] && _old=$(awk -F'\t' -v l="$_h" '$1 != l' "$_cf" 2>/dev/null)
+	[ -f "$_cf" ] && _old=$(cache_read_checked "$_cf" 2>/dev/null | awk -F'\t' -v l="$_h" '$1 != l')
 	{
 		[ -n "$_old" ] && printf '%s\n' "$_old"
 		printf '%s\n' "$_rows"
-	} | atomic_write "$_cf" 2>/dev/null || dbg "snapshots cache not writable: $_cf"
+	} | cache_write_checked "$_cf" 2>/dev/null || dbg "snapshots cache not writable: $_cf"
 	return 0
 }
 
@@ -1036,7 +1119,8 @@ snapshots_cache_put() {
 snapshots_cached_only() {
 	for _d in $(cache_read_dirs); do
 		[ -f "$_d/snapshots.cache" ] || continue
-		awk -F'\t' -v l="$1" '$1 == l' "$_d/snapshots.cache" 2>/dev/null
+		cache_read_checked "$_d/snapshots.cache" 2>/dev/null |
+			awk -F'\t' -v l="$1" '$1 == l'
 	done
 	return 0
 }
@@ -1148,7 +1232,8 @@ image_mountpoint() {
 image_attach() {
 	_img="$1"
 	if _mp=$(image_mountpoint "$_img"); then
-		dbg "$_img is already attached at $_mp"
+		dbg "$_img is already attached at $_mp -- reusing it"
+		image_touch "$_img" "$_mp"
 		printf '%s\n' "$_mp"
 		return 0
 	fi
@@ -1165,25 +1250,35 @@ image_attach() {
 		                                gsub(/"/, "", m); print m; f = 1 }')
 	rm -f "$_pl"
 	[ -n "$_mp" ] || return 1
-	printf '%s\n' "$_img" >>"$TRANSIENT_IMAGES"
+	image_touch "$_img" "$_mp"
 	printf '%s\n' "$_mp"
+	return 0
+}
+
+## Record the attach, or push its grace period out again because it was just
+## used. Attaching a sparsebundle over a share costs minutes, so detaching the
+## moment one command ends makes the next command pay it all over again.
+image_touch() {
+	_img="$1"; _mp="$2"
+	mount_record_add "-" "image:$_img" "$_mp" "${IMAGE_GRACE:-600}" "image"
 	return 0
 }
 
 ## Detach only images WE attached, and only after the snapshots mounted
 ## inside them are gone -- an image with a live mount inside it is busy.
+## Images are NOT detached when a command ends: they are recorded with a grace
+## period and released by the sweep, so a series of commands against a network
+## store pays the attach once instead of once each.
 cleanup_images() {
-	[ -f "$TRANSIENT_IMAGES" ] || return 0
-	while IFS= read -r _i; do
-		[ -n "$_i" ] || continue
-		if run hdiutil detach "$(image_mountpoint "$_i" 2>/dev/null)" -quiet >/dev/null 2>&1; then
-			dbg "detached $_i again, as it was found"
-		else
-			warn "could not detach $_i again"
-		fi
-	done <"$TRANSIENT_IMAGES"
 	rm -f "$TRANSIENT_IMAGES"
 	return 0
+}
+
+## detach one, on behalf of the sweep
+image_detach() {
+	run_echo hdiutil detach "$1"
+	hdiutil detach "$1" -quiet >/dev/null 2>&1 ||
+		hdiutil detach "$1" -force -quiet >/dev/null 2>&1
 }
 
 mnt_private_root() { printf '%s/.mnt\n' "$MOUNT_ROOT"; }
@@ -1568,7 +1663,16 @@ sweep() {
 		[ -n "${_mp:-}" ] || continue
 		## reconcile first: a record with nothing real behind it is dropped,
 		## never obeyed.
-		if ! mount_table_is_snapshot "$_mp"; then
+		_isimage=0
+		case "${_flags:-}" in *image*) _isimage=1 ;; esac
+		if [ "$_isimage" = "1" ]; then
+			## an attached image is an ordinary volume, not a snapshot mount
+			if ! mount_table_has "$_mp"; then
+				dbg "sweep: image record with nothing attached ($_mp)"
+				mount_record_drop "$_mp"
+				continue
+			fi
+		elif ! mount_table_is_snapshot "$_mp"; then
 			dbg "sweep: stale record dropped ($_mp)"
 			mount_record_drop "$_mp"
 			continue
@@ -1604,6 +1708,15 @@ sweep() {
 		[ "$_expired" = "1" ] || continue
 		if printf '%s\n' "$_busy" | grep -qxF "$_mp" 2>/dev/null; then
 			dbg "sweep: $_mp still has open files -- retrying next round"
+			continue
+		fi
+		if [ "$_isimage" = "1" ]; then
+			msg "detaching image after its grace period: $_mp"
+			if image_detach "$_mp"; then
+				mount_record_drop "$_mp"
+			else
+				warn "could not detach $_mp (retrying next round)"
+			fi
 			continue
 		fi
 		msg "releasing expired mount: $_mp"
@@ -1871,6 +1984,62 @@ vs_write_baseline() {
 	fi
 	rm -f "$_err"
 	dbg "version baseline: $_nb buckets"
+	return 0
+}
+
+## Snapshots that Time Machine has thinned, or macOS has purged, are no longer
+## covered by the index and must stop being counted as such.
+##
+## Their DELTA cannot simply be deleted, though: each delta records changes
+## against the previous walk, so removing one from the middle would make every
+## later snapshot inherit the version before it. A purged snapshot's delta is
+## squashed FORWARD into the next one instead -- the later row wins for a path
+## both mention, and rows only the older delta had are carried over -- which
+## keeps the chain exact and still reclaims the space.
+vs_prune() {
+	_loc="$1"
+	_d=$(vs_dir "$_loc")
+	_cov=$(index_covered_file "$_loc")
+	[ -d "$_d" ] || [ -f "$_cov" ] || return 0
+	_live=$(snap_names "$_loc" 2>/dev/null)
+	[ -n "$_live" ] || return 0          # cannot tell -- leave everything alone
+
+	_gone=""
+	if [ -f "$_cov" ]; then
+		_gone=$(printf '%s\n' "$_live" | LC_ALL=C sort >"$_d/.live.$$" 2>/dev/null &&
+			LC_ALL=C sort "$_cov" | LC_ALL=C comm -23 - "$_d/.live.$$")
+		rm -f "$_d/.live.$$"
+	fi
+	[ -n "$_gone" ] || return 0
+
+	_n=0
+	for _gts in $_gone; do
+		[ -n "$_gts" ] || continue
+		_n=$(( _n + 1 ))
+		_gd="$_d/d.$_gts.tsv"
+		[ -f "$_gd" ] || continue
+		## the next delta in time order, if there is one
+		_next=$(ls "$_d"/d.*.tsv 2>/dev/null | sed 's|.*/d\.||; s|\.tsv$||' |
+			LC_ALL=C sort | awk -v g="$_gts" '$0 > g {print; exit}')
+		if [ -n "$_next" ]; then
+			_nd="$_d/d.$_next.tsv"
+			_merged=$(mktemp /tmp/my-tm.sq.XXXXXX) || continue
+			awk -F'\t' '
+				FILENAME == later { seen[$1] = 1; print; next }
+				!($1 in seen) { print }
+			' later="$_nd" "$_nd" "$_gd" | LC_ALL=C sort -u >"$_merged"
+			mv -f "$_merged" "$_nd" 2>/dev/null
+			dbg "version store: squashed the delta of purged $_gts into $_next"
+		fi
+		rm -f "$_gd"
+	done
+
+	## and stop claiming to cover what is not there
+	LC_ALL=C sort "$_cov" 2>/dev/null | LC_ALL=C comm -12 - "$(printf '%s\n' "$_live" |
+		LC_ALL=C sort >"$_d/.live2.$$" && printf '%s' "$_d/.live2.$$")" >"$_cov.new" 2>/dev/null &&
+		mv -f "$_cov.new" "$_cov"
+	rm -f "$_d/.live2.$$" "$_cov.new"
+	dbg "version store: $_n snapshot(s) no longer exist and were pruned from '$_loc'"
 	return 0
 }
 
@@ -2760,6 +2929,18 @@ cmd_umount() {
 			warn "still needed? leave it. Otherwise: $US --umount -f $_what"
 			continue
 		fi
+		case "${_flags:-}" in
+			*image*)
+				if image_detach "$_mp"; then
+					mount_record_drop "$_mp"
+					msg "detached $_mp"
+					_n=$(( _n + 1 ))
+				else
+					warn "could not detach $_mp"
+				fi
+				continue
+				;;
+		esac
 		if snap_umount "$_mp" "$FORCE"; then
 			msg "released $_mp"
 			_n=$(( _n + 1 ))
@@ -2893,6 +3074,10 @@ cmd_index() {
 	locate_tool locate.mklocatedb >/dev/null ||
 		err "locate.mklocatedb not found (looked on PATH and in /usr/libexec). The name index --find uses cannot be built without it."
 	_targets="$*"
+	## drop what has been thinned away since the last run, before adding more
+	for _ph in $(locations_all | awk -F'\t' '$2 != "local" || 1 {print $1}'); do
+		loc_reachable "$_ph" && vs_prune "$_ph"
+	done
 	_locs=""
 	_snaps=""
 	if [ -z "$_targets" ]; then
@@ -3290,6 +3475,14 @@ _EOF
 				cleanup_transient
 			}
 		fi
+	fi
+
+	## Full Disk Access -- one pointer, not a stack of errors from each command
+	## that would have needed it
+	if ! has_full_disk_access; then
+		health_say warn "no Full Disk Access: --rm, --verify and Time Machine's own listings will fail. Grant it in System Settings > Privacy & Security > Full Disk Access, to the program that runs my-tm (your terminal, or the job binary)"
+	else
+		health_say ok "Full Disk Access is granted"
 	fi
 
 	## the jobs we installed
@@ -3691,6 +3884,10 @@ cmd_refresh() {
 	## for when they suspect my-tm is telling them something stale or wrong
 	for _d in $(cache_read_dirs); do
 		rm -f "$_d/index/versions.tsv" 2>/dev/null
+	done
+	for _ph in $(locations_all | awk -F'\t' '{print $1}'); do
+		[ -n "$_only" ] && [ "$_ph" != "$_only" ] && continue
+		loc_reachable "$_ph" && vs_prune "$_ph"
 	done
 	if [ -n "$_only" ]; then
 		snapshots_get "$_only" >/dev/null
@@ -4571,6 +4768,14 @@ t_match() {
 }
 
 t_stub_dir() { printf '%s/stub\n' "$T_ROOT"; }
+
+## Append rows to the snapshot cache the way my-tm does, so its integrity
+## header stays correct -- appending raw lines is exactly the damage the
+## checksum exists to catch.
+t_cache_add() {
+	_cf=$(snapshots_cache_file)
+	{ cache_read_checked "$_cf" 2>/dev/null; cat; } | cache_write_checked "$_cf"
+}
 t_calls()    { printf '%s/calls.log\n' "$T_ROOT"; }
 
 t_make_stubs() {
@@ -5129,7 +5334,7 @@ t_test_ejected_destination() {
 
 	## give it a remembered snapshot, as a real cache would have
 	_cf=$(snapshots_cache_file)
-	printf 'ejectedstore\t2026-08-20-155805\t1755698285\tzz1234\t-\t100\t200\t300\t-\tok\tData\n' >>"$_cf"
+	printf 'ejectedstore\t2026-08-20-155805\t1755698285\tzz1234\t-\t100\t200\t300\t-\tok\tData\n' | t_cache_add
 	t_eq "the cache-only reader finds it without touching the disk" \
 		"$(snapshots_cached_only ejectedstore | count_lines)" "1"
 
@@ -5156,7 +5361,7 @@ t_test_ejected_destination() {
 	## REGRESSION: detached AND nothing remembered used to print NOTHING at
 	## all, which reads as "this disk has no backups" -- the opposite of the
 	## truth. It must say why and what to do about it.
-	grep -v '^ejectedstore' "$_cf" > "$_cf.tmp" 2>/dev/null && mv "$_cf.tmp" "$_cf"
+	cache_read_checked "$_cf" 2>/dev/null | grep -v '^ejectedstore' | cache_write_checked "$_cf"
 	_empty=$(cmd_ls ejectedstore 2>&1)
 	t_ne "an empty answer is never silent" "$_empty" ""
 	t_match "it says the disk is away" "$_empty" "not attached"
@@ -5254,7 +5459,7 @@ t_test_local_list_never_cached() {
 	printf '\nLocal snapshot list is never served from cache\n'
 	_cf=$(snapshots_cache_file)
 	snapshots_get local >/dev/null 2>&1
-	printf 'local\t1999-01-01-000000\t915148800\tgone01\t-\t-\t-\t-\t-\tok\tData\n' >>"$_cf"
+	printf 'local\t1999-01-01-000000\t915148800\tgone01\t-\t-\t-\t-\t-\tok\tData\n' | t_cache_add
 	_rows=$(snapshots_get local)
 	t_eq "a snapshot macOS no longer lists is not reported" \
 		"$(printf '%s\n' "$_rows" | count_match '1999-01-01')" "0"
@@ -5443,7 +5648,7 @@ t_test_snapshot_set_is_validated() {
 	t_ne "the fixture store has snapshots" "$_before" "0"
 
 	## a snapshot the store does not have (thinned away since the scan)
-	printf 'store\t1999-12-31-235959\t946684799\tgone99\t-\t-\t-\t-\t-\tok\tData\n' >>"$_cf"
+	printf 'store\t1999-12-31-235959\t946684799\tgone99\t-\t-\t-\t-\t-\tok\tData\n' | t_cache_add
 	_rows=$(snapshots_get store)
 	t_eq "a snapshot that is no longer there is not offered" \
 		"$(printf '%s\n' "$_rows" | count_match '1999-12-31')" "0"
@@ -5500,7 +5705,7 @@ t_test_detached_store_still_answers() {
 	printf '\nA detached store answers from its last known table\n'
 	_cf=$(snapshots_cache_file)
 	printf 'gonestore\t/Volumes/NotHere\t\n' >>"$T_ROOT/cache/locations.tsv"
-	printf 'gonestore\t2026-08-20-155805\t1755698285\tzz9999\t-\t1\t2\t3\t-\tok\tData\n' >>"$_cf"
+	printf 'gonestore\t2026-08-20-155805\t1755698285\tzz9999\t-\t1\t2\t3\t-\tok\tData\n' | t_cache_add
 
 	t_eq "snapshots_get falls back to the cache" \
 		"$(snapshots_get gonestore | count_lines)" "1"
@@ -5510,7 +5715,7 @@ t_test_detached_store_still_answers() {
 	t_match "and flags that it came from cache" "$_j" '"from_cache": true'
 
 	grep -v '^gonestore' "$T_ROOT/cache/locations.tsv" >"$T_ROOT/l.tmp" && mv "$T_ROOT/l.tmp" "$T_ROOT/cache/locations.tsv"
-	grep -v '^gonestore' "$_cf" >"$T_ROOT/c.tmp" 2>/dev/null && mv "$T_ROOT/c.tmp" "$_cf"
+	cache_read_checked "$_cf" 2>/dev/null | grep -v '^gonestore' | cache_write_checked "$_cf"
 }
 
 ## REGRESSION: --rm verifies against the store before deleting. When the store
@@ -5521,7 +5726,7 @@ t_test_rm_needs_the_store() {
 	printf '\n--rm will not guess about a store it cannot see\n'
 	_cf=$(snapshots_cache_file)
 	printf 'gonestore\t/Volumes/NotHere\t\n' >>"$T_ROOT/cache/locations.tsv"
-	printf 'gonestore\t2026-08-20-155805\t1755698285\tzz9999\t-\t1\t2\t3\t-\tok\tData\n' >>"$_cf"
+	printf 'gonestore\t2026-08-20-155805\t1755698285\tzz9999\t-\t1\t2\t3\t-\tok\tData\n' | t_cache_add
 	: >"$(t_calls)"
 	_out=$( ( cmd_rm zz9999 ) 2>&1 )
 	t_match "it says it cannot verify" "$_out" "cannot verify"
@@ -5529,7 +5734,7 @@ t_test_rm_needs_the_store() {
 		"$(printf '%s\n' "$_out" | count_match 'already deleted')" "0"
 	t_eq "and nothing was run" "$(count_match 'tmutil delete' < "$(t_calls)")" "0"
 	grep -v '^gonestore' "$T_ROOT/cache/locations.tsv" >"$T_ROOT/l.tmp" && mv "$T_ROOT/l.tmp" "$T_ROOT/cache/locations.tsv"
-	grep -v '^gonestore' "$_cf" >"$T_ROOT/c.tmp" 2>/dev/null && mv "$T_ROOT/c.tmp" "$_cf"
+	cache_read_checked "$_cf" 2>/dev/null | grep -v '^gonestore' | cache_write_checked "$_cf"
 }
 
 ## REGRESSION: snap_mount and image_attach are called inside $(...) to capture
@@ -5587,6 +5792,73 @@ t_test_usage_trend() {
 	rm -f "$_f"
 }
 
+## REGRESSION: snapshots get thinned and purged, but the index went on claiming
+## to cover them. Their deltas cannot merely be deleted either: a delta records
+## changes against the PREVIOUS walk, so dropping one from the middle makes
+## every later snapshot inherit the version before it.
+t_test_version_store_pruning() {
+	printf '\nPruning snapshots that no longer exist\n'
+	_d=$(vs_dir store)
+	need_dir "$_d"
+	_cov=$(index_covered_file store)
+	need_dir "$(dirname "$_cov")"
+
+	## the fixture store really has these two; the third is invented
+	_live=$(snap_names store | LC_ALL=C sort)
+	_a=$(printf '%s\n' "$_live" | head -n 1)
+	_b=$(printf '%s\n' "$_live" | tail -n 1)
+	_gone=2020-01-01-000000
+	printf '%s\n%s\n%s\n' "$_a" "$_gone" "$_b" >"$_cov"
+
+	## the purged snapshot changed two files; the next one changed one of them
+	printf '/keep/only-in-old\t11\t111\n/both/changed\t22\t222\n' >"$_d/d.$_gone.tsv"
+	printf '/both/changed\t99\t999\n' >"$_d/d.$_b.tsv"
+
+	vs_prune store >/dev/null 2>&1
+
+	t_eq "the purged snapshot is no longer claimed as covered" \
+		"$(count_match "$_gone" < "$_cov")" "0"
+	t_eq "the ones that exist still are" "$(count_lines < "$_cov")" "2"
+	t_eq "its delta file is gone" \
+		"$([ -f "$_d/d.$_gone.tsv" ] && echo left || echo gone)" "gone"
+	## the squash: what only the old delta knew must survive in the next one...
+	t_eq "a row only the purged delta had is carried forward" \
+		"$(awk -F'\t' '$1 == "/keep/only-in-old" {print $2}' "$_d/d.$_b.tsv")" "11"
+	## ...and where both knew a path, the LATER one must win
+	t_eq "the later version wins for a path both changed" \
+		"$(awk -F'\t' '$1 == "/both/changed" {print $2}' "$_d/d.$_b.tsv")" "99"
+	t_eq "and it is not duplicated" \
+		"$(count_match '/both/changed' < "$_d/d.$_b.tsv")" "1"
+	rm -rf "$_d" "$_cov"
+}
+
+## REGRESSION: the health table documented a Full Disk Access check that did
+## not exist. Without it, tmutil delete and verifychecksums fail one by one
+## with their own errors instead of one pointer at the cause.
+t_test_full_disk_access() {
+	printf '\nFull Disk Access\n'
+	_saved="$FDA_PROBE"
+
+	_ok="$T_ROOT/fda_ok"; printf 'x\n' >"$_ok"
+	FDA_PROBE="$_ok"
+	t_true has_full_disk_access
+
+	## TCC denies the read, so the probe must READ, not merely stat
+	_no="$T_ROOT/fda_denied"; printf 'x\n' >"$_no"; chmod 000 "$_no"
+	FDA_PROBE="$_no"
+	t_eq "an unreadable probe is detected" \
+		"$(has_full_disk_access && echo granted || echo denied)" "denied"
+	t_match "and --health says so with a pointer" "$(cmd_health 2>&1)" "Full Disk Access"
+	t_match "naming where to grant it" "$(cmd_health 2>&1)" "System Settings"
+
+	## a probe that is not there at all must not raise a false alarm
+	FDA_PROBE="$T_ROOT/does-not-exist"
+	t_true has_full_disk_access
+
+	chmod 644 "$_no" 2>/dev/null
+	FDA_PROBE="$_saved"
+}
+
 run_tests() {
 	T_WITH_SNAPSHOTS=0
 	for _a in "$@"; do
@@ -5624,6 +5896,8 @@ run_tests() {
 	t_test_lookup_collapse
 	t_test_progress_goes_to_stderr
 	t_test_usage_trend
+	t_test_version_store_pruning
+	t_test_full_disk_access
 	t_test_snapshot_set_is_validated
 	t_test_no_exclusive_size_claims
 	t_test_site_conf_dir_from_env
