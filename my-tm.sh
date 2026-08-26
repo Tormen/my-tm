@@ -36,6 +36,7 @@ NOTIFY_MOUNT_WARN=1
 CACHE_TTL=3600
 USAGE_SAMPLE_INTERVAL=21600
 IMAGE_GRACE=600
+IMAGE_SCAN_TTL=300
 INDEX_BASELINES="newest oldest"
 INDEX_INC_MAX=16
 INDEX_REMOTE_COPY=1
@@ -616,6 +617,7 @@ destinations_scan() {
 ## emits: handle <TAB> target <TAB> installdir
 locations_all() {
 	_seen=""
+	_seenpaths=""
 	_reg=$(locations_registered)
 	if [ -n "$_reg" ]; then
 		while IFS= read -r _l; do
@@ -623,6 +625,7 @@ locations_all() {
 			_h=$(printf '%s' "$_l" | awk -F'\t' '{print $1}')
 			[ -n "$_h" ] || continue
 			_seen="$_seen $_h"
+			_seenpaths="$_seenpaths $(printf '%s' "$_l" | awk -F'\t' '{print $2}')"
 			printf '%s\n' "$_l"
 		done <<_EOF
 $_reg
@@ -641,6 +644,25 @@ _EOF
 				printf '%s\t%s\t\n' "$_h" "$_mp"
 			done <<_EOF
 $_dst
+_EOF
+		fi
+	fi
+	## this Mac's own backups inside a sparsebundle on a mounted volume -- a
+	## destination it may have stopped using, whose history is still there
+	if [ "$AUTODETECT_LOCAL_TM_BACKUPS" = "1" ]; then
+		_imgs=$(autodetect_images)
+		if [ -n "$_imgs" ]; then
+			while IFS= read -r _b; do
+				[ -n "$_b" ] || continue
+				case " $_seenpaths " in *" $_b "*) continue ;; esac
+				_h=$(slug "$(basename "$_b" .sparsebundle)")
+				is_id_word "$_h" && _h="${_h}-tm"
+				case " $_seen " in *" $_h "*) _h="${_h}-img" ;; esac
+				case " $_seen " in *" $_h "*) continue ;; esac
+				_seen="$_seen $_h"
+				printf '%s\t%s\t\n' "$_h" "$_b"
+			done <<_EOF
+$_imgs
 _EOF
 		fi
 	fi
@@ -670,6 +692,60 @@ is_image_target() {
 		*.sparsebundle|*.sparseimage|*.dmg) return 0 ;;
 	esac
 	return 1
+}
+
+## This Mac's own hardware UUID -- the same value a sparsebundle records in its
+## MachineID.plist. Overridable so the tests can pretend to be another Mac.
+MAC_UUID="${MAC_UUID:-}"
+
+mac_uuid() {
+	if [ -n "$MAC_UUID" ]; then printf '%s\n' "$MAC_UUID"; return 0; fi
+	ioreg -rd1 -c IOPlatformExpertDevice 2>/dev/null |
+		sed -nE 's/.*"IOPlatformUUID" = "([^"]*)".*/\1/p' | head -n 1
+}
+
+## which Mac a sparsebundle holds the backups OF
+bundle_host_uuid() {
+	_mp="$1/com.apple.TimeMachine.MachineID.plist"
+	[ -f "$_mp" ] || return 1
+	## the dots are part of the KEY, not a key path -- plutil needs them escaped,
+	## or it goes looking for com -> apple -> backupd -> HostUUID and finds nothing
+	plutil -extract 'com\.apple\.backupd\.HostUUID' raw -o - "$_mp" 2>/dev/null
+}
+
+## A bundle recording THIS Mac's UUID is this Mac's own backup history. That is
+## a fact, not a guess -- which is why it can be picked up automatically, while
+## another Mac's backups are only ever added by hand.
+bundle_is_mine() {
+	_bu=$(bundle_host_uuid "$1") || return 1
+	[ -n "$_bu" ] || return 1
+	[ "$_bu" = "$(mac_uuid)" ]
+}
+
+## Sparsebundles on mounted volumes that belong to this Mac.
+##
+## Cached briefly: locations_all is called many times per run, and a fork per
+## bundle per call would be paid over and over for an answer that changes when
+## someone plugs something in, not between two lines of the same table.
+autodetect_images() {
+	_f="$(cache_write_dir)/images.autodetect"
+	if [ -f "$_f" ]; then
+		_age=$(( $(now_epoch) - $(stat -f '%m' "$_f" 2>/dev/null || echo 0) ))
+		[ "$_age" -lt "${IMAGE_SCAN_TTL:-300}" ] && { cat "$_f"; return 0; }
+	fi
+	_tmp=$(mktemp /tmp/my-tm.img.XXXXXX) || return 0
+	for _b in /Volumes/*/*.sparsebundle; do
+		[ -d "$_b" ] || continue
+		bundle_is_mine "$_b" || continue
+		printf '%s\n' "$_b" >>"$_tmp"
+	done
+	if need_dir "$(dirname "$_f")"; then
+		mv -f "$_tmp" "$_f" 2>/dev/null || rm -f "$_tmp"
+	else
+		rm -f "$_tmp"
+	fi
+	cat "$_f" 2>/dev/null
+	return 0
 }
 
 ## local | ssh | image | disk
@@ -1271,6 +1347,31 @@ image_touch() {
 ## store pays the attach once instead of once each.
 cleanup_images() {
 	rm -f "$TRANSIENT_IMAGES"
+	return 0
+}
+
+## Adopt an image that is attached but unrecorded.
+##
+## The sweep can only release what it has a record of, so an attach left behind
+## by a killed run would stay attached for good. Anything attached that belongs
+## to a location my-tm knows is taken over here and given the usual grace, so
+## the ordinary machinery ends up releasing it.
+images_adopt_orphans() {
+	_locs=$(locations_all | awk -F'\t' '{print $1}')
+	while IFS= read -r _ih; do
+		[ -n "$_ih" ] || continue
+		[ "$(loc_kind "$_ih")" = "image" ] || continue
+		_ib=$(loc_target "$_ih")
+		_imp=$(image_mountpoint "$_ib" 2>/dev/null) || continue
+		[ -n "$_imp" ] || continue
+		if mounts_read_all | awk -F'\t' -v m="$_imp" '$3 == m {f = 1} END {exit(f ? 0 : 1)}'; then
+			continue
+		fi
+		dbg "adopting an untracked attach of $_ib at $_imp"
+		image_touch "$_ib" "$_imp"
+	done <<_EOF
+$_locs
+_EOF
 	return 0
 }
 
@@ -1900,7 +2001,11 @@ vs_versions_for() {
 	for _df in "$_d"/d.*.tsv; do
 		[ -f "$_df" ] || continue
 		_dts=$(basename "$_df"); _dts=${_dts#d.}; _dts=${_dts%.tsv}
-		_row=$(awk -F'\t' -v p="$_p" '$1 == p {printf "%s\t%s", $2, $3; exit}' "$_df")
+		## if a delta somehow holds both, the file being THERE is the truth
+		_row=$(awk -F'\t' -v p="$_p" '
+			$1 == p { if ($2 != "-") { printf "%s\t%s", $2, $3; found = 1; exit }
+			          else keep = $2 "\t" $3 }
+			END { if (!found && keep != "") printf "%s", keep }' "$_df")
 		[ -n "$_row" ] && _cur="$_row"
 		printf '%s\t%s\n' "$_dts" "$_cur"
 	done
@@ -1928,13 +2033,21 @@ vs_record_snapshot() {
 	if [ -f "$_prev.gz" ]; then
 		_pp=$(mktemp /tmp/my-tm.prev.XXXXXX) || return 1
 		gzip -cd "$_prev.gz" >"$_pp" 2>/dev/null
+		## Removals are a difference of PATHS, never of whole lines. Comparing
+		## lines calls every CHANGED file removed as well -- its old line is gone --
+		## so each delta carried both "here it is" and "it is gone" for the same
+		## path, and an absent row sorts before a real one (ASCII 45 before 48), so
+		## the phantom won every lookup. That is a backup reported as not holding a
+		## file it plainly holds.
+		_op=$(mktemp /tmp/my-tm.op.XXXXXX) || return 1
+		_np=$(mktemp /tmp/my-tm.np.XXXXXX) || return 1
+		cut -f1 "$_pp" | LC_ALL=C sort -u >"$_op"
+		cut -f1 "$_stats" | LC_ALL=C sort -u >"$_np"
 		{
 			LC_ALL=C comm -13 "$_pp" "$_stats" || true
-			LC_ALL=C comm -23 "$_pp" "$_stats" | cut -f1 |
-				while IFS= read -r _gonep; do
-					[ -n "$_gonep" ] && printf '%s\t-\t-\n' "$_gonep"
-				done
+			LC_ALL=C comm -23 "$_op" "$_np" | awk 'length > 0 {printf "%s\t-\t-\n", $0}'
 		} | LC_ALL=C sort -u >"$_dl" 2>/dev/null
+		rm -f "$_op" "$_np"
 		dbg "version store: $_ts delta is $(count_lines <"$_dl") rows"
 		rm -f "$_pp"
 	else
@@ -1975,7 +2088,10 @@ vs_write_baseline() {
 		[ -f "$_bf" ] || continue
 		gzip -c "$_bf" >"$_d/base.$(basename "$_bf").gz" 2>/dev/null
 	done
-	_nb=$(ls "$_d"/base.*.gz 2>/dev/null | count_lines)
+	_nb=0
+	for _bg in "$_d"/base.*.gz; do
+		[ -f "$_bg" ] && _nb=$(( _nb + 1 ))
+	done
 	rm -rf "$_tmp"
 	if [ "$_nb" -le 0 ]; then
 		warn "the version baseline could not be written$([ -s "$_err" ] && printf ': %s' "$(head -n 1 "$_err")")"
@@ -1996,20 +2112,52 @@ vs_write_baseline() {
 ## squashed FORWARD into the next one instead -- the later row wins for a path
 ## both mention, and rows only the older delta had are carried over -- which
 ## keeps the chain exact and still reclaims the space.
+## Repair deltas written before removals were computed by path: a changed file
+## was recorded as changed AND removed. Precise -- an absent row is dropped only
+## where the SAME delta also has a real row for that path -- and idempotent, so
+## a 25-hour index is mended rather than rebuilt.
+VS_REPAIR=1
+vs_repair_deltas() {
+	_d=$(vs_dir "$1")
+	[ -d "$_d" ] || return 0
+	[ -f "$_d/.repaired.$VS_REPAIR" ] && return 0
+	_fixed=0
+	for _df in "$_d"/d.*.tsv; do
+		[ -f "$_df" ] || continue
+		_rt=$(mktemp /tmp/my-tm.rep.XXXXXX) || continue
+		if awk -F'\t' '
+				NR == FNR { if ($2 != "-") real[$1] = 1; next }
+				$2 == "-" && ($1 in real) { dropped++; next }
+				{ print }
+				END { if (dropped > 0) printf "%d\n", dropped > "/dev/stderr" }
+			' "$_df" "$_df" >"$_rt" 2>/dev/null; then
+			mv -f "$_rt" "$_df"
+			_fixed=$(( _fixed + 1 ))
+		else
+			rm -f "$_rt"
+		fi
+	done
+	printf '%s\n' "$VS_REPAIR" >"$_d/.repaired.$VS_REPAIR" 2>/dev/null
+	[ "$_fixed" -gt 0 ] && dbg "version store: checked $_fixed delta(s) for phantom removals"
+	return 0
+}
+
 vs_prune() {
 	_loc="$1"
+	vs_repair_deltas "$_loc"
 	_d=$(vs_dir "$_loc")
 	_cov=$(index_covered_file "$_loc")
 	[ -d "$_d" ] || [ -f "$_cov" ] || return 0
 	_live=$(snap_names "$_loc" 2>/dev/null)
 	[ -n "$_live" ] || return 0          # cannot tell -- leave everything alone
 
+	## Scratch files go to /tmp, not inside $_d: a location can have coverage
+	## from an earlier run and no version store yet, and writing into a directory
+	## that does not exist failed the whole prune with a shell error.
+	_lf=$(mktemp /tmp/my-tm.live.XXXXXX) || return 0
+	printf '%s\n' "$_live" | LC_ALL=C sort >"$_lf"
 	_gone=""
-	if [ -f "$_cov" ]; then
-		_gone=$(printf '%s\n' "$_live" | LC_ALL=C sort >"$_d/.live.$$" 2>/dev/null &&
-			LC_ALL=C sort "$_cov" | LC_ALL=C comm -23 - "$_d/.live.$$")
-		rm -f "$_d/.live.$$"
-	fi
+	[ -f "$_cov" ] && _gone=$(LC_ALL=C sort "$_cov" | LC_ALL=C comm -23 - "$_lf")
 	[ -n "$_gone" ] || return 0
 
 	_n=0
@@ -2019,8 +2167,10 @@ vs_prune() {
 		_gd="$_d/d.$_gts.tsv"
 		[ -f "$_gd" ] || continue
 		## the next delta in time order, if there is one
-		_next=$(ls "$_d"/d.*.tsv 2>/dev/null | sed 's|.*/d\.||; s|\.tsv$||' |
-			LC_ALL=C sort | awk -v g="$_gts" '$0 > g {print; exit}')
+		_next=$(for _dn in "$_d"/d.*.tsv; do
+				[ -f "$_dn" ] || continue
+				_db=$(basename "$_dn"); _db=${_db#d.}; printf '%s\n' "${_db%.tsv}"
+			done | LC_ALL=C sort | awk -v g="$_gts" '$0 > g {print; exit}')
 		if [ -n "$_next" ]; then
 			_nd="$_d/d.$_next.tsv"
 			_merged=$(mktemp /tmp/my-tm.sq.XXXXXX) || continue
@@ -2035,10 +2185,12 @@ vs_prune() {
 	done
 
 	## and stop claiming to cover what is not there
-	LC_ALL=C sort "$_cov" 2>/dev/null | LC_ALL=C comm -12 - "$(printf '%s\n' "$_live" |
-		LC_ALL=C sort >"$_d/.live2.$$" && printf '%s' "$_d/.live2.$$")" >"$_cov.new" 2>/dev/null &&
-		mv -f "$_cov.new" "$_cov"
-	rm -f "$_d/.live2.$$" "$_cov.new"
+	if [ -f "$_cov" ]; then
+		LC_ALL=C sort "$_cov" | LC_ALL=C comm -12 - "$_lf" >"$_cov.new" 2>/dev/null &&
+			mv -f "$_cov.new" "$_cov"
+		rm -f "$_cov.new"
+	fi
+	rm -f "$_lf"
 	dbg "version store: $_n snapshot(s) no longer exist and were pruned from '$_loc'"
 	return 0
 }
@@ -2179,6 +2331,10 @@ cmd_status() {
 	while IFS="$(printf '\t')" read -r _h _t _idir; do
 		[ -n "${_h:-}" ] || continue
 		[ -n "$_only" ] && [ "$_h" != "$_only" ] && continue
+		## never ATTACH for a status line: opening a sparsebundle on a share costs
+		## a minute, and `my-tm` with no arguments must stay instant. It is shown
+		## from what is already known, marked "?" like any store we cannot see.
+		[ "$(loc_kind "$_h")" = "image" ] && continue
 		loc_open "$_h" || true
 	done <<_EOF
 $_locs
@@ -2198,7 +2354,12 @@ _EOF
 		[ "$_t" = "local" ] && _dest="/ + /System/Volumes/Data"
 		_snaps="-"; _span="-"; _last="-"; _space="-"; _mark=""
 
-		if loc_ready "$_h"; then
+		if [ "$(loc_kind "$_h")" = "image" ]; then
+			## an image is reported from what has already been read, never by
+			## attaching it here (see above)
+			_rows=$(snapshots_cached_only "$_h")
+			[ -n "$_rows" ] || _mark="?"
+		elif loc_ready "$_h"; then
 			_rows=$(snapshots_get "$_h")
 		else
 			## not attached (ejected, unplugged, network destination): show the
@@ -2599,9 +2760,14 @@ _EOF
 		while IFS="$(printf '\t')" read -r _ts _ep _id _i _s _m; do
 			[ -n "${_ts:-}" ] || continue
 			_ndist=$(( _ndist + 1 ))
-			if [ "${_i:--}" = "-" ]; then
+			## Presence is decided by SIZE, never by the inode. The version store
+			## records path, size and mtime -- there is no inode in it, so testing
+			## one reported every indexed snapshot as "absent" whatever it held.
+			## Identity is size+mtime everywhere else here too, because an inode is
+			## not stable across snapshots of every store (see the collapse in §6).
+			if [ "${_s:--}" = "-" ]; then
 				_state="absent"; _size="-"
-			elif [ "$_i" = "${_live_i:-x}" ] && [ "$_s" = "${_live_s:-x}" ] && [ "$_m" = "${_live_m:-x}" ]; then
+			elif [ "$_s" = "${_live_s:-x}" ] && [ "$_m" = "${_live_m:-x}" ]; then
 				_state="=live"; _size=$(human_bytes "$_s")
 			else
 				_state="changed"; _size=$(human_bytes "$_s")
@@ -2901,6 +3067,8 @@ _EOF
 
 cmd_umount() {
 	_what="${1:-}"
+	## take over anything attached that nothing is tracking, so it can be released
+	images_adopt_orphans
 	_records=$(mounts_read_all)
 	[ -n "$_records" ] || { note "nothing mounted by $US"; return 0; }
 	_tmp=$(mktemp /tmp/my-tm.um.XXXXXX) || return 1
@@ -3806,9 +3974,111 @@ cmd_backup() {
 ## --add / --forget / --refresh
 #############################################################################
 
+## What a sparsebundle can say about itself WITHOUT being attached -- which is
+## the point, since attaching one over a share costs a minute or more.
+bundle_show() {
+	_b="$1"; _i="${2:-}"; _n="${3:-}"
+	_name=$(basename "$_b")
+	_host=$(bundle_host_uuid "$_b" 2>/dev/null)
+	_model=$(plutil -extract 'com\.apple\.backupd\.ModelID' raw -o - \
+		"$_b/com.apple.TimeMachine.MachineID.plist" 2>/dev/null)
+	_size=$(plutil -extract size raw -o - "$_b/Info.plist" 2>/dev/null)
+	_last=$(stat -f '%Sm' -t '%Y-%m-%d %H:%M' "$_b" 2>/dev/null)
+	printf '\n'
+	[ -n "$_i" ] && med "[$_i/$_n] $_name"
+	[ -n "$_i" ] || med "$_name"
+	minor "path        $_b"
+	if bundle_is_mine "$_b"; then
+		minor "belongs to  THIS Mac"
+	else
+		minor "belongs to  another Mac (HostUUID ${_host:-unknown})"
+	fi
+	[ -n "$_model" ] && minor "model       $_model"
+	[ -n "$_size" ] && minor "capacity    $(human_bytes "$_size")"
+	[ -n "$_last" ] && minor "last change $_last"
+	if locations_registered | awk -F'\t' -v b="$_b" '$2 == b {f = 1} END {exit(f ? 0 : 1)}'; then
+		minor "registered  yes, already known to my-tm"
+	else
+		minor "registered  no"
+	fi
+	return 0
+}
+
+## Offer each Time Machine bundle found in a directory, one at a time.
+## Its own variables are prefixed: add_one below sets _n and _b as well, and
+## shell has no locals -- the count changed under the loop and it walked off
+## the end of the list.
+add_pick() {
+	_pk_list="$1"
+	_pk_n=$(printf '%s\n' "$_pk_list" | count_lines)
+	_pk_i=1
+	_pk_added=0
+	_pk_asked=0
+	while [ "$_pk_i" -le "$_pk_n" ]; do
+		_pk_b=$(printf '%s\n' "$_pk_list" | sed -n "${_pk_i}p")
+		bundle_show "$_pk_b" "$_pk_i" "$_pk_n"
+		printf 'add / skip / back / quit  [a/s/b/q]? ' >&2
+		## Whether anyone is there to answer is decided by whether an answer
+		## ARRIVES, not by whether stdin is a terminal: answers piped in are a
+		## perfectly good way to drive this, and EOF is the honest signal that
+		## nobody is choosing.
+		if ! read -r _pk_ans; then
+			printf '\n' >&2
+			if [ "$_pk_asked" = "0" ]; then
+				note "$_pk_n Time Machine backups here, and nothing to answer with; add one by name:"
+				printf '%s\n' "$_pk_list" | while IFS= read -r _pk_lb; do
+					[ -n "$_pk_lb" ] && minor "$US --add $_pk_lb"
+				done
+				return 1
+			fi
+			break
+		fi
+		_pk_asked=1
+		case "$_pk_ans" in
+			a|A)
+				if add_one "$_pk_b" ""; then _pk_added=$(( _pk_added + 1 )); fi
+				_pk_i=$(( _pk_i + 1 ))
+				;;
+			s|S|"") _pk_i=$(( _pk_i + 1 )) ;;
+			b|B)
+				if [ "$_pk_i" -gt 1 ]; then _pk_i=$(( _pk_i - 1 )); else note "already at the first one"; fi
+				;;
+			q|Q) break ;;
+			*) warn "answer a, s, b or q" ;;
+		esac
+	done
+	note "$_pk_added added"
+	return 0
+}
+
 cmd_add() {
 	_folder="${1:-}"; _handle="${2:-}"
 	[ -n "$_folder" ] || err "--add needs a <FOLDER> (or host:/path), optionally a <HANDLE>"
+
+	## A directory that CONTAINS Time Machine bundles rather than being a store
+	## itself: offer what is in it instead of refusing.
+	if ! is_remote_target "$_folder" && ! is_image_target "$_folder"; then
+		_probe=$(abs_path "$_folder")
+		if [ -d "$_probe" ] && [ ! -f "$_probe/backup_manifest.plist" ]; then
+			_found=""
+			for _sb in "$_probe"/*.sparsebundle; do
+				[ -d "$_sb" ] || continue
+				_found="$_found$_sb
+"
+			done
+			_found=$(printf '%s' "$_found" | grep -v '^$' || true)
+			if [ -n "$_found" ]; then
+				add_pick "$_found"
+				return $?
+			fi
+		fi
+	fi
+	add_one "$_folder" "$_handle"
+	return $?
+}
+
+add_one() {
+	_folder="${1:-}"; _handle="${2:-}"
 
 	if ! is_remote_target "$_folder"; then
 		_folder=$(abs_path "$_folder")
@@ -3817,6 +4087,9 @@ cmd_add() {
 	if [ -z "$_handle" ]; then
 		if is_remote_target "$_folder"; then
 			_handle=$(slug "$(remote_host "$_folder")")
+		elif is_image_target "$_folder"; then
+			## "macado.sparsebundle" would slug to "macado-sparsebundle"
+			_handle=$(slug "$(basename "$_folder" | sed 's/\.[^.]*$//')")
 		else
 			_handle=$(slug "$(basename "$_folder")")
 		fi
@@ -4219,6 +4492,7 @@ cmd_uninstall() {
 #############################################################################
 
 cmd_maintenance() {
+	images_adopt_orphans
 	dbg "maintenance: usage samples"
 	for _uh in $(locations_all | awk -F'\t' '{print $1}'); do
 		usage_sample "$_uh"
@@ -5859,6 +6133,237 @@ t_test_full_disk_access() {
 	FDA_PROBE="$_saved"
 }
 
+## A sparsebundle records the UUID of the Mac it backs up. That makes "is this
+## my own backup history?" a fact rather than a guess -- which is what lets
+## my-tm pick up its own bundles automatically while leaving other machines'
+## backups alone.
+t_test_bundle_ownership() {
+	printf '\nSparsebundles: whose backups are these\n'
+	_saved="$MAC_UUID"
+	MAC_UUID="AAAA1111-2222-3333-4444-555566667777"
+
+	_share="$T_ROOT/share"; mkdir -p "$_share"
+	t_make_bundle "$_share/mine.sparsebundle" "$MAC_UUID" "Mac16,5"
+	t_make_bundle "$_share/theirs.sparsebundle" "BBBB9999-8888-7777-6666-555544443333" "Mac14,2"
+	mkdir -p "$_share/notabundle.sparsebundle"   # no MachineID.plist at all
+
+	t_eq "my own bundle is recognised" \
+		"$(bundle_is_mine "$_share/mine.sparsebundle" && echo mine || echo other)" "mine"
+	t_eq "another Mac's is not" \
+		"$(bundle_is_mine "$_share/theirs.sparsebundle" && echo mine || echo other)" "other"
+	t_eq "and neither is something without a MachineID" \
+		"$(bundle_is_mine "$_share/notabundle.sparsebundle" && echo mine || echo other)" "other"
+	t_eq "the host UUID is read back" \
+		"$(bundle_host_uuid "$_share/theirs.sparsebundle")" "BBBB9999-8888-7777-6666-555544443333"
+
+	## what --add shows before asking, without attaching anything
+	_show=$(bundle_show "$_share/mine.sparsebundle" 2>&1)
+	t_match "the summary says whose it is" "$_show" "THIS Mac"
+	t_match "and names the model" "$_show" "Mac16,5"
+	_show=$(bundle_show "$_share/theirs.sparsebundle" 2>&1)
+	t_match "a foreign one is marked as such" "$_show" "another Mac"
+
+	MAC_UUID="$_saved"
+}
+
+## --add pointed at a directory full of bundles asks about each in turn.
+t_test_add_picker() {
+	printf '\n--add on a directory of bundles\n'
+	_saved="$MAC_UUID"
+	MAC_UUID="AAAA1111-2222-3333-4444-555566667777"
+	_share="$T_ROOT/share2"; mkdir -p "$_share"
+	t_make_bundle "$_share/one.sparsebundle" "$MAC_UUID" "Mac16,5"
+	t_make_bundle "$_share/two.sparsebundle" "BBBB9999-8888-7777-6666-555544443333" "Mac14,2"
+	_lf=$(locations_file)
+	_before=$(cat "$_lf" 2>/dev/null)
+
+	## no terminal: it must not guess, it must name them
+	_out=$( ( cmd_add "$_share" ) </dev/null 2>&1 )
+	t_match "with nothing to answer with, it lists them instead of choosing" "$_out" "add one by name"
+	t_eq "and registers nothing" "$(cat "$_lf" 2>/dev/null)" "$_before"
+
+	## skip the first, add the second, then quit
+	_out=$( printf 's\na\n' | ( cmd_add "$_share" ) 2>&1 )
+	t_match "it walks through each bundle" "$_out" "\[1/2\]"
+	t_match "and the second one too" "$_out" "\[2/2\]"
+	t_eq "the skipped bundle was not registered" \
+		"$(count_match 'one.sparsebundle' < "$_lf")" "0"
+	t_eq "the chosen one was" "$(count_match 'two.sparsebundle' < "$_lf")" "1"
+
+	## quitting stops immediately
+	_before=$(cat "$_lf" 2>/dev/null)
+	_out=$( printf 'q\n' | ( cmd_add "$_share" ) 2>&1 )
+	t_eq "quit registers nothing more" "$(cat "$_lf" 2>/dev/null)" "$_before"
+
+	MAC_UUID="$_saved"
+}
+
+## a minimal but real sparsebundle: the two plists my-tm reads
+t_make_bundle() {
+	_b="$1"; _host="$2"; _model="$3"
+	mkdir -p "$_b/bands"
+	cat >"$_b/Info.plist" <<_EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+	<key>band-size</key><integer>268435456</integer>
+	<key>diskimage-bundle-type</key><string>com.apple.diskimage.sparsebundle</string>
+	<key>size</key><integer>11399877943296</integer>
+	<key>uuid</key><string>d3da6a2f-7bd7-4db1-bd52-295f50474ff5</string>
+</dict></plist>
+_EOF
+	cat >"$_b/com.apple.TimeMachine.MachineID.plist" <<_EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+	<key>com.apple.backupd.HostUUID</key><string>$_host</string>
+	<key>com.apple.backupd.ModelID</key><string>$_model</string>
+	<key>VerificationState</key><integer>1</integer>
+</dict></plist>
+_EOF
+	return 0
+}
+
+## REGRESSION: an image attached by a run that was killed had no record, and
+## the sweep only releases what it has a record of -- so it would have stayed
+## attached indefinitely.
+t_test_image_orphan_adoption() {
+	printf '\nAn untracked attach is adopted, not abandoned\n'
+	_saved="$MAC_UUID"; MAC_UUID="AAAA1111-2222-3333-4444-555566667777"
+	_share="$T_ROOT/share3"; mkdir -p "$_share"
+	t_make_bundle "$_share/orphan.sparsebundle" "$MAC_UUID" "Mac16,5"
+	printf 'orphanloc\t%s/orphan.sparsebundle\t\n' "$_share" >>"$T_ROOT/cache/locations.tsv"
+
+	## pretend hdiutil reports it as attached -- as a real plist, because that
+	## is what image_mountpoint parses
+	{
+		printf '#!/bin/sh\n'
+		printf 'printf "hdiutil %%s\\n" "$*" >>"%s"\n' "$(t_calls)"
+		# shellcheck disable=SC2016  # writing a script: $1 is the STUB's argument
+		printf 'if [ "$1" = "info" ]; then cat <<XEOF\n'
+		printf '<?xml version="1.0" encoding="UTF-8"?>\n'
+		printf '<plist version="1.0"><dict><key>images</key><array><dict>\n'
+		printf '<key>image-path</key><string>%s/orphan.sparsebundle</string>\n' "$_share"
+		printf '<key>system-entities</key><array><dict>\n'
+		printf '<key>mount-point</key><string>/Volumes/Orphan</string>\n'
+		printf '</dict></array></dict></array></dict></plist>\n'
+		printf 'XEOF\n'
+		printf 'fi\n'
+		printf 'exit 0\n'
+	} >"$(t_stub_dir)/hdiutil"
+	chmod 0755 "$(t_stub_dir)/hdiutil"
+
+	_f=$(mounts_file); : >"$_f"
+	t_eq "nothing is tracked to begin with" "$(mounts_read_all | count_lines)" "0"
+	images_adopt_orphans >/dev/null 2>&1
+	t_eq "the untracked attach is now tracked" \
+		"$(mounts_read_all | count_match 'image')" "1"
+	_ttl=$(mounts_read_all | awk -F'\t' '$7 ~ /image/ {print $5}')
+	t_eq "with the image grace period" "$_ttl" "$IMAGE_GRACE"
+
+	## and adopting twice must not duplicate it
+	images_adopt_orphans >/dev/null 2>&1
+	t_eq "adopting again changes nothing" "$(mounts_read_all | count_match 'image')" "1"
+
+	rm -f "$(t_stub_dir)/hdiutil"
+	: >"$_f"
+	grep -v '^orphanloc' "$T_ROOT/cache/locations.tsv" >"$T_ROOT/l3.tmp" &&
+		mv "$T_ROOT/l3.tmp" "$T_ROOT/cache/locations.tsv"
+	MAC_UUID="$_saved"
+}
+
+## REGRESSION: pruning wrote its scratch files INSIDE the version-store
+## directory. A location indexed before the version store existed has coverage
+## but no such directory, so the very first thing --index did was fail with a
+## shell error and prune nothing.
+t_test_prune_without_version_store() {
+	printf '\nPruning a location that has no version store yet\n'
+	_cov=$(index_covered_file store)
+	need_dir "$(dirname "$_cov")"
+	_d=$(vs_dir store)
+	rm -rf "$_d"          # coverage exists, version store does not
+	_live=$(snap_names store | LC_ALL=C sort)
+	{ printf '%s\n' "$_live"; printf '2020-01-01-000000\n'; } >"$_cov"
+
+	_err=$( ( vs_prune store ) 2>&1 >/dev/null )
+	t_eq "it does not fail" "$(printf '%s' "$_err" | count_match 'No such file')" "0"
+	t_eq "and still prunes what is gone" "$(count_match '2020-01-01' < "$_cov")" "0"
+	t_eq "keeping what exists" "$(count_lines < "$_cov")" "$(printf '%s\n' "$_live" | count_lines)"
+	rm -f "$_cov"
+}
+
+## REGRESSION: a CHANGED file was recorded as changed and removed at once,
+## because removals were computed by comparing whole lines: the old line is
+## gone, so every changed path looked deleted. An absent row sorts before a
+## real one, so the phantom won -- my-tm reported a backup as not holding a
+## file it plainly held. Verified against a real store: 2.26M such rows.
+t_test_delta_removals_by_path() {
+	printf '\nDeltas: changed is not removed\n'
+	_d=$(vs_dir store); rm -rf "$_d"; need_dir "$_d"
+
+	## walk 1: two files. walk 2: one changed, one deleted, one new.
+	_w1=$(mktemp "$T_ROOT/w1.XXXXXX"); _w2=$(mktemp "$T_ROOT/w2.XXXXXX")
+	printf '/a/changed\t100\t1000\n/a/deleted\t200\t2000\n' >"$_w1"
+	printf '/a/changed\t999\t9999\n/a/new\t300\t3000\n' >"$_w2"
+
+	vs_record_snapshot store 2026-01-01-000000 "$_w1" >/dev/null 2>&1
+	vs_record_snapshot store 2026-01-02-000000 "$_w2" >/dev/null 2>&1
+	_dl="$_d/d.2026-01-02-000000.tsv"
+
+	t_eq "the changed file is recorded with its new size" \
+		"$(awk -F'\t' '$1 == "/a/changed" {print $2}' "$_dl")" "999"
+	t_eq "and NOT also as removed" \
+		"$(awk -F'\t' '$1 == "/a/changed" && $2 == "-"' "$_dl" | count_lines)" "0"
+	t_eq "the genuinely deleted file IS marked absent" \
+		"$(awk -F'\t' '$1 == "/a/deleted" && $2 == "-"' "$_dl" | count_lines)" "1"
+	t_eq "the new file is recorded" \
+		"$(awk -F'\t' '$1 == "/a/new" {print $2}' "$_dl")" "300"
+
+	## and what a lookup reconstructs must say the changed file is THERE
+	_v=$(vs_versions_for store /a/changed)
+	t_eq "the reconstruction reports it present" \
+		"$(printf '%s\n' "$_v" | awk -F'\t' '$1 == "2026-01-02-000000" {print $2}')" "999"
+	t_eq "and the deleted one absent" \
+		"$(vs_versions_for store /a/deleted | awk -F'\t' '$1 == "2026-01-02-000000" {print $2}')" "-"
+
+	## the repair mends a store already written the wrong way
+	printf '/a/changed\t-\t-\n' >>"$_dl"
+	rm -f "$_d/.repaired.$VS_REPAIR"
+	vs_repair_deltas store
+	t_eq "a phantom removal is repaired away" \
+		"$(awk -F'\t' '$1 == "/a/changed" && $2 == "-"' "$_dl" | count_lines)" "0"
+	t_eq "while the real row survives" \
+		"$(awk -F'\t' '$1 == "/a/changed" && $2 == "999"' "$_dl" | count_lines)" "1"
+	t_eq "and a genuine removal is left alone" \
+		"$(awk -F'\t' '$1 == "/a/deleted" && $2 == "-"' "$_dl" | count_lines)" "1"
+	rm -rf "$_d" "$_w1" "$_w2"
+}
+
+## REGRESSION: presence was decided by the INODE field, but the version store
+## holds path, size and mtime and has no inode -- so every snapshot the index
+## answered was reported "absent" no matter what it held, which made a
+## 25-hour index worse than useless: confidently wrong.
+t_test_presence_by_size_not_inode() {
+	printf '\nPresence is decided by size, not inode\n'
+	_w="$T_ROOT/pres"
+	## rows as cmd_lookup builds them: ts, epoch, id, inode, size, mtime
+	{
+		printf '2026-08-03-000000\t300\tc3\t-\t205797\t1787660725\n'
+		printf '2026-08-02-000000\t200\tb2\t-\t-\t-\n'
+		printf '2026-08-01-000000\t100\ta1\t99\t7466\t1748518711\n'
+	} >"$_w"
+	_out=$(while IFS="$(printf '\t')" read -r _ts _ep _id _i _s _m; do
+		if [ "${_s:--}" = "-" ]; then printf '%s absent\n' "$_id"
+		else printf '%s present\n' "$_id"; fi
+	done <"$_w")
+	t_match "an index row with no inode is still PRESENT" "$_out" "c3 present"
+	t_match "a row with no size is absent" "$_out" "b2 absent"
+	t_match "a live-read row is present too" "$_out" "a1 present"
+	t_eq "nothing is called absent merely for lacking an inode" \
+		"$(printf '%s\n' "$_out" | count_match 'absent')" "1"
+	rm -f "$_w"
+}
+
 run_tests() {
 	T_WITH_SNAPSHOTS=0
 	for _a in "$@"; do
@@ -5897,7 +6402,13 @@ run_tests() {
 	t_test_progress_goes_to_stderr
 	t_test_usage_trend
 	t_test_version_store_pruning
+	t_test_prune_without_version_store
+	t_test_delta_removals_by_path
+	t_test_presence_by_size_not_inode
 	t_test_full_disk_access
+	t_test_bundle_ownership
+	t_test_add_picker
+	t_test_image_orphan_adoption
 	t_test_snapshot_set_is_validated
 	t_test_no_exclusive_size_claims
 	t_test_site_conf_dir_from_env
