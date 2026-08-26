@@ -951,7 +951,12 @@ Read once, cached — and, as it turns out, **without mounting anything at all**
   `tmutil listbackups`, which needs Full Disk Access; this needs neither that
   nor root.
 * `tmutil destinationinfo` → mounted destinations, IDs, kind (Local/Network).
-* the store root listing → `.inprogress` / `.interrupted` / `.previous` leftovers.
+* the store root listing → `.inprogress` and `.interrupted` leftovers. A
+  `<ts>.previous` directory is deliberately **not** reported: it is the working
+  copy Time Machine keeps of the last completed backup to compare the next one
+  against, so it exists after every successful backup and simply moves to the
+  newest. Reporting it as a state made a perfectly healthy newest backup look
+  like it was in some peculiar condition.
 
 A `PATH` is *covered* by a location when the volume UUID of `PATH`
 (`diskutil info -plist`) is in that location's source-volume set, and

@@ -919,7 +919,12 @@ snap_states() {
 	is_remote_target "$_t" && return 0
 	_t=$(loc_store_path "$1") || return 0
 	[ -d "$_t" ] || return 0
-	for _e in "$_t"/*.inprogress "$_t"/*.interrupted "$_t"/*.previous; do
+	## Only conditions worth reporting. A <ts>.previous directory is NOT one: it
+	## is the working copy Time Machine keeps of the last completed backup, to
+	## compare the next one against, so it is present after every successful
+	## backup and simply moves to the newest. Reporting it as a state made the
+	## newest backup look like it was in some peculiar condition.
+	for _e in "$_t"/*.inprogress "$_t"/*.interrupted; do
 		[ -e "$_e" ] || continue
 		_b=$(basename "$_e")
 		printf '%s\t%s\n' "${_b%.*}" "${_b##*.}"
@@ -6364,6 +6369,20 @@ t_test_presence_by_size_not_inode() {
 	rm -f "$_w"
 }
 
+## A <ts>.previous directory is normal housekeeping -- the working copy Time
+## Machine keeps of the last completed backup -- so it must not be reported as
+## a state. Only in-progress and interrupted backups are conditions.
+t_test_previous_is_not_a_state() {
+	printf '\nA .previous working copy is not a condition\n'
+	mkdir -p "$T_ROOT/store/2026-08-26-231818.previous"
+	_st=$(snap_states store)
+	t_eq "a .previous directory is not reported" \
+		"$(printf '%s\n' "$_st" | count_match 'previous')" "0"
+	t_match "while an interrupted backup still is" "$_st" "interrupted"
+	t_match "and one in progress too" "$_st" "inprogress"
+	rmdir "$T_ROOT/store/2026-08-26-231818.previous"
+}
+
 run_tests() {
 	T_WITH_SNAPSHOTS=0
 	for _a in "$@"; do
@@ -6382,6 +6401,7 @@ run_tests() {
 	t_test_format
 	t_test_manifest
 	t_test_states
+	t_test_previous_is_not_a_state
 	t_test_thin
 	t_test_config
 	t_test_locations
