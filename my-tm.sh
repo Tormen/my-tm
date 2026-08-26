@@ -2941,9 +2941,11 @@ cmd_show() {
 
 abs_path() {
 	case "$1" in
-		/*) printf '%s\n' "$1" ;;
-		*)  printf '%s/%s\n' "$PWD" "$1" ;;
+		/*) _ap="$1" ;;
+		*)  _ap="$PWD/$1" ;;
 	esac
+	## "./my-tm.sh" would otherwise read back as "/some/dir/./my-tm.sh"
+	printf '%s\n' "$_ap" | sed -e 's|/\./|/|g' -e 's|//*|/|g'
 }
 
 #############################################################################
@@ -5016,8 +5018,8 @@ main() {
 		--completion)   cmd_completion "${1:-}" ;;
 		--version)
 			## name the FILE and its date, not just the number: my-tm is copied to
-			## a root-owned path for the daemons rather than symlinked, so a checkout
-			and an installed copy can differ and look identical from the outside
+			## a root-owned path for the daemons rather than symlinked, so a
+			## checkout and an installed copy can differ while looking identical
 			_vb=$(abs_path "$0")
 			printf '%s %s\n' "$US" "$MY_TM_VERSION"
 			printf '  %s\n' "$_vb"
@@ -6391,6 +6393,20 @@ t_test_previous_is_not_a_state() {
 	rmdir "$T_ROOT/store/2026-08-26-231818.previous"
 }
 
+## REGRESSION: a mangled comment left a bare word in the --version arm, which
+## the shell tried to run. The output still looked right, so nothing caught it.
+t_test_version_output() {
+	printf '\n--version\n'
+	_err=$( "$T_MYTM" --version 2>&1 >/dev/null )
+	t_eq "it prints no errors" "$_err" ""
+	_out=$( "$T_MYTM" --version 2>/dev/null )
+	t_match "the version number is there" "$_out" "[0-9]\.[0-9]"
+	t_match "and the file it ran from" "$_out" "my-tm"
+	t_eq "the path is clean" "$(printf '%s' "$_out" | count_match '/./')" "0"
+	t_eq "abs_path normalises a dot component" \
+		"$(cd /tmp && abs_path ./x/y)" "/tmp/x/y"
+}
+
 run_tests() {
 	T_WITH_SNAPSHOTS=0
 	for _a in "$@"; do
@@ -6421,6 +6437,7 @@ run_tests() {
 	t_test_rm_dryrun
 	t_test_help
 	t_test_paths
+	t_test_version_output
 	t_test_ejected_destination
 	t_test_auto_mount_destinations
 	t_test_verify_reports
