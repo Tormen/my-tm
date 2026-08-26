@@ -5014,7 +5014,15 @@ main() {
 		--refresh)      cmd_refresh "$@" ;;
 		--create-config) cmd_create_config "${1:-}" ;;
 		--completion)   cmd_completion "${1:-}" ;;
-		--version)      printf '%s %s\n' "$US" "$MY_TM_VERSION" ;;
+		--version)
+			## name the FILE and its date, not just the number: my-tm is copied to
+			## a root-owned path for the daemons rather than symlinked, so a checkout
+			and an installed copy can differ and look identical from the outside
+			_vb=$(abs_path "$0")
+			printf '%s %s\n' "$US" "$MY_TM_VERSION"
+			printf '  %s\n' "$_vb"
+			printf '  %s\n' "$(stat -f '%Sm' -t '%Y-%m-%d %H:%M' "$_vb" 2>/dev/null)"
+			;;
 		--run-tests)    run_tests "$@" ;;
 		*)              err "unknown command: $CMD  (see --help)" ;;
 	esac
