@@ -287,6 +287,19 @@ config_search_paths() {
 	done
 }
 
+## Where to OFFER writing one when none was found: the site location first,
+## then the system one, then the user's -- ordered by how often each is the
+## right answer, which is NOT the search order ($HOME is searched before
+## /etc). Each is checked against the real search list, so this can never
+## point at a file my-tm would not read.
+config_offer_paths() {
+	_co_all=$(config_search_paths)
+	for _co_p in /LINKS/default/my-tm.conf /etc/my-tm.conf "$HOME/.my-tm.conf"; do
+		printf '%s\n' "$_co_all" | grep -qxF "$_co_p" && printf '%s\n' "$_co_p"
+	done
+	return 0
+}
+
 config_candidates() {
 	if [ -n "${MY_TM_CONFIG:-}" ]; then
 		printf '%s\n' "$MY_TM_CONFIG"
@@ -4489,10 +4502,11 @@ cmd_install() {
 	require_root "--install"
 	if [ -z "$CONFIG_SOURCED" ]; then
 		warn "--install needs a config: job labels, directories and the group are site-specific, and guessing them is worse than asking."
-		note "no config in any of the searched places -- write one with:"
-		config_search_paths | while IFS= read -r _cp; do
+		note "no config found -- write one, most common place first:"
+		config_offer_paths | while IFS= read -r _cp; do
 			minor "$US --create-config > $_cp"
 		done
+		why "$US --help lists every place searched, in search order"
 		exit 1
 	fi
 
@@ -6603,6 +6617,29 @@ t_test_config_search_order() {
 		"$(config_search_paths | sed -n '1p')" "/LINKS/default/my-tm.conf"
 	t_match "and \$HOME renders as a dotfile" \
 		"$(config_search_paths)" "$HOME/.my-tm.conf"
+
+	## What a user with no config is TOLD to do. Ordered by how often each
+	## place is the right answer -- site, then system, then user -- which is
+	## deliberately NOT the search order, so it is never described as one.
+	t_eq "the site location is offered first" \
+		"$(config_offer_paths | sed -n '1p')" "/LINKS/default/my-tm.conf"
+	t_eq "then the system one" \
+		"$(config_offer_paths | sed -n '2p')" "/etc/my-tm.conf"
+	t_eq "then the user's" \
+		"$(config_offer_paths | sed -n '3p')" "$HOME/.my-tm.conf"
+
+	## REGRESSION-GUARD: the offer must never name a file my-tm would not
+	## read. Every offered path has to be in the real search list -- so a
+	## later edit to the search cannot leave the message pointing at a
+	## location that is no longer consulted.
+	_cso_orphans=0
+	config_offer_paths | while IFS= read -r _cso_p; do
+		config_search_paths | grep -qxF "$_cso_p" || _cso_orphans=1
+		[ "$_cso_orphans" = "1" ] && printf 'ORPHAN %s\n' "$_cso_p"
+	done >"$T_ROOT/offer.check"
+	t_eq "every offered path is one that is actually searched" \
+		"$(count_lines < "$T_ROOT/offer.check")" "0"
+	rm -f "$T_ROOT/offer.check"
 
 	SITE_CONF_DIR_FROM_ENV="$_cso_save"
 }
