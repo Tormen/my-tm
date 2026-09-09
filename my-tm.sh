@@ -11,7 +11,7 @@
 set -u
 
 US="${0##*/}"
-MY_TM_VERSION="0.9.1"
+MY_TM_VERSION="0.9.2"
 
 #############################################################################
 ## DEFAULTS -- all neutral.  Site values belong in the config file, never here.
@@ -60,6 +60,8 @@ LOCAL_SNAP_MAX=48
 BACKUP_JOB="local.my-tm.backup"
 BACKUP_SCHEDULE="on-boot"
 BACKUP_VOLUME=""
+POST_BACKUP="eject"
+POST_BACKUP_PER_LOCATION=""
 NOTIFY_CMD=""
 NO_EJECT_FLAGFILE="/var/lib/my-tm/no-eject"
 LOCKFILE="/var/lib/my-tm/backup.lock"
@@ -92,6 +94,10 @@ VRB=0; DBG=0; DEEPDBG=0; DBG_PATH=""
 JSON=0; OPT_ALL=0; LIMIT=""; FORCE=0; SRC=""
 CONFIG_FILE=""; CONFIG_SOURCED=""
 EXIT_RC=0
+## set by the daemons only.  A background job may read what is already
+## there; it may not SPIN A DISK UP to look, which is the whole point of
+## having put it to sleep after the backup.
+BACKGROUND_JOB=0
 
 ## Mountpoints to release when this run ends.  A FILE, not a variable: every
 ## caller reaches transient_snapshot through $(...), which is a subshell, and a
@@ -224,7 +230,27 @@ LOCAL_SNAP_MAX=48               # cap for high-frequency intervals
 BACKUP_JOB="local.my-tm.backup"
 BACKUP_SCHEDULE="on-boot"       # on-boot | <N>s|m|h | HH:MM | Mon HH:MM ...
 # --- backup control ---
-BACKUP_VOLUME=""                # "" = TM's own destination
+BACKUP_VOLUME=""                # "" = ask tmutil which destination this is.
+                                # Resolved ONCE at startup; the pre-backup
+                                # mount, POST_BACKUP and the quiet rule all
+                                # use that one value. More than one tmutil
+                                # destination = refuse and ask, not guess.
+POST_BACKUP="eject"             # what happens when a backup finishes:
+                                #   none     leave it mounted
+                                #   unmount  diskutil unmountDisk -- the device
+                                #            stays on the bus and the enclosure
+                                #            spins it down on its own timer
+                                #   eject    diskutil eject -- parks the drive
+                                #            at once. Quietest and least
+                                #            runtime, but some USB bridges then
+                                #            need a replug. Test yours before
+                                #            trusting it to an unattended job.
+POST_BACKUP_PER_LOCATION=""     # per-location override, one "<location> <value>"
+                                # per line; anything unnamed gets POST_BACKUP:
+                                #   POST_BACKUP_PER_LOCATION="
+                                #   horse   eject
+                                #   ada     none
+                                #   "
 NOTIFY_CMD=""                   # optional external notifier; empty = osascript
 NO_EJECT_FLAGFILE="/var/lib/my-tm/no-eject"
 LOCKFILE="/var/lib/my-tm/backup.lock"
@@ -1463,6 +1489,10 @@ loc_open() {
 	is_remote_target "$_t" && return 0
 	[ -d "$_t" ] && return 0
 	[ "${AUTO_MOUNT_DESTINATIONS:-1}" = "1" ] || return 1
+	if [ "$BACKGROUND_JOB" = "1" ] && loc_is_quiet "$_h"; then
+		dbg "$_h is quiet (POST_BACKUP put it to sleep) -- not waking it for a daemon"
+		return 1
+	fi
 	_name=$(basename "$_t")
 	[ "$(volume_state "$_name")" = "unmounted" ] || return 1
 	msg "'$_name' is attached but not mounted -- mounting it"
@@ -3543,6 +3573,7 @@ health_say() {
 }
 
 cmd_health() {
+	BACKGROUND_JOB=1
 	_only="${1:-}"
 	if [ -n "$_only" ]; then
 		_locs="$_only"
@@ -3559,22 +3590,38 @@ cmd_health() {
 	while IFS= read -r _h; do
 		[ -n "$_h" ] || continue
 		loc_line "$_h" >/dev/null 2>&1 || continue
+		## A destination my-tm itself put to sleep is not "not reachable" --
+		## it is exactly where it was left. Answer from the cache instead of
+		## spinning it up, and say so, because a cached age is a fact about
+		## the last time anyone looked.
+		_asleep=0
 		if ! loc_reachable "$_h"; then
-			health_say fail "$_h: destination not reachable"
-			continue
+			if loc_is_quiet "$_h"; then
+				_asleep=1
+				dbg "$_h is quiet and asleep -- answering from the cache"
+			else
+				health_say fail "$_h: destination not reachable"
+				continue
+			fi
 		fi
 		_t=$(loc_target "$_h")
-		_rows=$(snapshots_get "$_h")
+		if [ "$_asleep" = "1" ]; then
+			_rows=$(snapshots_cached_only "$_h")
+		else
+			_rows=$(snapshots_get "$_h")
+		fi
 		if [ -z "$_rows" ]; then
 			health_say fail "$_h: no snapshots found"
 			continue
 		fi
+		_from=""
+		[ "$_asleep" = "1" ] && _from=" [cached; disk asleep]"
 		_lastep=$(printf '%s\n' "$_rows" | sort -t"$(printf '\t')" -k3,3n | tail -n 1 | awk -F'\t' '{print $3}')
 		_agh=$(( (_now - _lastep) / 3600 ))
 		if [ "$_agh" -gt "$HEALTH_MAX_AGE_H" ]; then
-			health_say fail "$_h: newest backup is ${_agh}h old (limit ${HEALTH_MAX_AGE_H}h) -- Time Machine fails silently, this is the one to watch"
+			health_say fail "$_h: newest backup is ${_agh}h old (limit ${HEALTH_MAX_AGE_H}h)$_from -- Time Machine fails silently, this is the one to watch"
 		else
-			health_say ok "$_h: newest backup ${_agh}h old"
+			health_say ok "$_h: newest backup ${_agh}h old$_from"
 		fi
 
 		if [ "$_t" != "local" ] && [ -d "$_t" ]; then
@@ -3905,24 +3952,105 @@ backup_cleanup() {
 	exit $_rc
 }
 
-do_eject() {
-	[ -n "$BACKUP_VOLUME" ] || return 0
-	if [ -f "$NO_EJECT_FLAGFILE" ]; then
-		msg "not ejecting: $NO_EJECT_FLAGFILE exists"
+## The backup destination, resolved ONCE and then reused.  BACKUP_VOLUME
+## names it outright; empty means ASK TMUTIL -- because `tmutil startbackup`
+## writes to that destination whatever my-tm thinks, and a tool that backs up
+## to a disk it refuses to name cannot mount it, eject it, or leave it alone
+## on purpose.  Every consumer below calls this, none calls tmutil itself.
+backup_volume() {
+	if [ -n "${BACKUP_VOLUME_RESOLVED+x}" ]; then
+		printf '%s\n' "$BACKUP_VOLUME_RESOLVED"
 		return 0
 	fi
+	if [ -n "$BACKUP_VOLUME" ]; then
+		BACKUP_VOLUME_RESOLVED="$BACKUP_VOLUME"
+	else
+		_bv_mp=$(tmutil destinationinfo 2>/dev/null |
+			sed -nE 's/^[[:space:]]*Mount Point[[:space:]]*:[[:space:]]*(.*)$/\1/p')
+		_bv_n=$(printf '%s\n' "$_bv_mp" | count_lines)
+		case "$_bv_n" in
+			0) BACKUP_VOLUME_RESOLVED="" ;;
+			1) BACKUP_VOLUME_RESOLVED=$(printf '%s\n' "$_bv_mp" | sed -n '1p')
+			   BACKUP_VOLUME_RESOLVED="${BACKUP_VOLUME_RESOLVED##*/}" ;;
+			*) err "tmutil reports $_bv_n destinations -- name the one to act on with BACKUP_VOLUME in the config; guessing is worse than asking" ;;
+		esac
+	fi
+	printf '%s\n' "$BACKUP_VOLUME_RESOLVED"
+	return 0
+}
+
+## What happens to the disk when a backup finishes, for one location.
+## POST_BACKUP_PER_LOCATION wins over POST_BACKUP; an unknown value is a
+## config error, not a silent fallback.
+post_backup_policy() {
+	_pb_h="${1:-}"
+	_pb_v=""
+	if [ -n "$_pb_h" ] && [ -n "$POST_BACKUP_PER_LOCATION" ]; then
+		_pb_v=$(printf '%s\n' "$POST_BACKUP_PER_LOCATION" |
+			awk -v h="$_pb_h" '$1 == h { print $2; exit }')
+	fi
+	[ -n "$_pb_v" ] || _pb_v="$POST_BACKUP"
+	case "$_pb_v" in
+		none|unmount|eject) printf '%s\n' "$_pb_v" ;;
+		*) err "POST_BACKUP is '$_pb_v' -- it must be none, unmount or eject" ;;
+	esac
+	return 0
+}
+
+## A location my-tm puts back to sleep is QUIET: a background job must not
+## wake it just to look.  One rule, no allowlist -- interactive commands are
+## unaffected, because someone asked.
+loc_is_quiet() {
+	_lq_t=$(loc_target "${1:-}" 2>/dev/null) || return 1
+	case "$_lq_t" in local) return 1 ;; esac
+	is_remote_target "$_lq_t" && return 1
+	_lq_v=$(backup_volume)
+	[ -n "$_lq_v" ] || return 1
+	[ "$(basename "$_lq_t")" = "$_lq_v" ] || return 1
+	[ "$(post_backup_policy "$1")" = "none" ] && return 1
+	return 0
+}
+
+## Give the disk back to the hardware.  `eject` parks it at once and is the
+## quietest; `unmount` leaves the device on the bus and lets the enclosure
+## spin it down on its own timer, which is what an enclosure that does not
+## survive an eject needs.  Retries are shared: both can lose to a straggler
+## holding the volume open.
+do_post_backup() {
+	_pv=$(backup_volume)
+	[ -n "$_pv" ] || {
+		why "no backup destination to act on"
+		return 0
+	}
+	_pol=$(post_backup_policy "${1:-}")
+	if [ -f "$NO_EJECT_FLAGFILE" ]; then
+		msg "leaving $_pv mounted [policy $_pol suppressed by $NO_EJECT_FLAGFILE]"
+		why "--eject removes that file and the policy applies again"
+		return 0
+	fi
+	case "$_pol" in
+		none)
+			msg "leaving $_pv mounted [POST_BACKUP=none]"
+			return 0 ;;
+		unmount) set -- diskutil unmountDisk "/Volumes/$_pv" ;;
+		eject)   set -- diskutil eject "/Volumes/$_pv" ;;
+	esac
 	_i=1
 	while [ "$_i" -le "$EJECT_RETRIES" ]; do
 		sync
-		if run diskutil eject "/Volumes/$BACKUP_VOLUME" >/dev/null 2>&1; then
-			msg "ejected $BACKUP_VOLUME (attempt $_i)"
+		if run "$@" >/dev/null 2>&1; then
+			msg "$_pol done on $_pv (attempt $_i)"
+			[ "$_pol" = "eject" ] &&
+				why "the drive parks now; the next backup brings it back"
+			[ "$_pol" = "unmount" ] &&
+				why "the device stays on the bus; the enclosure spins it down on its own timer"
 			return 0
 		fi
-		dbg "eject attempt $_i/$EJECT_RETRIES failed; waiting ${EJECT_WAIT}s"
+		dbg "$_pol attempt $_i/$EJECT_RETRIES failed; waiting ${EJECT_WAIT}s"
 		sleep "$EJECT_WAIT"
 		_i=$(( _i + 1 ))
 	done
-	warn "could not eject $BACKUP_VOLUME after $EJECT_RETRIES attempts"
+	warn "could not $_pol $_pv after $EJECT_RETRIES attempts"
 	return 1
 }
 
@@ -3931,10 +4059,16 @@ cmd_backup() {
 	shift 2>/dev/null || true
 	for _a in "$@"; do
 		case "$_a" in
-			--set-no-eject) run touch "$NO_EJECT_FLAGFILE" || err "cannot create $NO_EJECT_FLAGFILE"
-			                why "while this file exists no auto-eject happens" ;;
-			--set-eject)    run rm -f "$NO_EJECT_FLAGFILE"
-			                why "removed, so the disk is ejected again after a backup" ;;
+			## --set-* are the old spellings, kept working.  The flag is named
+			## for what it does; that it PERSISTS is said in the output.
+			--no-eject|--set-no-eject)
+				run touch "$NO_EJECT_FLAGFILE" || err "cannot create $NO_EJECT_FLAGFILE"
+				msg "the disk is left mounted after every backup from now on"
+				why "including the unattended $BACKUP_JOB run -- until --eject clears it" ;;
+			--eject|--set-eject)
+				run rm -f "$NO_EJECT_FLAGFILE"
+				msg "POST_BACKUP applies again after every backup"
+				why "the disk is put back the way POST_BACKUP says, from now on" ;;
 		esac
 	done
 	case "$_action" in
@@ -3954,12 +4088,13 @@ cmd_backup() {
 
 	if [ "$_action" = "stop" ]; then
 		run tmutil stopbackup
-		do_eject
+		do_post_backup
 		return 0
 	fi
 
-	if [ -n "$BACKUP_VOLUME" ] && [ ! -d "/Volumes/$BACKUP_VOLUME" ]; then
-		run diskutil mount "$BACKUP_VOLUME" || err "could not mount $BACKUP_VOLUME"
+	_bv=$(backup_volume)
+	if [ -n "$_bv" ] && [ ! -d "/Volumes/$_bv" ]; then
+		run diskutil mount "$_bv" || err "could not mount $_bv"
 	fi
 	[ "$NOTIFY_BEGIN" = "1" ] && notify "Time Machine backup starting"
 	run tmutil startbackup --block
@@ -3972,7 +4107,7 @@ cmd_backup() {
 		*) warn "backup FAILED (rc=$_rc)"
 		   [ "$NOTIFY_END" = "1" ] && notify "Time Machine backup FAILED ($_rc)" ;;
 	esac
-	do_eject
+	do_post_backup
 	snapshots_cache_invalidate
 	return "$_rc"
 }
@@ -4499,6 +4634,7 @@ cmd_uninstall() {
 #############################################################################
 
 cmd_maintenance() {
+	BACKGROUND_JOB=1
 	images_adopt_orphans
 	dbg "maintenance: usage samples"
 	for _uh in $(locations_all | awk -F'\t' '{print $1}'); do
@@ -4728,8 +4864,12 @@ MAINTAIN -- these need root + Full Disk Access
                                  delete the snapshots a retention policy does
                                  not keep; every location and the configured
                                  policy if omitted. Dry-run unless you type \`go\`
-  --backup  start|stop [--set-eject|--set-no-eject]
-                                 run or stop a backup, then eject the disk.
+  --backup  start|stop [--eject|--no-eject]
+                                 run or stop a backup, then do what POST_BACKUP
+                                 says with the disk: none | unmount | eject.
+                                 --no-eject leaves it mounted from now on,
+                                 --eject undoes that. Both persist, the
+                                 unattended run included.
                                  [daemon: run on BACKUP_SCHEDULE]
 
 INSTALL & SET UP
@@ -6395,6 +6535,105 @@ t_test_previous_is_not_a_state() {
 
 ## REGRESSION: a mangled comment left a bare word in the --version arm, which
 ## the shell tried to run. The output still looked right, so nothing caught it.
+## The post-backup disk action.  Adversarial first: the failure that matters
+## is not "eject did not run", it is my-tm running the WRONG action while
+## reporting the right one -- ejecting a disk whose policy says unmount, or
+## touching a disk the flag file says to leave alone.  Every case asserts the
+## diskutil call that reached the stub, never what my-tm said it did.
+t_test_post_backup() {
+	printf '\nPost-backup disk action\n'
+	_pb_save_v="$BACKUP_VOLUME"; _pb_save_p="$POST_BACKUP"
+	_pb_save_l="$POST_BACKUP_PER_LOCATION"; _pb_save_f="$NO_EJECT_FLAGFILE"
+	NO_EJECT_FLAGFILE="$T_ROOT/no-eject"
+	POST_BACKUP_PER_LOCATION=""
+	BACKUP_VOLUME="TestVol"
+
+	## Where the log ends now, so each case reads only the calls IT made --
+	## a count of matching lines is NOT a line offset, and using one as the
+	## other made the "does not eject" case re-read the eject case above it.
+	_pb_n() { count_lines < "$(t_calls)"; }
+
+	POST_BACKUP="eject"; unset BACKUP_VOLUME_RESOLVED
+	_b=$(_pb_n); do_post_backup >/dev/null 2>&1
+	_new=$(sed -n "$(( _b + 1 )),\$p" "$(t_calls)")
+	t_match "POST_BACKUP=eject ejects" "$_new" "diskutil eject /Volumes/TestVol"
+
+	POST_BACKUP="unmount"; unset BACKUP_VOLUME_RESOLVED
+	_b=$(_pb_n); do_post_backup >/dev/null 2>&1
+	_new=$(sed -n "$(( _b + 1 )),\$p" "$(t_calls)")
+	t_match "POST_BACKUP=unmount unmounts" "$_new" "diskutil unmountDisk /Volumes/TestVol"
+	t_eq "and does NOT eject" "$(printf '%s\n' "$_new" | count_match 'eject')" "0"
+
+	POST_BACKUP="none"; unset BACKUP_VOLUME_RESOLVED
+	_b=$(_pb_n); do_post_backup >/dev/null 2>&1
+	t_eq "POST_BACKUP=none runs no command at all" "$(( $(_pb_n) - _b ))" "0"
+
+	POST_BACKUP="eject"; unset BACKUP_VOLUME_RESOLVED
+	: >"$NO_EJECT_FLAGFILE"
+	_b=$(_pb_n); do_post_backup >/dev/null 2>&1
+	t_eq "the flag file suppresses the policy entirely" "$(( $(_pb_n) - _b ))" "0"
+	rm -f "$NO_EJECT_FLAGFILE"
+
+	POST_BACKUP="eject"
+	POST_BACKUP_PER_LOCATION="$(printf 'other\tnone\nstore\tunmount\n')"
+	t_eq "a per-location value beats the global one" \
+		"$(post_backup_policy store)" "unmount"
+	t_eq "and a location not named falls back to it" \
+		"$(post_backup_policy nosuch)" "eject"
+	POST_BACKUP_PER_LOCATION=""
+
+	_bad=$( ( POST_BACKUP="sleep"; post_backup_policy store ) 2>&1 >/dev/null )
+	t_match "an unknown value is refused, not silently defaulted" "$_bad" "none, unmount or eject"
+
+	## REGRESSION: BACKUP_VOLUME="" used to mean "do nothing", while
+	## tmutil startbackup wrote to its destination regardless -- my-tm backed
+	## up to a disk it refused to name, mount or release.
+	BACKUP_VOLUME=""; unset BACKUP_VOLUME_RESOLVED
+	t_eq "an empty BACKUP_VOLUME resolves from tmutil" "$(backup_volume)" "store"
+	POST_BACKUP="eject"; unset BACKUP_VOLUME_RESOLVED
+	_b=$(_pb_n); do_post_backup >/dev/null 2>&1
+	_new=$(sed -n "$(( _b + 1 )),\$p" "$(t_calls)")
+	t_match "and the action reaches that volume" "$_new" "diskutil eject /Volumes/store"
+
+	## A disk my-tm just put to sleep must not be woken by a daemon two
+	## minutes later -- that is what defeated the whole feature before.
+	POST_BACKUP="eject"; unset BACKUP_VOLUME_RESOLVED
+	if loc_is_quiet store; then t_ok "a location with a post-backup action is quiet"
+	else t_bad "store should be quiet under POST_BACKUP=eject" ""; fi
+	POST_BACKUP="none"; unset BACKUP_VOLUME_RESOLVED
+	if loc_is_quiet store; then t_bad "POST_BACKUP=none must not make it quiet" ""
+	else t_ok "POST_BACKUP=none leaves it an ordinary location"; fi
+
+	## ...and the rule has to hold where it is USED, not only where it is
+	## decided: loc_open is what every daemon reaches the disk through.
+	_pb_sv="$TRANSIENT_VOLUMES"; TRANSIENT_VOLUMES="$T_ROOT/pb.volumes"
+	rm -f "$TRANSIENT_VOLUMES"
+	BACKUP_VOLUME="UnmountedStore"; POST_BACKUP="eject"
+	unset BACKUP_VOLUME_RESOLVED
+	printf 'quietstore\t/Volumes/UnmountedStore\t\n' >>"$T_ROOT/cache/locations.tsv"
+
+	BACKGROUND_JOB=1
+	: >"$(t_calls)"
+	loc_open quietstore >/dev/null 2>&1
+	t_eq "a daemon does not mount a quiet location" \
+		"$(count_match 'diskutil mount' < "$(t_calls)")" "0"
+
+	BACKGROUND_JOB=0
+	: >"$(t_calls)"
+	loc_open quietstore >/dev/null 2>&1
+	t_eq "but an interactive command still does -- somebody asked" \
+		"$(count_match 'diskutil mount UnmountedStore' < "$(t_calls)")" "1"
+	cleanup_volumes >/dev/null 2>&1
+
+	grep -v '^quietstore	' "$T_ROOT/cache/locations.tsv" >"$T_ROOT/cache/l.pb" &&
+		mv "$T_ROOT/cache/l.pb" "$T_ROOT/cache/locations.tsv"
+	rm -f "$TRANSIENT_VOLUMES"; TRANSIENT_VOLUMES="$_pb_sv"
+
+	BACKUP_VOLUME="$_pb_save_v"; POST_BACKUP="$_pb_save_p"
+	POST_BACKUP_PER_LOCATION="$_pb_save_l"; NO_EJECT_FLAGFILE="$_pb_save_f"
+	unset BACKUP_VOLUME_RESOLVED
+}
+
 t_test_version_output() {
 	printf '\n--version\n'
 	_err=$( "$T_MYTM" --version 2>&1 >/dev/null )
@@ -6438,6 +6677,7 @@ run_tests() {
 	t_test_help
 	t_test_paths
 	t_test_version_output
+	t_test_post_backup
 	t_test_ejected_destination
 	t_test_auto_mount_destinations
 	t_test_verify_reports

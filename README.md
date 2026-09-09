@@ -23,7 +23,7 @@ my-tm 'invoice*.pdf'            # search the history by name -> paths + versions
 my-tm k7f2q9                     # what is snapshot k7f2q9  (6-char ID)
 my-tm k7f2q9 ~/Doc/report.odt         # that file in that snapshot: path + stat
 ls /tm/backup/2026-08-20_1558.05/ # browse any snapshot directly
-my-tm --backup start             # the classic: run a backup, then eject
+my-tm --backup start             # the classic: back up, then quiet the disk
 ```
 
 **Every command starts with `--`; everything without `--` is data** — a
@@ -117,8 +117,9 @@ MAINTAIN -- these need root + Full Disk Access
                                  delete the snapshots a retention policy does
                                  not keep; every location and the configured
                                  policy if omitted. Dry-run unless you type `go`
-  --backup  start|stop [--set-eject|--set-no-eject]
-                                 run or stop a backup, then eject the disk.
+  --backup  start|stop [--eject|--no-eject]
+                                 run or stop a backup, then do what POST_BACKUP
+                                 says with the disk: none | unmount | eject.
                                  [daemon: run on BACKUP_SCHEDULE]
 
 INSTALL & SET UP
@@ -1087,7 +1088,9 @@ BACKUP_SCHEDULE="on-boot"       # space-separated, combinable. Examples:
                                 #   on-boot 03:30 15:30 -> RunAtLoad + both times
                                 #   Mon 03:30          -> weekly
 # --- backup control (from the old my-tm.sh) ---
-BACKUP_VOLUME=""                # "" = TM's own destination
+BACKUP_VOLUME=""                # "" = ask tmutil. Resolved ONCE at startup
+POST_BACKUP="eject"             # none | unmount | eject, when a backup ends
+POST_BACKUP_PER_LOCATION=""     # "<location> <value>" per line; overrides it
 NOTIFY_CMD=""                   # optional external notifier; empty = osascript
 NO_EJECT_FLAGFILE="/var/lib/my-tm/no-eject"
 LOCKFILE="/var/lib/my-tm/backup.lock"
@@ -1119,10 +1122,47 @@ auto-mounted; they show their last known state with `?`.
 `my-tm --backup start` keeps the old behaviour, cleaned up and config-driven:
 single-instance lockfile with a signal trap, optional `diskutil mount` of
 `BACKUP_VOLUME`, `tmutil startbackup --block`, notification on the three
-outcomes (ok / already running / failed), then eject with retries unless
-`--set-no-eject` planted the flag file. `--backup stop` = `tmutil stopbackup`
-plus the same eject logic. Both are root-only; everything else runs unprivileged
+outcomes (ok / already running / failed), then whatever `POST_BACKUP` says
+unless `--no-eject` planted the flag file. `--backup stop` = `tmutil stopbackup`
+plus the same post-backup logic. Both are root-only; everything else runs unprivileged
 wherever the OS allows.
+
+### Quieting the disk when the backup ends
+
+An external 2.5" drive costs runtime and makes vibration noise for as long as
+it spins, and macOS has no command that spins one down on demand: `pmset
+disksleep` is global and idle-based, and on USB the enclosure decides whether
+to honour it. The only levers are taking the filesystem away.
+
+`POST_BACKUP` picks one, globally or per location:
+
+| value | what happens | when it is right |
+|---|---|---|
+| `none` | left mounted | the disk is shared, or something else manages it |
+| `unmount` | `diskutil unmountDisk` — the device stays on the bus, the enclosure spins it down on its own timer | a bridge that does not come back after an eject |
+| `eject` | `diskutil eject` — parks the drive at once | the default: least runtime, least noise |
+
+Test the enclosure before trusting `eject` to an unattended job: eject the
+volume, then check whether `/dev/diskN` is still listed and whether
+`diskutil mountDisk /dev/diskN` brings it back without a replug. Some USB
+bridges drop off the bus and need the cable pulled — those want `unmount`.
+
+`BACKUP_VOLUME=""` means "ask `tmutil destinationinfo`", resolved once at
+startup; the pre-backup mount, the post-backup action and the rule below all
+use that one value. More than one destination and my-tm refuses and asks,
+rather than picking one.
+
+`--backup start --no-eject` leaves the disk mounted from now on, the unattended
+run included, until `--eject` undoes it. Both persist — they plant and remove
+`$NO_EJECT_FLAGFILE`, and say so.
+
+**A disk that was put to sleep stays asleep.** `--maintenance` runs every
+`MAINT_INTERVAL` seconds and would otherwise mount each destination and stat
+its manifest — waking the drive every couple of minutes and defeating the
+whole thing. So a location whose `POST_BACKUP` is `unmount` or `eject` is
+*quiet*: the daemons never open it, and `--health` answers from the cache,
+marking the age it reports `[cached; disk asleep]`. Interactive commands still
+mount it — somebody asked.
 
 **my-tm replaces `my-tm.sh` outright** — the old file goes, and `--install` owns
 the job: `$BACKUP_JOB` (`local.my-tm.backup`) as a **LaunchDaemon**, so it
