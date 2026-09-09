@@ -282,6 +282,10 @@ config_search_paths() {
 	for _cs_d in $(config_search_dirs); do
 		case "$_cs_d" in
 			"$HOME") printf '%s/.my-tm.conf\n' "$_cs_d" ;;
+			## Under /LINKS/default BOTH spellings count: the site's config
+			## farm holds some names with a .conf suffix and some without, so
+			## knowing only one of them ignores a file sitting right there.
+			/LINKS/default) printf '%s/my-tm.conf\n%s/my-tm\n' "$_cs_d" "$_cs_d" ;;
 			*)       printf '%s/my-tm.conf\n' "$_cs_d" ;;
 		esac
 	done
@@ -6611,8 +6615,13 @@ t_test_config_search_order() {
 
 	## the paths the user is TOLD about are the paths that were searched --
 	## naming one hand-picked location is what sent people to the wrong file
-	t_eq "every searched dir yields one path" \
-		"$(config_search_paths | count_lines)" "$(config_search_dirs | count_lines)"
+	t_eq "every searched dir yields a path (the site one yields both spellings)" \
+		"$(config_search_paths | count_lines)" \
+		"$(( $(config_search_dirs | count_lines) + 1 ))"
+	t_eq "the site location is searched under its .conf name" \
+		"$(config_search_paths | count_match '/LINKS/default/my-tm.conf')" "1"
+	t_eq "and under the bare name the farm also uses" \
+		"$(config_search_paths | grep -cxF '/LINKS/default/my-tm')" "1"
 	t_match "the primary one is offered first" \
 		"$(config_search_paths | sed -n '1p')" "/LINKS/default/my-tm.conf"
 	t_match "and \$HOME renders as a dotfile" \
