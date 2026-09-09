@@ -1009,12 +1009,22 @@ conventions (a private reverse-domain for launchd labels, a shared admin group,
 a site-wide config directory, a preferred notifier) is set in the config file,
 which stays local. Nothing that ships carries a hostname, a user name, a private
 path or a real document name — not in the code, not in the defaults, not in the
-examples in this README.
+examples in this README. The single exception is the `/LINKS/default` config
+location below, and it is deliberate.
 
 Config search order (first wins): `$MY_TM_CONFIG` · `--config FILE` ·
-`$SITE_CONF_DIR/my-tm.conf` · `~/.my-tm.conf` · `/etc/my-tm.conf` ·
-`/usr/local/etc/my-tm.conf`. Plain shell, `.`-sourced. `--create-config` prints
-it (or writes `FILE`, never overwriting).
+`$SITE_CONF_DIR` **when it was set in the environment** ·
+`/LINKS/default/my-tm.conf` · `$SITE_CONF_DIR/my-tm.conf` · `~/.my-tm.conf` ·
+`/etc/my-tm.conf` · `/usr/local/etc/my-tm.conf`. Plain shell, `.`-sourced.
+`--create-config` prints it (or writes `FILE`, never overwriting); with no
+config anywhere, my-tm names every path it searched, one ready-to-run
+`--create-config` line each.
+
+`/LINKS/default` is the one site path written into the code. A search keyed on
+a value that lives *inside* a config file cannot find that file, and one gated
+on `$LINKS` being exported skips the location silently in a root shell — so the
+primary location is spelled out. It is a directory name and reveals nothing;
+everything else site-specific stays in the config.
 
 **Two files at the site location.** Where `$SITE_CONF_DIR` is a merged
 directory whose entries can come from a shared tree or a host-specific one, the

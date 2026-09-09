@@ -31,6 +31,10 @@ MOUNT_ROOT="/var/lib/my-tm/mount"
 ## search below needs this value before any config has been read, so a value
 ## set inside a config file can only ever say where --install WRITES, never
 ## where my-tm looks.
+## Set in the ENVIRONMENT it is an explicit override and outranks the site
+## search, exactly like $MY_TM_CONFIG and --config; set anywhere else it only
+## says where --install WRITES.
+if [ -n "${SITE_CONF_DIR:-}" ]; then SITE_CONF_DIR_FROM_ENV=1; else SITE_CONF_DIR_FROM_ENV=0; fi
 SITE_CONF_DIR="${SITE_CONF_DIR:-/usr/local/etc}"
 NOTIFY_MOUNT_WARN=1
 CACHE_TTL=3600
@@ -175,8 +179,11 @@ _default_config_content() {
 # my-tm configuration.  Plain shell, sourced at startup.
 #
 # Search order (first existing wins):
-#   $MY_TM_CONFIG · --config <FILE> · $SITE_CONF_DIR/my-tm.conf
+#   $MY_TM_CONFIG · --config <FILE> · $SITE_CONF_DIR when it came from the
+#   ENVIRONMENT · /LINKS/default/my-tm.conf · $SITE_CONF_DIR/my-tm.conf
 #   · ~/.my-tm.conf · /etc/my-tm.conf · /usr/local/etc/my-tm.conf
+# /LINKS/default is spelled out on purpose: a search keyed on a value that
+# lives INSIDE a config file cannot find that file.
 # When both a shared and a host-specific file sit at the site location, the
 # host-specific one is my-tm.conf and the shared one is my-tm.conf.GLOBAL;
 # my-tm sources .GLOBAL first, then my-tm.conf on top.
@@ -260,6 +267,26 @@ _CFG_EOF
 }
 
 ## echo every config file to source, in order (base first, override last)
+## Where a config is looked for, in order.  /LINKS/default comes first and is
+## SPELLED OUT: a search that depended on $SITE_CONF_DIR could only find the
+## value inside the config file it has not found yet, and one gated on $LINKS
+## being exported skips the location silently in a root shell.
+config_search_dirs() {
+	[ "$SITE_CONF_DIR_FROM_ENV" = "1" ] && printf '%s\n' "$SITE_CONF_DIR"
+	printf '%s\n' /LINKS/default "$SITE_CONF_DIR" "$HOME" /etc /usr/local/etc
+}
+
+## The same list as PATHS, for telling the user where we looked.  One source
+## for the search and for the message, so they cannot drift.
+config_search_paths() {
+	for _cs_d in $(config_search_dirs); do
+		case "$_cs_d" in
+			"$HOME") printf '%s/.my-tm.conf\n' "$_cs_d" ;;
+			*)       printf '%s/my-tm.conf\n' "$_cs_d" ;;
+		esac
+	done
+}
+
 config_candidates() {
 	if [ -n "${MY_TM_CONFIG:-}" ]; then
 		printf '%s\n' "$MY_TM_CONFIG"
@@ -269,7 +296,7 @@ config_candidates() {
 		printf '%s\n' "$CONFIG_FILE"
 		return 0
 	fi
-	for _d in "$SITE_CONF_DIR" "$HOME" /etc /usr/local/etc; do
+	for _d in $(config_search_dirs); do
 		case "$_d" in
 			"$HOME") _f="$_d/.my-tm.conf" ;;
 			*)       _f="$_d/my-tm.conf" ;;
@@ -4460,8 +4487,14 @@ cmd_install() {
 	fi
 
 	require_root "--install"
-	[ -n "$CONFIG_SOURCED" ] ||
-		err "--install needs a config: job labels, directories and the group are site-specific and guessing them is worse than asking. Run: $US --create-config > /etc/my-tm.conf"
+	if [ -z "$CONFIG_SOURCED" ]; then
+		warn "--install needs a config: job labels, directories and the group are site-specific, and guessing them is worse than asking."
+		note "no config in any of the searched places -- write one with:"
+		config_search_paths | while IFS= read -r _cp; do
+			minor "$US --create-config > $_cp"
+		done
+		exit 1
+	fi
 
 	MY_TM_BIN=$(abs_path "$0")
 	LOG_DIR_ROOT="/var/log/my-tm"
@@ -6540,6 +6573,40 @@ t_test_previous_is_not_a_state() {
 ## reporting the right one -- ejecting a disk whose policy says unmount, or
 ## touching a disk the flag file says to leave alone.  Every case asserts the
 ## diskutil call that reached the stub, never what my-tm said it did.
+## REGRESSION: the search was keyed on $SITE_CONF_DIR, whose site value lives
+## INSIDE the config file -- so /LINKS/default, the primary location, was never
+## looked at and a config sitting right there was silently ignored.
+t_test_config_search_order() {
+	printf '\nConfig search order\n'
+	_cso_save="$SITE_CONF_DIR_FROM_ENV"
+
+	SITE_CONF_DIR_FROM_ENV=0
+	t_eq "the primary location is searched FIRST" \
+		"$(config_search_dirs | sed -n '1p')" "/LINKS/default"
+	t_eq "and it is spelled out, not derived from a config value" \
+		"$(config_search_dirs | count_match '$')" "0"
+
+	## the escape hatch keeps its rank: an env var is an explicit override,
+	## the same class as $MY_TM_CONFIG and --config
+	SITE_CONF_DIR_FROM_ENV=1
+	t_eq "SITE_CONF_DIR from the environment still wins" \
+		"$(config_search_dirs | sed -n '1p')" "$SITE_CONF_DIR"
+	t_eq "with the primary location right behind it" \
+		"$(config_search_dirs | sed -n '2p')" "/LINKS/default"
+	SITE_CONF_DIR_FROM_ENV=0
+
+	## the paths the user is TOLD about are the paths that were searched --
+	## naming one hand-picked location is what sent people to the wrong file
+	t_eq "every searched dir yields one path" \
+		"$(config_search_paths | count_lines)" "$(config_search_dirs | count_lines)"
+	t_match "the primary one is offered first" \
+		"$(config_search_paths | sed -n '1p')" "/LINKS/default/my-tm.conf"
+	t_match "and \$HOME renders as a dotfile" \
+		"$(config_search_paths)" "$HOME/.my-tm.conf"
+
+	SITE_CONF_DIR_FROM_ENV="$_cso_save"
+}
+
 t_test_post_backup() {
 	printf '\nPost-backup disk action\n'
 	_pb_save_v="$BACKUP_VOLUME"; _pb_save_p="$POST_BACKUP"
@@ -6678,6 +6745,7 @@ run_tests() {
 	t_test_paths
 	t_test_version_output
 	t_test_post_backup
+	t_test_config_search_order
 	t_test_ejected_destination
 	t_test_auto_mount_destinations
 	t_test_verify_reports
