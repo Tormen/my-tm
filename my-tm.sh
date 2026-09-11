@@ -73,6 +73,7 @@ NOTIFY_BEGIN=0
 NOTIFY_END=1
 EJECT_RETRIES=10
 EJECT_WAIT=5
+LSOF_TIMEOUT=10
 
 ## how long a mount made on the way into a command lives if the command dies
 ## without cleaning up.  Not user-tunable: it is a leak-reaper, not a policy.
@@ -263,6 +264,11 @@ NO_EJECT_FLAGFILE="/var/lib/my-tm/no-eject"
 LOCKFILE="/var/lib/my-tm/backup.lock"
 NOTIFY_BEGIN=0; NOTIFY_END=1
 EJECT_RETRIES=10; EJECT_WAIT=5
+LSOF_TIMEOUT=10                 # s the mount sweep waits for lsof. lsof walks
+                                # EVERY mount, so one unresponsive filesystem
+                                # wedges it beyond the reach of any signal; past
+                                # this the sweep calls every candidate BUSY and
+                                # releases nothing, rather than hanging a daemon.
 _CFG_EOF
 }
 
@@ -1391,11 +1397,40 @@ image_attach() {
 	_pl=$(mktemp /tmp/my-tm.att.XXXXXX) || return 1
 	run_echo hdiutil attach -readonly -nobrowse -noverify -noautofsck "$_img"
 	why "read-only, so it cannot collide with the Mac that backs up into it"
-	if ! hdiutil attach -readonly -nobrowse -noverify -noautofsck -plist "$_img" \
-			>"$_pl" 2>/dev/null; then
+	## Attaching a sparsebundle over a share takes minutes and hdiutil says
+	## NOTHING while it does: -puppetstrings emits no progress for an attach
+	## with -noverify (measured -- the man page's "indeterminate" case), so
+	## there is no percentage to report and pretending otherwise would be a
+	## made-up number. What IS true is how long it has been going, so say
+	## that -- and only once it is slow enough to worry about, so a fast
+	## local attach stays silent.
+	## These lines go to STDERR like every other progress line: this function
+	## is called inside $(...) for the path it prints.
+	hdiutil attach -readonly -nobrowse -noverify -noautofsck -plist "$_img" \
+			>"$_pl" 2>/dev/null &
+	_att_pid=$!
+	_att_t0=$(now_epoch)
+	_att_said=0
+	while kill -0 "$_att_pid" 2>/dev/null; do
+		sleep 2
+		_att_el=$(( $(now_epoch) - _att_t0 ))
+		[ "$_att_el" -lt 6 ] && continue
+		if [ "$_att_said" = "0" ]; then
+			msg "attaching $(basename "$_img") -- this can take minutes over a share"
+			_att_said=1
+			_att_next=$(( _att_el + 15 ))
+		elif [ "$_att_el" -ge "$_att_next" ]; then
+			minor "still attaching, ${_att_el}s so far"
+			_att_next=$(( _att_el + 15 ))
+		fi
+	done
+	if ! wait "$_att_pid"; then
 		rm -f "$_pl"
+		[ "$_att_said" = "1" ] && warn "attach of $(basename "$_img") failed after $(( $(now_epoch) - _att_t0 ))s"
 		return 1
 	fi
+	[ "$_att_said" = "1" ] &&
+		msg "attached $(basename "$_img") after $(( $(now_epoch) - _att_t0 ))s"
 	_mp=$(plutil -p "$_pl" 2>/dev/null |
 		awk '/"mount-point" =>/ && !f { m = $0; sub(/^[^>]*=> /, "", m);
 		                                gsub(/"/, "", m); print m; f = 1 }')
@@ -1799,11 +1834,41 @@ transient_snapshot() {
 busy_mounts() {
 	_bl=$(mktemp /tmp/my-tm.busy.XXXXXX) || return 0
 	cat >"$_bl"
-	if [ -s "$_bl" ]; then
-		tr '\n' '\0' <"$_bl" | xargs -0 lsof -n -P -- 2>/dev/null |
-			awk 'NR > 1 {print $NF}' | sort -u
+	if [ ! -s "$_bl" ]; then
+		rm -f "$_bl"
+		return 0
 	fi
-	rm -f "$_bl"
+	_bo=$(mktemp /tmp/my-tm.busyout.XXXXXX) || { rm -f "$_bl"; return 0; }
+	_bd="$_bo.done"
+
+	## lsof enumerates EVERY mount on the machine, so one unresponsive
+	## filesystem anywhere wedges it -- in an uninterruptible wait, where no
+	## signal reaches it, not even KILL. Observed on a live machine: every
+	## lsof call blocked for ever, including `lsof /tmp`. A daemon that runs
+	## every MAINT_INTERVAL seconds must not be able to stop for good because
+	## of that, so the wait is bounded.
+	## The sentinel file, not `kill -0`, says it finished: an exited child
+	## the shell has not reaped yet still answers kill -0, which would read
+	## as a timeout.
+	{ tr '\n' '\0' <"$_bl" | xargs -0 lsof -n -P -- 2>/dev/null >"$_bo"; : >"$_bd"; } &
+	_bp=$!
+	_bi=0
+	while [ ! -f "$_bd" ]; do
+		[ "$_bi" -ge "$LSOF_TIMEOUT" ] && break
+		sleep 1
+		_bi=$(( _bi + 1 ))
+	done
+
+	if [ ! -f "$_bd" ]; then
+		kill "$_bp" 2>/dev/null
+		warn "lsof did not answer in ${LSOF_TIMEOUT}s -- every candidate mount is treated as BUSY"
+		why "so nothing is released on a guess; the stuck lsof cannot be killed and is left behind"
+		cat "$_bl"
+		rm -f "$_bl" "$_bo" "$_bd"
+		return 0
+	fi
+	awk 'NR > 1 {print $NF}' "$_bo" | sort -u
+	rm -f "$_bl" "$_bo" "$_bd"
 	return 0
 }
 
@@ -6594,6 +6659,116 @@ t_test_previous_is_not_a_state() {
 ## REGRESSION: the search was keyed on $SITE_CONF_DIR, whose site value lives
 ## INSIDE the config file -- so /LINKS/default, the primary location, was never
 ## looked at and a config sitting right there was silently ignored.
+## A sparsebundle on a share takes minutes to attach and hdiutil says nothing
+## while it does, so my-tm now reports elapsed time. The danger in adding ANY
+## output here is the bug the stderr rule exists for: image_attach is called
+## inside $(...) for the path it prints, so a progress line on stdout becomes
+## part of the mountpoint. Both halves are asserted -- that it speaks, and
+## that speaking does not corrupt the value.
+## REGRESSION: lsof enumerates EVERY mount, so one unresponsive filesystem
+## anywhere wedges it in an uninterruptible wait that no signal can clear --
+## observed live, where even `lsof /tmp` never returned. The sweep runs from a
+## daemon every MAINT_INTERVAL seconds, so an unbounded wait there stops the
+## daemon for good. Adversarial first: the test is the lsof that NEVER answers.
+t_test_lsof_never_answers() {
+	printf '\nA wedged lsof must not stop the sweep\n'
+	_lt_save="$LSOF_TIMEOUT"; LSOF_TIMEOUT=2
+	_lt_stub="$(t_stub_dir)/lsof"
+	_lt_in="$T_ROOT/mnt-a
+$T_ROOT/mnt-b"
+
+	## an lsof that hangs far longer than the bound
+	printf '#!/bin/sh\nsleep 30\n' >"$_lt_stub"
+	chmod 0755 "$_lt_stub"
+
+	_lt_t0=$(now_epoch)
+	_lt_out=$(printf '%s\n' "$_lt_in" | busy_mounts 2>"$T_ROOT/busy.err")
+	_lt_el=$(( $(now_epoch) - _lt_t0 ))
+
+	t_eq "it gives up instead of waiting for ever" \
+		"$([ "$_lt_el" -le 8 ] && echo bounded || echo "waited ${_lt_el}s")" "bounded"
+	## failing SAFE is the whole point: a mount that might be in use is left
+	## alone, never released on a guess
+	t_eq "and calls every candidate busy, so nothing is released" \
+		"$(printf '%s\n' "$_lt_out" | count_lines)" "2"
+	t_match "the reason is stated, not swallowed" \
+		"$(cat "$T_ROOT/busy.err")" "did not answer"
+
+	## and a healthy lsof still gets its real answer through
+	{
+		printf '#!/bin/sh\n'
+		printf 'echo "COMMAND PID USER FD TYPE DEVICE SIZE NODE NAME"\n'
+		printf 'echo "vim 1 me 3r REG 1,2 10 20 %s/mnt-a"\n' "$T_ROOT"
+	} >"$_lt_stub"
+	chmod 0755 "$_lt_stub"
+	_lt_ok=$(printf '%s\n' "$_lt_in" | busy_mounts 2>/dev/null)
+	t_eq "a healthy lsof still reports only the busy one" \
+		"$_lt_ok" "$T_ROOT/mnt-a"
+
+	rm -f "$_lt_stub" "$T_ROOT/busy.err"
+	LSOF_TIMEOUT="$_lt_save"
+}
+
+t_test_attach_progress() {
+	printf '\nA slow attach reports elapsed time, without corrupting the path\n'
+	_ap_img="$T_ROOT/slow.sparsebundle"
+	mkdir -p "$_ap_img"
+	_ap_stub="$(t_stub_dir)/hdiutil"
+
+	## a stub that takes long enough to trip the 6s threshold, then answers
+	## like the real thing
+	{
+		printf '#!/bin/sh\n'
+		# shellcheck disable=SC2016  # writing a script: $1 is the STUB's argument
+		printf 'if [ "$1" = "info" ]; then exit 0; fi\n'
+		printf 'sleep 9\n'
+		printf '%s\n' 'cat <<XEOF'
+		printf '<?xml version="1.0" encoding="UTF-8"?>\n'
+		printf '<plist version="1.0"><dict><key>system-entities</key><array><dict>\n'
+		printf '<key>mount-point</key><string>/Volumes/SlowOne</string>\n'
+		printf '</dict></array></dict></plist>\n'
+		printf 'XEOF\n'
+		printf 'exit 0\n'
+	} >"$_ap_stub"
+	chmod 0755 "$_ap_stub"
+
+	_ap_err="$T_ROOT/attach.err"
+	_ap_val=$(image_attach "$_ap_img" 2>"$_ap_err")
+
+	t_eq "the captured value is the mountpoint and nothing else" \
+		"$_ap_val" "/Volumes/SlowOne"
+	t_match "the wait is announced once it is slow" \
+		"$(cat "$_ap_err")" "this can take minutes"
+	t_match "and the finish reports how long it took" \
+		"$(cat "$_ap_err")" "attached slow.sparsebundle after"
+	t_eq "every progress line went to stderr" \
+		"$(printf '%s' "$_ap_val" | count_match 'attaching')" "0"
+
+	## a fast attach says nothing at all -- no noise for a local image
+	{
+		printf '#!/bin/sh\n'
+		# shellcheck disable=SC2016  # writing a script: $1 is the STUB's argument
+		printf 'if [ "$1" = "info" ]; then exit 0; fi\n'
+		printf '%s\n' 'cat <<XEOF'
+		printf '<?xml version="1.0" encoding="UTF-8"?>\n'
+		printf '<plist version="1.0"><dict><key>system-entities</key><array><dict>\n'
+		printf '<key>mount-point</key><string>/Volumes/FastOne</string>\n'
+		printf '</dict></array></dict></plist>\n'
+		printf 'XEOF\n'
+		printf 'exit 0\n'
+	} >"$_ap_stub"
+	chmod 0755 "$_ap_stub"
+
+	_ap_img2="$T_ROOT/fast.sparsebundle"; mkdir -p "$_ap_img2"
+	_ap_val2=$(image_attach "$_ap_img2" 2>"$T_ROOT/attach2.err")
+	t_eq "a fast attach still yields the path" "$_ap_val2" "/Volumes/FastOne"
+	t_eq "and says nothing about waiting" \
+		"$(count_match 'attaching' < "$T_ROOT/attach2.err")" "0"
+
+	rm -f "$_ap_stub" "$_ap_err" "$T_ROOT/attach2.err"
+	rm -rf "$_ap_img" "$_ap_img2"
+}
+
 t_test_config_search_order() {
 	printf '\nConfig search order\n'
 	_cso_save="$SITE_CONF_DIR_FROM_ENV"
@@ -6792,6 +6967,8 @@ run_tests() {
 	t_test_version_output
 	t_test_post_backup
 	t_test_config_search_order
+	t_test_attach_progress
+	t_test_lsof_never_answers
 	t_test_ejected_destination
 	t_test_auto_mount_destinations
 	t_test_verify_reports
