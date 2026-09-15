@@ -820,7 +820,7 @@ Every other command runs with your own access, and says nothing about them.
   backwards from *now*, keeping one snapshot per granularity bucket inside it:
 
   ```text
-  THIN_POLICY_TO_KEEP="24h:hourly 7d:daily 4w:weekly 2y:monthly *:yearly"
+  THIN_POLICY_TO_KEEP_DEFAULT="24h:hourly 7d:daily 4w:weekly 2y:monthly *:yearly"
   ```
 
   `<SPAN>` = `<NUMBER><UNIT>` with `h d w m y`, or `*` for everything older than
@@ -828,8 +828,9 @@ Every other command runs with your own access, and says nothing about them.
   yearly all none`. `*:none` deletes everything past the last span; leaving `*`
   out entirely means *keep* everything older, untouched — the safe default.
 
-  Resolution order: the CLI argument beats `THIN_POLICY_PER_LOCATION` for that
-  handle, which beats the global `THIN_POLICY_TO_KEEP`.
+  Resolution order: the CLI argument beats the location's `THIN_POLICY_TO_KEEP`
+  (set in `set_location_parameters`, §13), which beats
+  `THIN_POLICY_TO_KEEP_DEFAULT`.
 * **`--verify <ID> [<PATH>…]`** — `tmutil verifychecksums`, which takes *paths*,
   so it works at **snapshot, directory or single-file** granularity. Whole
   snapshots are slow; a directory or one file is quick. Reports `!` (checksum
@@ -843,7 +844,7 @@ non-zero on the worst — suitable for cron and for a LaunchDaemon.
 
 | Check | Fails when |
 |---|---|
-| staleness | newest backup older than `HEALTH_MAX_AGE_H` — the #1 real failure, Time Machine fails **silently** |
+| staleness | newest backup older than the location's `HEALTH_MAX_AGE` (`HEALTH_MAX_AGE_DEFAULT`, 48h; `0` = no age expected, the age is only shown) — the #1 real failure, Time Machine fails **silently** |
 | destination reachable | configured destination not mounted / not seen for N days |
 | free space | backup disk below `HEALTH_MIN_FREE_PCT`, or thinning cannot reclaim |
 | stuck backups | leftover `.inprogress` / `.interrupted` dirs above `HEALTH_MAX_INTERRUPTED` |
@@ -1145,10 +1146,7 @@ INDEX_REMOTE_COPY=1             # also keep a local copy of a remote index, so
                                 # --find works while that host is offline
 ID_LEN=6
 # --- retention ---
-THIN_POLICY_TO_KEEP="24h:hourly 7d:daily 4w:weekly 2y:monthly"
-THIN_POLICY_PER_LOCATION="
-backup   24h:hourly 7d:daily 4w:weekly 5y:monthly *:yearly
-"
+THIN_POLICY_TO_KEEP_DEFAULT="24h:hourly 7d:daily 4w:weekly 2y:monthly"
 # --- health ---
 HEALTH_INTERVAL="1d"            # "" / 0 / false -> no daemon installed
 HEALTH_JOB="local.my-tm.health-check"
@@ -1157,7 +1155,7 @@ HEALTH_VERIFY=""                # "" = off; else a list of paths, one per line
 HEALTH_WATCH_PATHS=""           # paths that MUST be covered by a backup; the
                                 # exclusion-drift check fails when one is
                                 # excluded or on an uncovered volume
-HEALTH_MAX_AGE_H=48; HEALTH_MIN_FREE_PCT=10
+HEALTH_MAX_AGE_DEFAULT="48h"; HEALTH_MIN_FREE_PCT=10  # 0 = no age expected
 HEALTH_MAX_INTERRUPTED=2; HEALTH_DRIFT_FACTOR=5
 # --- jobs installed by --install ---
 MAINT_JOB="local.my-tm.maintenance"   # mount sweep + /tm refresh + local snaps
@@ -1180,14 +1178,31 @@ JOBS_LAUNCHER="/usr/local/sbin/my-tm-launcher"  # built by --install; root:wheel
 JOBS_ACCESS_NETWORK_VOLUMES=0   # 1: the jobs may open locations on network volumes
 # --- backup control (from the old my-tm.sh) ---
 BACKUP_VOLUME=""                # "" = ask tmutil. Resolved ONCE at startup
-POST_BACKUP="eject"             # none | unmount | eject, when a backup ends
-POST_BACKUP_PER_LOCATION=""     # "<location> <value>" per line; overrides it
+POST_BACKUP_DEFAULT="eject"     # none | unmount | eject, when a backup ends
 NOTIFY_CMD=""                   # optional external notifier; empty = osascript
 NO_EJECT_FLAGFILE="/var/lib/my-tm/no-eject"
 LOCKFILE="/var/lib/my-tm/backup.lock"
 NOTIFY_BEGIN=0; NOTIFY_END=1    # via $NOTIFY_CMD (§14)
 EJECT_RETRIES=10; EJECT_WAIT=5
+
+# --- per location ---
+set_location_parameters() {
+	case "$LOCATION" in
+		backup)     THIN_POLICY_TO_KEEP="24h:hourly 7d:daily 4w:weekly 5y:monthly *:yearly" ;;
+		horse@ada)  HEALTH_MAX_AGE="0" ;;
+	esac
+}
 ```
+
+**Per-location parameters.** `THIN_POLICY_TO_KEEP`, `POST_BACKUP` and
+`HEALTH_MAX_AGE` each have a `_DEFAULT` for every location; a config sets one
+for a single location in `set_location_parameters()`, which sees the handle in
+`$LOCATION`. The site's config and the host's may both define it: the site's is
+called first, the host's last, so the host wins where both name a location. At
+the top level a config sets only the `_DEFAULT`s. A config that still sets one of
+the old names (`THIN_POLICY_TO_KEEP`, `THIN_POLICY_PER_LOCATION`, `POST_BACKUP`,
+`POST_BACKUP_PER_LOCATION`, `HEALTH_MAX_AGE_H`) stops my-tm with one line naming
+what replaced it.
 
 `my-tm --add /Volumes/X backup` (root — the file is in the shared dir) probes
 the folder (§12), prints what it found — volumes, snapshot count, span — and

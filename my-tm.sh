@@ -68,14 +68,16 @@ INDEX_BASELINES="newest oldest"
 INDEX_INC_MAX=16
 INDEX_REMOTE_COPY=1
 ID_LEN=6
-THIN_POLICY_TO_KEEP="24h:hourly 7d:daily 4w:weekly 2y:monthly"
-THIN_POLICY_PER_LOCATION=""
+## per-location parameters: NAME_DEFAULT here; NAME for one location in a
+## config's set_location_parameters() (see loc_param)
+THIN_POLICY_TO_KEEP_DEFAULT="24h:hourly 7d:daily 4w:weekly 2y:monthly"
 HEALTH_INTERVAL="1d"
 HEALTH_JOB="local.my-tm.health-check"
 HEALTH_LOCATIONS="LOCAL"
 HEALTH_VERIFY=""
 HEALTH_WATCH_PATHS=""
-HEALTH_MAX_AGE_H=48
+# shellcheck disable=SC2034  # read through loc_param, which builds its name
+HEALTH_MAX_AGE_DEFAULT="48h"
 HEALTH_MIN_FREE_PCT=10
 HEALTH_MAX_INTERRUPTED=2
 HEALTH_DRIFT_FACTOR=5
@@ -87,8 +89,7 @@ LOCAL_SNAP_MAX=48
 BACKUP_JOB="local.my-tm.backup"
 BACKUP_SCHEDULE="on-boot"
 BACKUP_VOLUME=""
-POST_BACKUP="eject"
-POST_BACKUP_PER_LOCATION=""
+POST_BACKUP_DEFAULT="eject"
 NOTIFY_CMD=""
 NO_EJECT_FLAGFILE="/var/lib/my-tm/no-eject"
 LOCKFILE="/var/lib/my-tm/backup.lock"
@@ -253,15 +254,18 @@ IMAGE_GRACE=600                 # s an attached sparsebundle stays attached afte
                                 # minutes, so back-to-back commands reuse it
 ID_LEN=6
 # --- retention ---
-THIN_POLICY_TO_KEEP="24h:hourly 7d:daily 4w:weekly 2y:monthly"
-THIN_POLICY_PER_LOCATION=""
+THIN_POLICY_TO_KEEP_DEFAULT="24h:hourly 7d:daily 4w:weekly 2y:monthly"
+                                # what --thin keeps; for one location set
+                                # THIN_POLICY_TO_KEEP in set_location_parameters
 # --- health ---
 HEALTH_INTERVAL="1d"            # "" / 0 / false -> no daemon installed
 HEALTH_JOB="local.my-tm.health-check"
 HEALTH_LOCATIONS="LOCAL"        # ON-THIS-DISK | LOCAL | ALL | handles | paths
 HEALTH_VERIFY=""                # "" = off; else a list of paths, one per line
 HEALTH_WATCH_PATHS=""           # paths that MUST be covered by a backup
-HEALTH_MAX_AGE_H=48; HEALTH_MIN_FREE_PCT=10
+HEALTH_MAX_AGE_DEFAULT="48h"    # a newer backup is expected within this: <N>s|m|h|d;
+                                # 0 = no age expected (the age is only shown)
+HEALTH_MIN_FREE_PCT=10
 HEALTH_MAX_INTERRUPTED=2; HEALTH_DRIFT_FACTOR=5
 # --- jobs installed by --install ---
 MAINT_JOB="local.my-tm.maintenance"   # mount sweep + /tm refresh + local snaps
@@ -296,7 +300,7 @@ BACKUP_VOLUME=""                # "" = ask tmutil which destination this is.
                                 # mount, POST_BACKUP and the quiet rule all
                                 # use that one value. More than one tmutil
                                 # destination = refuse and ask, not guess.
-POST_BACKUP="eject"             # what happens when a backup finishes:
+POST_BACKUP_DEFAULT="eject"     # what happens when a backup finishes:
                                 #   none     leave it mounted
                                 #   unmount  diskutil unmountDisk -- the device
                                 #            stays on the bus and the enclosure
@@ -306,12 +310,16 @@ POST_BACKUP="eject"             # what happens when a backup finishes:
                                 #            runtime, but some USB bridges then
                                 #            need a replug. Test yours before
                                 #            trusting it to an unattended job.
-POST_BACKUP_PER_LOCATION=""     # per-location override, one "<location> <value>"
-                                # per line; anything unnamed gets POST_BACKUP:
-                                #   POST_BACKUP_PER_LOCATION="
-                                #   horse   eject
-                                #   ada     none
-                                #   "
+# --- per location ---
+# THIN_POLICY_TO_KEEP, POST_BACKUP and HEALTH_MAX_AGE can be set for one
+# location; a location not named keeps each _DEFAULT. The site's config and the
+# host's may both define this function: the site's runs first, the host's last.
+#set_location_parameters() {
+#	case "$LOCATION" in
+#		horse)      POST_BACKUP="unmount" ;;
+#		horse@ada)  HEALTH_MAX_AGE="0" ;;
+#	esac
+#}
 NOTIFY_CMD=""                   # optional external notifier; empty = osascript
 NO_EJECT_FLAGFILE="/var/lib/my-tm/no-eject"
 LOCKFILE="/var/lib/my-tm/backup.lock"
@@ -406,6 +414,55 @@ load_config() {
 	done <<_EOF
 $_tmp
 _EOF
+	return 0
+}
+
+## Per-location parameters. Each is an uppercase NAME whose default is
+## NAME_DEFAULT; a config sets it for one location in set_location_parameters(),
+## which sees that location's handle in $LOCATION. Every loaded config file may
+## define the function, and each one is called in load order (the site's, then
+## the host's). The shell keeps only the LAST function of a name, so each file is
+## sourced again right before its own is called. All of it in a subshell: nothing
+## set for one location reaches the next, or my-tm itself.
+LOCATION_PARAMETERS="THIN_POLICY_TO_KEEP POST_BACKUP HEALTH_MAX_AGE"
+
+loc_param() {
+	case " $LOCATION_PARAMETERS " in
+		*" $2 "*) : ;;
+		*) err "loc_param: '$2' is not a per-location parameter" ;;
+	esac
+	(
+		for _lp_n in $LOCATION_PARAMETERS; do
+			eval "$_lp_n=\${${_lp_n}_DEFAULT-}"
+		done
+		for _lp_f in $CONFIG_SOURCED; do
+			unset -f set_location_parameters 2>/dev/null
+			# shellcheck source=/dev/null
+			. "$_lp_f" >/dev/null 2>&1
+			command -v set_location_parameters >/dev/null 2>&1 || continue
+			# shellcheck disable=SC2034  # read by the config's set_location_parameters
+			LOCATION="$1"
+			set_location_parameters
+		done
+		eval "printf '%s\n' \"\${$2-}\""
+	)
+}
+
+## Settings that became per-location parameters. A config still setting one is
+## stopped, naming what replaced it: ignoring it silently would change what the
+## backups keep, and when a disk is ejected.
+config_refuse_old_names() {
+	for _on in \
+		THIN_POLICY_TO_KEEP:THIN_POLICY_TO_KEEP_DEFAULT \
+		THIN_POLICY_PER_LOCATION:set_location_parameters \
+		POST_BACKUP:POST_BACKUP_DEFAULT \
+		POST_BACKUP_PER_LOCATION:set_location_parameters \
+		HEALTH_MAX_AGE_H:HEALTH_MAX_AGE_DEFAULT; do
+		_on_old=${_on%%:*}
+		eval "_on_set=\${$_on_old+set}"
+		[ -n "$_on_set" ] || continue
+		err "$_on_old is no longer read (config:$CONFIG_SOURCED) -- use ${_on#*:} instead; $US --create-config shows the current names"
+	done
 	return 0
 }
 
@@ -3930,8 +3987,17 @@ cmd_health() {
 		[ "$_asleep" = "1" ] && _from=" [cached; disk asleep]"
 		_lastep=$(printf '%s\n' "$_rows" | sort -t"$(printf '\t')" -k3,3n | tail -n 1 | awk -F'\t' '{print $3}')
 		_agh=$(( (_now - _lastep) / 3600 ))
-		if [ "$_agh" -gt "$HEALTH_MAX_AGE_H" ]; then
-			health_say fail "$_h: newest backup is ${_agh}h old (limit ${HEALTH_MAX_AGE_H}h)$_from -- Time Machine fails silently, this is the one to watch"
+		## the age this location's newest backup should stay under; 0 = none. A
+		## number without a unit is refused: parse_interval would read 48 as seconds
+		_hma=$(loc_param "$_h" HEALTH_MAX_AGE)
+		_hmas=""
+		case "$_hma" in *[smhd]) _hmas=$(parse_interval "$_hma") || _hmas="" ;; esac
+		if [ "$_hma" = "0" ]; then
+			health_say ok "$_h: newest backup ${_agh}h old$_from [no age expected: HEALTH_MAX_AGE=0]"
+		elif [ -z "$_hmas" ]; then
+			health_say warn "$_h: HEALTH_MAX_AGE is '$_hma' -- give it a unit (48h, 2d), or 0 for no age expected"
+		elif [ $(( _now - _lastep )) -gt "$_hmas" ]; then
+			health_say fail "$_h: newest backup is ${_agh}h old (limit $_hma)$_from -- Time Machine fails silently, this is the one to watch"
 		else
 			health_say ok "$_h: newest backup ${_agh}h old$_from"
 		fi
@@ -4251,13 +4317,10 @@ cmd_thin() {
 		## kept apart: the functions called below set _h themselves
 		_thin_h="$_h"
 		loc_ready "$_h" || continue
-		## CLI beats per-location beats global
+		## the CLI beats the location's THIN_POLICY_TO_KEEP (its _DEFAULT unless
+		## set_location_parameters says otherwise)
 		_p="$_policy"
-		if [ -z "$_p" ]; then
-			_p=$(printf '%s\n' "$THIN_POLICY_PER_LOCATION" |
-				awk -v l="$_h" '$1 == l {$1 = ""; sub(/^ /, ""); print; exit}')
-		fi
-		[ -n "$_p" ] || _p="$THIN_POLICY_TO_KEEP"
+		[ -n "$_p" ] || _p=$(loc_param "$_h" THIN_POLICY_TO_KEEP)
 		[ -n "$_p" ] || continue
 
 		_rows=$(snapshots_get "$_h" | sort -t"$(printf '\t')" -k3,3n | awk -F'\t' '{print $2"\t"$3}')
@@ -4333,20 +4396,14 @@ backup_volume() {
 	return 0
 }
 
-## What happens to the disk when a backup finishes, for one location.
-## POST_BACKUP_PER_LOCATION wins over POST_BACKUP; an unknown value is a
-## config error, not a silent fallback.
+## What happens to the disk when a backup finishes, for one location: its
+## POST_BACKUP (set_location_parameters), else POST_BACKUP_DEFAULT. An unknown
+## value is a config error, not a silent fallback.
 post_backup_policy() {
-	_pb_h="${1:-}"
-	_pb_v=""
-	if [ -n "$_pb_h" ] && [ -n "$POST_BACKUP_PER_LOCATION" ]; then
-		_pb_v=$(printf '%s\n' "$POST_BACKUP_PER_LOCATION" |
-			awk -v h="$_pb_h" '$1 == h { print $2; exit }')
-	fi
-	[ -n "$_pb_v" ] || _pb_v="$POST_BACKUP"
+	_pb_v=$(loc_param "${1:-}" POST_BACKUP)
 	case "$_pb_v" in
 		none|unmount|eject) printf '%s\n' "$_pb_v" ;;
-		*) err "POST_BACKUP is '$_pb_v' -- it must be none, unmount or eject" ;;
+		*) err "POST_BACKUP${1:+ for $1} is '$_pb_v' -- it must be none, unmount or eject" ;;
 	esac
 	return 0
 }
@@ -4376,7 +4433,13 @@ do_post_backup() {
 		why "no backup destination to act on"
 		return 0
 	}
-	_pol=$(post_backup_policy "${1:-}")
+	## the location this volume IS, so its own POST_BACKUP applies: the same
+	## match loc_is_quiet makes (the target's last component is the volume)
+	_pv_h="${1:-}"
+	[ -n "$_pv_h" ] || _pv_h=$(locations_all | awk -F'\t' -v v="$_pv" '
+		$2 == "local" || $2 ~ /:/ { next }
+		{ n = $2; sub(/.*\//, "", n) } n == v { print $1; exit }')
+	_pol=$(post_backup_policy "$_pv_h")
 	if [ -f "$NO_EJECT_FLAGFILE" ]; then
 		msg "leaving $_pv mounted [policy $_pol suppressed by $NO_EJECT_FLAGFILE]"
 		why "--eject removes that file and the policy applies again"
@@ -5700,6 +5763,10 @@ main() {
 	[ "$DEEPDBG" = "1" ] && { PS4='+ '; set -x; }
 
 	load_config || true
+	case "${CMD:-}" in
+		--run-tests|--create-config|--help|--version) : ;;
+		*) config_refuse_old_names ;;
+	esac
 
 	## Without --install there is no maintenance daemon, so nothing would ever
 	## reap a mount leaked by a kill -9. Reconcile and release expired ones on
@@ -5954,6 +6021,8 @@ t_setup() {
 	FIRMLINK="$T_ROOT/mount"
 	CACHE_TTL=3600
 	AUTODETECT_LOCAL_TM_BACKUPS=0
+	## hermetic: loc_param re-reads the loaded config files
+	CONFIG_SOURCED=""
 	HOME="$T_ROOT/home"
 	PATH="$(t_stub_dir):$PATH"
 	export PATH HOME
@@ -6100,6 +6169,68 @@ t_test_thin() {
 	t_eq "*:all keeps everything" \
 		"$(printf '%s\n' "$_dec4" | awk -F'\t' '$1 == "del"' | count_lines)" "0"
 	rm -f "$_rows"
+}
+
+## Per-location parameters. Adversarial: the host's set_location_parameters
+## must run AFTER the site's and win, the site's must still apply where the host
+## says nothing, nothing set for one location may leak into my-tm, a location
+## nobody names gets the _DEFAULT, HEALTH_MAX_AGE=0 must not fail and a bare
+## number must not be read as seconds, and a config still setting an old name
+## must stop my-tm instead of being ignored.
+t_test_location_parameters() {
+	printf '\nPer-location parameters\n'
+	_lp_save="$CONFIG_SOURCED"; _lp_thin="$THIN_POLICY_TO_KEEP_DEFAULT"
+	## a site config loaded before the tests may still carry the old name
+	unset THIN_POLICY_TO_KEEP
+	unset -f set_location_parameters 2>/dev/null
+	THIN_POLICY_TO_KEEP_DEFAULT="24h:hourly"
+	# shellcheck disable=SC2016  # writing config files: $LOCATION is their own
+	{
+		printf 'set_location_parameters() {\n'
+		printf '\tcase "$LOCATION" in\n'
+		printf '\t\tstore) THIN_POLICY_TO_KEEP="site-store"; HEALTH_MAX_AGE="0" ;;\n'
+		printf '\t\tother) THIN_POLICY_TO_KEEP="site-other" ;;\n'
+		printf '\tesac\n}\n'
+	} >"$T_ROOT/site.conf"
+	# shellcheck disable=SC2016  # same
+	{
+		printf 'set_location_parameters() {\n'
+		printf '\tcase "$LOCATION" in\n'
+		printf '\t\tstore) THIN_POLICY_TO_KEEP="host-store" ;;\n'
+		printf '\tesac\n}\n'
+	} >"$T_ROOT/host.conf"
+	CONFIG_SOURCED=" $T_ROOT/site.conf $T_ROOT/host.conf"
+	t_eq "the host's value wins over the site's" "$(loc_param store THIN_POLICY_TO_KEEP)" "host-store"
+	t_eq "the site's still applies where the host says nothing" "$(loc_param store HEALTH_MAX_AGE)" "0"
+	t_eq "and for a location only the site names" "$(loc_param other THIN_POLICY_TO_KEEP)" "site-other"
+	t_eq "a location nobody names gets THIN_POLICY_TO_KEEP_DEFAULT" "$(loc_param nosuch THIN_POLICY_TO_KEEP)" "24h:hourly"
+	loc_param store THIN_POLICY_TO_KEEP >/dev/null
+	_lp_fn=undefined; command -v set_location_parameters >/dev/null 2>&1 && _lp_fn=defined
+	t_eq "nothing leaks into my-tm itself" "${THIN_POLICY_TO_KEEP-unset} $_lp_fn" "unset undefined"
+
+	## HEALTH_MAX_AGE per location, as --health reads it
+	# shellcheck disable=SC2016  # writing a config file
+	printf 'set_location_parameters() { case "$LOCATION" in store) HEALTH_MAX_AGE="0" ;; esac; }\n' >"$T_ROOT/age.conf"
+	CONFIG_SOURCED=" $T_ROOT/age.conf"
+	_lp_h=$(cmd_health store 2>&1)
+	t_match "HEALTH_MAX_AGE=0 shows the age as information" "$_lp_h" "no age expected"
+	t_eq "and does not fail it" "$(printf '%s\n' "$_lp_h" | count_match 'store: newest backup is')" "0"
+	# shellcheck disable=SC2016  # writing a config file
+	printf 'set_location_parameters() { case "$LOCATION" in store) HEALTH_MAX_AGE="48" ;; esac; }\n' >"$T_ROOT/age.conf"
+	_lp_h=$(cmd_health store 2>&1)
+	t_match "a HEALTH_MAX_AGE without a unit is refused, not read as seconds" "$_lp_h" "give it a unit"
+	CONFIG_SOURCED=""
+	_lp_h=$(cmd_health store 2>&1)
+	t_match "HEALTH_MAX_AGE_DEFAULT still fails an old backup" "$_lp_h" "store: newest backup is"
+	CONFIG_SOURCED="$_lp_save"; THIN_POLICY_TO_KEEP_DEFAULT="$_lp_thin"
+
+	## an old name stops my-tm, and names what replaced it
+	printf 'POST_BACKUP_PER_LOCATION="store none"\n' >"$T_ROOT/old.conf"
+	_lp_out=$(MY_TM_CONFIG="$T_ROOT/old.conf" dash "$T_MYTM" --status 2>&1)
+	t_match "a config setting an old name is refused" "$_lp_out" "POST_BACKUP_PER_LOCATION is no longer read"
+	t_match "and the replacement is named" "$_lp_out" "use set_location_parameters instead"
+	rm -f "$T_ROOT/site.conf" "$T_ROOT/host.conf" "$T_ROOT/age.conf" "$T_ROOT/old.conf"
+	return 0
 }
 
 t_test_config() {
@@ -6582,7 +6713,7 @@ t_test_commands_keep_other_tables() {
 	# shellcheck disable=SC2030  # the changes are meant to stay in the subshell
 	( is_root() { return 0; }
 	  LOCKFILE="$T_ROOT/backup.lock"; BACKUP_VOLUME="TestVol"; unset BACKUP_VOLUME_RESOLVED
-	  POST_BACKUP="none"; NOTIFY_BEGIN=0; NOTIFY_END=0; NO_EJECT_FLAGFILE="$T_ROOT/no-eject.ck"
+	  POST_BACKUP_DEFAULT="none"; NOTIFY_BEGIN=0; NOTIFY_END=0; NO_EJECT_FLAGFILE="$T_ROOT/no-eject.ck"
 	  cmd_backup start ) >/dev/null 2>&1
 	t_eq "--backup keeps the away disk's table" "$(_ck_count awaydisk)" "1"
 	t_eq "and drops the stale table of the disk it backed up" "$(_ck_count testvol)" "0"
@@ -7926,10 +8057,10 @@ t_test_config_search_order() {
 # shellcheck disable=SC2031  # another test changes these settings only inside its own subshell
 t_test_post_backup() {
 	printf '\nPost-backup disk action\n'
-	_pb_save_v="$BACKUP_VOLUME"; _pb_save_p="$POST_BACKUP"
-	_pb_save_l="$POST_BACKUP_PER_LOCATION"; _pb_save_f="$NO_EJECT_FLAGFILE"
+	_pb_save_v="$BACKUP_VOLUME"; _pb_save_p="$POST_BACKUP_DEFAULT"
+	_pb_save_l="$CONFIG_SOURCED"; _pb_save_f="$NO_EJECT_FLAGFILE"
 	NO_EJECT_FLAGFILE="$T_ROOT/no-eject"
-	POST_BACKUP_PER_LOCATION=""
+	CONFIG_SOURCED=""
 	BACKUP_VOLUME="TestVol"
 
 	## Where the log ends now, so each case reads only the calls IT made --
@@ -7937,36 +8068,45 @@ t_test_post_backup() {
 	## other made the "does not eject" case re-read the eject case above it.
 	_pb_n() { count_lines < "$(t_calls)"; }
 
-	POST_BACKUP="eject"; unset BACKUP_VOLUME_RESOLVED
+	POST_BACKUP_DEFAULT="eject"; unset BACKUP_VOLUME_RESOLVED
 	_b=$(_pb_n); do_post_backup >/dev/null 2>&1
 	_new=$(sed -n "$(( _b + 1 )),\$p" "$(t_calls)")
 	t_match "POST_BACKUP=eject ejects" "$_new" "diskutil eject /Volumes/TestVol"
 
-	POST_BACKUP="unmount"; unset BACKUP_VOLUME_RESOLVED
+	POST_BACKUP_DEFAULT="unmount"; unset BACKUP_VOLUME_RESOLVED
 	_b=$(_pb_n); do_post_backup >/dev/null 2>&1
 	_new=$(sed -n "$(( _b + 1 )),\$p" "$(t_calls)")
 	t_match "POST_BACKUP=unmount unmounts" "$_new" "diskutil unmountDisk /Volumes/TestVol"
 	t_eq "and does NOT eject" "$(printf '%s\n' "$_new" | count_match 'eject')" "0"
 
-	POST_BACKUP="none"; unset BACKUP_VOLUME_RESOLVED
+	POST_BACKUP_DEFAULT="none"; unset BACKUP_VOLUME_RESOLVED
 	_b=$(_pb_n); do_post_backup >/dev/null 2>&1
 	t_eq "POST_BACKUP=none runs no command at all" "$(( $(_pb_n) - _b ))" "0"
 
-	POST_BACKUP="eject"; unset BACKUP_VOLUME_RESOLVED
+	POST_BACKUP_DEFAULT="eject"; unset BACKUP_VOLUME_RESOLVED
 	: >"$NO_EJECT_FLAGFILE"
 	_b=$(_pb_n); do_post_backup >/dev/null 2>&1
 	t_eq "the flag file suppresses the policy entirely" "$(( $(_pb_n) - _b ))" "0"
 	rm -f "$NO_EJECT_FLAGFILE"
 
-	POST_BACKUP="eject"
-	POST_BACKUP_PER_LOCATION="$(printf 'other\tnone\nstore\tunmount\n')"
-	t_eq "a per-location value beats the global one" \
+	POST_BACKUP_DEFAULT="eject"
+	# shellcheck disable=SC2016  # writing a config file: $LOCATION is its own
+	printf 'set_location_parameters() {\n\tcase "$LOCATION" in\n\t\tstore) POST_BACKUP="unmount" ;;\n\t\tother) POST_BACKUP="none" ;;\n\tesac\n}\n' >"$T_ROOT/pb-params.conf"
+	CONFIG_SOURCED=" $T_ROOT/pb-params.conf"
+	t_eq "a per-location value beats POST_BACKUP_DEFAULT" \
 		"$(post_backup_policy store)" "unmount"
 	t_eq "and a location not named falls back to it" \
 		"$(post_backup_policy nosuch)" "eject"
-	POST_BACKUP_PER_LOCATION=""
+	## the backup itself must find the location behind its volume, or no
+	## per-location value would ever reach the one command it exists for
+	BACKUP_VOLUME="store"; unset BACKUP_VOLUME_RESOLVED
+	_b=$(_pb_n); do_post_backup >/dev/null 2>&1
+	_new=$(sed -n "$(( _b + 1 )),\$p" "$(t_calls)")
+	t_match "the backup volume's own POST_BACKUP applies after a backup" "$_new" "diskutil unmountDisk /Volumes/store"
+	BACKUP_VOLUME="TestVol"; unset BACKUP_VOLUME_RESOLVED
+	CONFIG_SOURCED=""; rm -f "$T_ROOT/pb-params.conf"
 
-	_bad=$( ( POST_BACKUP="sleep"; post_backup_policy store ) 2>&1 >/dev/null )
+	_bad=$( ( POST_BACKUP_DEFAULT="sleep"; post_backup_policy store ) 2>&1 >/dev/null )
 	t_match "an unknown value is refused, not silently defaulted" "$_bad" "none, unmount or eject"
 
 	## REGRESSION: BACKUP_VOLUME="" used to mean "do nothing", while
@@ -7974,17 +8114,17 @@ t_test_post_backup() {
 	## up to a disk it refused to name, mount or release.
 	BACKUP_VOLUME=""; unset BACKUP_VOLUME_RESOLVED
 	t_eq "an empty BACKUP_VOLUME resolves from tmutil" "$(backup_volume)" "store"
-	POST_BACKUP="eject"; unset BACKUP_VOLUME_RESOLVED
+	POST_BACKUP_DEFAULT="eject"; unset BACKUP_VOLUME_RESOLVED
 	_b=$(_pb_n); do_post_backup >/dev/null 2>&1
 	_new=$(sed -n "$(( _b + 1 )),\$p" "$(t_calls)")
 	t_match "and the action reaches that volume" "$_new" "diskutil eject /Volumes/store"
 
 	## A disk my-tm just put to sleep must not be woken by a daemon two
 	## minutes later -- that is what defeated the whole feature before.
-	POST_BACKUP="eject"; unset BACKUP_VOLUME_RESOLVED
+	POST_BACKUP_DEFAULT="eject"; unset BACKUP_VOLUME_RESOLVED
 	if loc_is_quiet store; then t_ok "a location with a post-backup action is quiet"
 	else t_bad "store should be quiet under POST_BACKUP=eject" ""; fi
-	POST_BACKUP="none"; unset BACKUP_VOLUME_RESOLVED
+	POST_BACKUP_DEFAULT="none"; unset BACKUP_VOLUME_RESOLVED
 	if loc_is_quiet store; then t_bad "POST_BACKUP=none must not make it quiet" ""
 	else t_ok "POST_BACKUP=none leaves it an ordinary location"; fi
 
@@ -7992,7 +8132,7 @@ t_test_post_backup() {
 	## decided: loc_open is what every daemon reaches the disk through.
 	_pb_sv="$TRANSIENT_VOLUMES"; TRANSIENT_VOLUMES="$T_ROOT/pb.volumes"
 	rm -f "$TRANSIENT_VOLUMES"
-	BACKUP_VOLUME="UnmountedStore"; POST_BACKUP="eject"
+	BACKUP_VOLUME="UnmountedStore"; POST_BACKUP_DEFAULT="eject"
 	unset BACKUP_VOLUME_RESOLVED
 	printf 'quietstore\t/Volumes/UnmountedStore\t\n' >>"$T_ROOT/cache/locations.tsv"
 
@@ -8013,8 +8153,8 @@ t_test_post_backup() {
 		mv "$T_ROOT/cache/l.pb" "$T_ROOT/cache/locations.tsv"
 	rm -f "$TRANSIENT_VOLUMES"; TRANSIENT_VOLUMES="$_pb_sv"
 
-	BACKUP_VOLUME="$_pb_save_v"; POST_BACKUP="$_pb_save_p"
-	POST_BACKUP_PER_LOCATION="$_pb_save_l"; NO_EJECT_FLAGFILE="$_pb_save_f"
+	BACKUP_VOLUME="$_pb_save_v"; POST_BACKUP_DEFAULT="$_pb_save_p"
+	CONFIG_SOURCED="$_pb_save_l"; NO_EJECT_FLAGFILE="$_pb_save_f"
 	unset BACKUP_VOLUME_RESOLVED
 }
 
@@ -8051,6 +8191,7 @@ run_tests() {
 	t_test_previous_is_not_a_state
 	t_test_thin
 	t_test_config
+	t_test_location_parameters
 	t_test_locations
 	t_test_ladder
 	t_test_mount_records
