@@ -97,6 +97,8 @@ NOTIFY_END=1
 EJECT_RETRIES=10
 EJECT_WAIT=5
 LSOF_TIMEOUT=10
+JOBS_RUN_WITH_FULL_DISK_ACCESS=0
+JOBS_LAUNCHER="/usr/local/sbin/my-tm-launcher"
 JOBS_ACCESS_NETWORK_VOLUMES=0
 
 ## how long a mount made on the way into a command lives if the command dies
@@ -130,6 +132,9 @@ BACKGROUND_JOB=0
 ## The mount table, read from this file instead of `mount` when set. Only the
 ## suite sets it, the way it sets FDA_PROBE.
 MOUNT_TABLE_FILE=""
+## The program the job plists run: the launcher when the jobs have Full Disk
+## Access, otherwise my-tm itself. Set by --install; empty means my-tm.
+JOB_PROGRAM=""
 
 ## Mountpoints to release when this run ends.  A FILE, not a variable: every
 ## caller reaches transient_snapshot through $(...), which is a subshell, and a
@@ -265,6 +270,14 @@ LOCAL_SNAP_KEEP_H=24            # h; matches macOS's own ~24h rotation
 LOCAL_SNAP_MAX=48               # cap for high-frequency intervals
 BACKUP_JOB="local.my-tm.backup"
 BACKUP_SCHEDULE="on-boot"       # on-boot | <N>s|m|h | HH:MM | Mon HH:MM ...
+JOBS_RUN_WITH_FULL_DISK_ACCESS=0 # 1: the jobs run my-tm through JOBS_LAUNCHER,
+                                # which holds Full Disk Access once it is added in
+                                # System Settings > Privacy & Security > Full Disk
+                                # Access. --install builds it (needs clang and
+                                # codesign) and prints that step. The jobs need the
+                                # access to look inside network volumes and for
+                                # HEALTH_VERIFY checksums.
+JOBS_LAUNCHER="/usr/local/sbin/my-tm-launcher"  # where --install puts it; root:wheel 0700
 JOBS_ACCESS_NETWORK_VOLUMES=0   # 1: the jobs may open locations on network
                                 # volumes (SMB, NFS, AFP, WebDAV). 0: they skip
                                 # them -- each sparsebundle attach over a share
@@ -4743,6 +4756,56 @@ launcher_build() {
 	return 0
 }
 
+## Is the launcher at LAUNCHER the one --install would build for MY-TM-PATH
+## today? Judged by what it REPORTS -- the program it runs and the hash of its
+## source -- not by file dates, which say nothing about either.
+launcher_is_current() {
+	[ -x "$1" ] || return 1
+	[ "$("$1" --version 2>/dev/null)" = "my-tm-launcher (runs $2, source $(launcher_source_hash))" ]
+}
+
+## Put a launcher for MY-TM-PATH at LAUNCHER, unless the one there is current.
+## Built beside its destination, owned root:wheel 0700, then moved into place,
+## so a failed build never leaves a half-made launcher where the jobs look.
+launcher_install() {
+	_li_path="$1"; _li_bin="$2"
+	if launcher_is_current "$_li_path" "$_li_bin"; then
+		minor "launcher:   $_li_path is current"
+		return 0
+	fi
+	need_dir "$(dirname "$_li_path")" || { warn "cannot create $(dirname "$_li_path")"; return 1; }
+	_li_new="$(dirname "$_li_path")/.my-tm-launcher.new.$$"
+	launcher_build "$_li_bin" "$_li_new" || return 1
+	if ! run chown root:wheel "$_li_new" || ! run chmod 0700 "$_li_new" ||
+	   ! run mv -f "$_li_new" "$_li_path"; then
+		rm -f "$_li_new"
+		warn "could not install the launcher at $_li_path"
+		return 1
+	fi
+	msg "built the launcher $_li_path"
+	note "grant it Full Disk Access: System Settings > Privacy & Security > Full Disk Access > add $_li_path"
+	why "a rebuilt launcher is a new program to macOS -- an earlier grant does not carry over"
+	return 0
+}
+
+## The two job settings as --install shows them, with the one combination that
+## cannot work called out. A function, so the suite can read it without root.
+install_access_plan() {
+	if [ "$JOBS_RUN_WITH_FULL_DISK_ACCESS" = "1" ]; then
+		minor "access:     JOBS_RUN_WITH_FULL_DISK_ACCESS=1 -- the jobs run through $JOBS_LAUNCHER"
+	else
+		minor "access:     JOBS_RUN_WITH_FULL_DISK_ACCESS=0 -- the jobs run my-tm directly"
+	fi
+	if [ "$JOBS_ACCESS_NETWORK_VOLUMES" = "1" ]; then
+		minor "network:    JOBS_ACCESS_NETWORK_VOLUMES=1 -- the jobs may open locations on network volumes"
+		[ "$JOBS_RUN_WITH_FULL_DISK_ACCESS" = "1" ] ||
+			warn "JOBS_ACCESS_NETWORK_VOLUMES=1, but without Full Disk Access the jobs cannot see inside network volumes -- JOBS_RUN_WITH_FULL_DISK_ACCESS=1"
+	else
+		minor "network:    JOBS_ACCESS_NETWORK_VOLUMES=0 -- the jobs skip network volumes"
+	fi
+	return 0
+}
+
 ## The LaunchDaemon plist for one job, on stdout. Both output streams are
 ## captured -- <label>.log for stdout, <label>.err for stderr: a job without
 ## StandardOutPath discards everything it prints, and --health reports on stdout.
@@ -4758,7 +4821,7 @@ job_plist() {
 	printf '<plist version="1.0">\n<dict>\n'
 	printf '\t<key>Label</key>\n\t<string>%s</string>\n' "$_jp_label"
 	printf '\t<key>ProgramArguments</key>\n\t<array>\n\t\t<string>%s</string>\n%s\t</array>\n' \
-		"$MY_TM_BIN" "$_jp_args"
+		"${JOB_PROGRAM:-$MY_TM_BIN}" "$_jp_args"
 	plist_schedule "$_jp_sched"
 	printf '\t<key>StandardOutPath</key>\n\t<string>%s/%s.log</string>\n' "$LOG_DIR_ROOT" "$_jp_label"
 	printf '\t<key>StandardErrorPath</key>\n\t<string>%s/%s.err</string>\n' "$LOG_DIR_ROOT" "$_jp_label"
@@ -4767,7 +4830,7 @@ job_plist() {
 
 write_job() {
 	_label="$1"; _sched="$2"; shift 2
-	_prog="$MY_TM_BIN"
+	_prog="${JOB_PROGRAM:-$MY_TM_BIN}"
 	_pl="/Library/LaunchDaemons/$_label.plist"
 	job_plist "$_label" "$_sched" "$@" >"$_pl" || return 1
 	plutil -lint "$_pl" >/dev/null 2>&1 || { warn "$_pl did not lint"; return 1; }
@@ -4868,10 +4931,15 @@ cmd_install() {
 	minor "jobs:       $MAINT_JOB${HEALTH_INTERVAL:+, $HEALTH_JOB}${BACKUP_SCHEDULE:+, $BACKUP_JOB}"
 	minor "tree:       built by $MAINT_JOB on its first run, not here"
 	minor "logs:       $LOG_DIR_ROOT"
+	install_access_plan
 
 	## a job must not run a binary anyone but root can rewrite
 	if path_is_user_writable "$MY_TM_BIN"; then
 		err "$MY_TM_BIN is inside a group- or world-writable tree, so a LaunchDaemon running it as root would execute whatever someone puts there. Install a root-owned copy (e.g. /usr/local/sbin/my-tm, root:wheel 0755) and run --install from that."
+	fi
+	## the same for the launcher, which runs as root AND holds Full Disk Access
+	if [ "$JOBS_RUN_WITH_FULL_DISK_ACCESS" = "1" ] && path_is_user_writable "$(dirname "$JOBS_LAUNCHER")"; then
+		err "$(dirname "$JOBS_LAUNCHER") is inside a group- or world-writable tree -- JOBS_LAUNCHER must sit where only root can write."
 	fi
 
 	[ "$_go" = "1" ] || return 0
@@ -4902,7 +4970,18 @@ cmd_install() {
 		minor "synthetic entries only appear after a reboot; until then my-tm uses $MOUNT_ROOT"
 	fi
 
-	## 3. the /tm README + jobs
+	## 3. the launcher, when the jobs are to run with Full Disk Access; if it
+	## cannot be built, the jobs run my-tm directly and that is said
+	JOB_PROGRAM="$MY_TM_BIN"
+	if [ "$JOBS_RUN_WITH_FULL_DISK_ACCESS" = "1" ]; then
+		if launcher_install "$JOBS_LAUNCHER" "$MY_TM_BIN"; then
+			JOB_PROGRAM="$JOBS_LAUNCHER"
+		else
+			warn "the jobs run my-tm directly, without Full Disk Access"
+		fi
+	fi
+
+	## 4. the /tm README + jobs
 	## The browse tree is NOT built here. Building it reads every store, and
 	## on a fresh install nothing is cached, so a sparsebundle on a share has
 	## to be attached -- minutes of waiting, for a tree $MAINT_JOB builds on
@@ -4918,10 +4997,10 @@ cmd_install() {
 	[ -n "$BACKUP_SCHEDULE" ] && write_job "$BACKUP_JOB" "$BACKUP_SCHEDULE" --backup start
 	note "the $FIRMLINK tree is built by $MAINT_JOB on its first run -- to build it now: $US --refresh"
 
-	## 4. the config -- copied only where a plain run would otherwise find none
+	## 5. the config -- copied only where a plain run would otherwise find none
 	install_config "$(printf '%s' "$CONFIG_SOURCED" | awk '{print $NF}')"
 
-	## 5. completion, for the human who ran sudo -- never root's home
+	## 6. completion, for the human who ran sudo -- never root's home
 	write_completion_file
 
 	## every configured ssh host, too
@@ -4966,7 +5045,13 @@ cmd_uninstall() {
 	minor "unmounts:  everything under $MOUNT_ROOT"
 	minor "$_synth:   the comment + entry pair for $FIRMLINK"
 	minor "keeps:     $CACHE_DIR (asked about separately -- the index is expensive)"
+	[ -e "$JOBS_LAUNCHER" ] &&
+		minor "launcher:  $JOBS_LAUNCHER (its Full Disk Access entry stays in System Settings -- remove it there)"
 	[ "$_go" = "1" ] || return 0
+
+	if [ -e "$JOBS_LAUNCHER" ]; then
+		run rm -f "$JOBS_LAUNCHER" && msg "removed the launcher $JOBS_LAUNCHER"
+	fi
 
 	for _j in "$MAINT_JOB" "$HEALTH_JOB" "$BACKUP_JOB"; do
 		_pl="/Library/LaunchDaemons/$_j.plist"
@@ -7064,6 +7149,66 @@ t_test_install_config() {
 ## must arrive intact (one per line, so "a b" cannot silently split); with no
 ## arguments it must run NOTHING; and a quote in the my-tm path -- pasted into a
 ## compiler define -- must be refused, not compiled.
+## --install and the launcher. Adversarial: the mismatch warning must appear in
+## exactly ONE of the four combinations; the plists must switch their program;
+## and a launcher built for a DIFFERENT my-tm must count as stale, or an install
+## after moving my-tm would keep a launcher that runs the old path.
+t_test_install_launcher() {
+	printf '\n--install and the Full Disk Access launcher\n'
+	_il_a="$JOBS_RUN_WITH_FULL_DISK_ACCESS"; _il_n="$JOBS_ACCESS_NETWORK_VOLUMES"
+	_il_l="$JOBS_LAUNCHER"; JOBS_LAUNCHER="/usr/local/sbin/my-tm-launcher"
+	for _il_c in "0 0" "1 0" "1 1" "0 1"; do
+		JOBS_RUN_WITH_FULL_DISK_ACCESS=${_il_c% *}; JOBS_ACCESS_NETWORK_VOLUMES=${_il_c#* }
+		printf '%s %s\n' "$_il_c" "$(install_access_plan 2>&1 | count_match 'cannot see inside network volumes')"
+	done >"$T_ROOT/plan.check"
+	t_eq "the mismatch is called out only for access 0 with network 1" \
+		"$(tr '\n' '|' <"$T_ROOT/plan.check")" "0 0 0|1 0 0|1 1 0|0 1 1|"
+	JOBS_RUN_WITH_FULL_DISK_ACCESS=1; JOBS_ACCESS_NETWORK_VOLUMES=0
+	t_match "with access on, the plan names the launcher" \
+		"$(install_access_plan 2>&1)" "run through /usr/local/sbin/my-tm-launcher"
+
+	_il_bin="${MY_TM_BIN:-}"; _il_prog="${JOB_PROGRAM:-}"; _il_log="${LOG_DIR_ROOT:-}"
+	MY_TM_BIN="/usr/local/sbin/my-tm"; LOG_DIR_ROOT="$T_ROOT/logs"
+	JOB_PROGRAM="/usr/local/sbin/my-tm-launcher"
+	job_plist test.launcher.job 120s --maintenance >"$T_ROOT/lj.plist"
+	t_eq "the job plist runs the launcher, my-tm's arguments after it" \
+		"$(plutil -extract ProgramArguments.0 raw -o - "$T_ROOT/lj.plist") $(plutil -extract ProgramArguments.1 raw -o - "$T_ROOT/lj.plist")" \
+		"/usr/local/sbin/my-tm-launcher --maintenance"
+	JOB_PROGRAM=""
+	job_plist test.launcher.job 120s --maintenance >"$T_ROOT/lj.plist"
+	t_eq "without it, my-tm itself" \
+		"$(plutil -extract ProgramArguments.0 raw -o - "$T_ROOT/lj.plist")" "/usr/local/sbin/my-tm"
+	rm -f "$T_ROOT/lj.plist"
+
+	_il_body=$(sed -n '/^cmd_install() {$/,/^}$/p' "$T_MYTM")
+	# shellcheck disable=SC2016  # the literal source text is matched, not a variable
+	t_eq "--install refuses a launcher directory others can write" \
+		"$(printf '%s\n' "$_il_body" | count_match 'path_is_user_writable "$(dirname "$JOBS_LAUNCHER")"')" "1"
+	# shellcheck disable=SC2016  # the literal source text is matched, not a variable
+	t_eq "--uninstall removes the launcher" \
+		"$(sed -n '/^cmd_uninstall() {$/,/^}$/p' "$T_MYTM" | count_match 'rm -f "$JOBS_LAUNCHER"')" "1"
+	t_match "the default config leaves the jobs without it" "$(cmd_create_config)" "JOBS_RUN_WITH_FULL_DISK_ACCESS=0"
+
+	if command -v clang >/dev/null 2>&1 && command -v codesign >/dev/null 2>&1; then
+		_il_d="$T_ROOT/il"; mkdir -p "$_il_d"
+		printf '#!/bin/dash\nexit 0\n' >"$_il_d/my-tm"; chmod 755 "$_il_d/my-tm"
+		launcher_build "$_il_d/my-tm" "$_il_d/launcher" >/dev/null 2>&1
+		t_eq "a launcher built for this my-tm is current" \
+			"$(launcher_is_current "$_il_d/launcher" "$_il_d/my-tm" && echo current || echo stale)" "current"
+		t_eq "for a different my-tm it is stale" \
+			"$(launcher_is_current "$_il_d/launcher" "$_il_d/elsewhere/my-tm" && echo current || echo stale)" "stale"
+		t_eq "and a missing one is stale" \
+			"$(launcher_is_current "$_il_d/none" "$_il_d/my-tm" && echo current || echo stale)" "stale"
+		rm -rf "$_il_d"
+	else
+		t_skip "launcher staleness" "needs clang and codesign"
+	fi
+
+	rm -f "$T_ROOT/plan.check"
+	MY_TM_BIN="$_il_bin"; JOB_PROGRAM="$_il_prog"; LOG_DIR_ROOT="$_il_log"
+	JOBS_RUN_WITH_FULL_DISK_ACCESS="$_il_a"; JOBS_ACCESS_NETWORK_VOLUMES="$_il_n"; JOBS_LAUNCHER="$_il_l"
+}
+
 t_test_launcher() {
 	printf '\nThe Full Disk Access launcher\n'
 	_ln_c="$(dirname "$T_MYTM")/my-tm-launcher.c"
@@ -7562,6 +7707,7 @@ run_tests() {
 	t_test_job_plist_streams
 	t_test_network_volume_gate
 	t_test_launcher
+	t_test_install_launcher
 	t_test_ejected_destination
 	t_test_auto_mount_destinations
 	t_test_verify_reports
