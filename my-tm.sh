@@ -4145,6 +4145,20 @@ snapshots_cache_invalidate() {
 	return 0
 }
 
+## Forget ONE location's rows. Every other location keeps its last known
+## table -- for a disk that is away, the only one there is until it is back.
+snapshots_cache_drop() {
+	_scd_cf=$(snapshots_cache_file)
+	[ -f "$_scd_cf" ] || return 0
+	## read it all before writing: the writer replaces the very file being read,
+	## and a cache that cannot be read is left alone rather than emptied
+	_scd_all=$(cache_read_checked "$_scd_cf" 2>/dev/null) || return 0
+	_scd_keep=$(printf '%s\n' "$_scd_all" | awk -F'\t' -v l="$1" 'NF && $1 != l')
+	{ [ -z "$_scd_keep" ] || printf '%s\n' "$_scd_keep"; } |
+		cache_write_checked "$_scd_cf" 2>/dev/null || dbg "snapshots cache not writable: $_scd_cf"
+	return 0
+}
+
 #############################################################################
 ## --thin   (selection only; the deleting is --rm's job)
 #############################################################################
@@ -5198,6 +5212,38 @@ cmd_uninstall() {
 ## --maintenance   (what the LaunchDaemon runs: sweep, refresh, local snaps)
 #############################################################################
 
+## Rebuild the /tm tree of each location whose backups changed since the last
+## run, and re-read THAT location's snapshot table only. The loop's variables
+## carry their own prefix: snap_names and tm_refresh_loc use _h and _t.
+maint_refresh_trees() {
+	_mrt_locs=$(locations_all | awk -F'\t' '{print $1}')
+	while IFS= read -r _mrt_h; do
+		[ -n "$_mrt_h" ] || continue
+		loc_ready "$_mrt_h" || continue
+		_mrt_t=$(loc_target "$_mrt_h")
+		_mrt_stamp="$(cache_write_dir)/.manifest.$_mrt_h"
+		_mrt_m=0
+		[ "$_mrt_t" != "local" ] && [ -f "$_mrt_t/backup_manifest.plist" ] &&
+			_mrt_m=$(stat -f '%m' "$_mrt_t/backup_manifest.plist" 2>/dev/null || echo 0)
+		## local has no manifest: its stamp is the set of local snapshots, which
+		## changes only when one is taken or purged
+		[ "$_mrt_t" = "local" ] &&
+			_mrt_m=$(snap_names local | cksum | awk '{print $1 "." $2}')
+		_mrt_old=0
+		[ -f "$_mrt_stamp" ] && _mrt_old=$(cat "$_mrt_stamp" 2>/dev/null || echo 0)
+		if [ "$_mrt_m" != "$_mrt_old" ]; then
+			dbg "maintenance: $_mrt_h changed ($_mrt_old -> $_mrt_m), refreshing"
+			snapshots_cache_drop "$_mrt_h"
+			snapshots_get "$_mrt_h" >/dev/null
+			tm_refresh_loc "$_mrt_h"
+			printf '%s\n' "$_mrt_m" >"$_mrt_stamp" 2>/dev/null || true
+		fi
+	done <<_EOF
+$_mrt_locs
+_EOF
+	return 0
+}
+
 cmd_maintenance() {
 	BACKGROUND_JOB=1
 	images_adopt_orphans
@@ -5208,28 +5254,7 @@ cmd_maintenance() {
 	dbg "maintenance: sweep"
 	sweep
 	dbg "maintenance: /tm refresh"
-	_locs=$(locations_all | awk -F'\t' '{print $1}')
-	while IFS= read -r _h; do
-		[ -n "$_h" ] || continue
-		loc_ready "$_h" || continue
-		_t=$(loc_target "$_h")
-		_stamp="$(cache_write_dir)/.manifest.$_h"
-		_m=0
-		[ "$_t" != "local" ] && [ -f "$_t/backup_manifest.plist" ] &&
-			_m=$(stat -f '%m' "$_t/backup_manifest.plist" 2>/dev/null || echo 0)
-		[ "$_t" = "local" ] && _m=$(now_epoch)
-		_old=0
-		[ -f "$_stamp" ] && _old=$(cat "$_stamp" 2>/dev/null || echo 0)
-		if [ "$_m" != "$_old" ]; then
-			dbg "maintenance: $_h changed ($_old -> $_m), refreshing"
-			snapshots_cache_invalidate
-			snapshots_get "$_h" >/dev/null
-			tm_refresh_loc "$_h"
-			printf '%s\n' "$_m" >"$_stamp" 2>/dev/null || true
-		fi
-	done <<_EOF
-$_locs
-_EOF
+	maint_refresh_trees
 	if [ -n "$LOCAL_SNAP_INTERVAL" ]; then
 		_iv=$(parse_interval "$LOCAL_SNAP_INTERVAL") || _iv=""
 		if [ -n "$_iv" ]; then
@@ -6483,6 +6508,57 @@ t_test_version_store_generation() {
 
 ## REGRESSION: local snapshots are purgeable -- macOS deletes them at any age.
 ## A cached list produced mounts of snapshots that no longer existed.
+## The maintenance daemon re-reads what changed. Adversarial: a run must not
+## throw away the last known table of a disk that is away (nothing can read it
+## again until the disk is back), must not rebuild local when no local snapshot
+## changed, and must rebuild it when one did.
+t_test_maintenance_keeps_other_tables() {
+	printf '\nThe maintenance daemon re-reads only what changed\n'
+	_mk_cf=$(snapshots_cache_file)
+	_mk_log="$T_ROOT/refreshed.log"
+	rm -f "$(cache_write_dir)"/.manifest.* "$_mk_log"
+	printf 'awaydisk\t2026-01-01-000000\t1767225600\taway01\t-\t-\t-\t-\t-\tok\tData\n' | t_cache_add
+
+	## record which trees get rebuilt, without building them
+	( tm_refresh_loc() { printf '%s\n' "$1" >>"$_mk_log"; }; maint_refresh_trees ) >/dev/null 2>&1
+	t_eq "the first run rebuilds local" "$(awk '$0 == "local" { n++ } END { print n + 0 }' "$_mk_log")" "1"
+	t_eq "and keeps the table of a disk that is away" \
+		"$(cache_read_checked "$_mk_cf" 2>/dev/null | count_match 'away01')" "1"
+
+	: >"$_mk_log"
+	# shellcheck disable=SC2329  # overrides my-tm's now_epoch, which maint_refresh_trees calls
+	( now_epoch() { echo $(( $(date '+%s') + 120 )); }
+	  tm_refresh_loc() { printf '%s\n' "$1" >>"$_mk_log"; }; maint_refresh_trees ) >/dev/null 2>&1
+	t_eq "a second run with no new local snapshot does not rebuild local" \
+		"$(awk '$0 == "local" { n++ } END { print n + 0 }' "$_mk_log")" "0"
+
+	## a local snapshot appears, one more daemon interval later
+	_mk_stub="$(t_stub_dir)/tmutil"
+	cp -p "$_mk_stub" "$T_ROOT/tmutil.orig"
+	# shellcheck disable=SC2016  # writing a script: its $1 and $@ are the stub's own
+	{
+		printf '#!/bin/sh\n'
+		printf 'if [ "$1" = "listlocalsnapshots" ]; then\n'
+		printf '\t"%s" "$@"\n' "$T_ROOT/tmutil.orig"
+		printf '\tprintf "com.apple.TimeMachine.2026-08-24-010101.local\\n"\n'
+		printf '\texit 0\n'
+		printf 'fi\n'
+		printf 'exec "%s" "$@"\n' "$T_ROOT/tmutil.orig"
+	} >"$_mk_stub"
+	chmod 0755 "$_mk_stub"
+	: >"$_mk_log"
+	# shellcheck disable=SC2329  # overrides my-tm's now_epoch, which maint_refresh_trees calls
+	( now_epoch() { echo $(( $(date '+%s') + 240 )); }
+	  tm_refresh_loc() { printf '%s\n' "$1" >>"$_mk_log"; }; maint_refresh_trees ) >/dev/null 2>&1
+	t_eq "a new local snapshot makes the next run rebuild local" \
+		"$(awk '$0 == "local" { n++ } END { print n + 0 }' "$_mk_log")" "1"
+	t_eq "and the away disk's table is still there" \
+		"$(cache_read_checked "$_mk_cf" 2>/dev/null | count_match 'away01')" "1"
+
+	mv -f "$T_ROOT/tmutil.orig" "$_mk_stub"
+	rm -f "$_mk_log" "$(cache_write_dir)"/.manifest.*
+}
+
 t_test_local_list_never_cached() {
 	printf '\nLocal snapshot list is never served from cache\n'
 	_cf=$(snapshots_cache_file)
@@ -7926,6 +8002,7 @@ run_tests() {
 	t_test_mount_root_fallback
 	t_test_version_store_generation
 	t_test_local_list_never_cached
+	t_test_maintenance_keeps_other_tables
 	t_test_local_snapshots
 
 	t_teardown
