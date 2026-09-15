@@ -97,6 +97,7 @@ NOTIFY_END=1
 EJECT_RETRIES=10
 EJECT_WAIT=5
 LSOF_TIMEOUT=10
+JOBS_ACCESS_NETWORK_VOLUMES=0
 
 ## how long a mount made on the way into a command lives if the command dies
 ## without cleaning up.  Not user-tunable: it is a leak-reaper, not a policy.
@@ -126,6 +127,9 @@ EXIT_RC=0
 ## there; it may not SPIN A DISK UP to look, which is the whole point of
 ## having put it to sleep after the backup.
 BACKGROUND_JOB=0
+## The mount table, read from this file instead of `mount` when set. Only the
+## suite sets it, the way it sets FDA_PROBE.
+MOUNT_TABLE_FILE=""
 
 ## Mountpoints to release when this run ends.  A FILE, not a variable: every
 ## caller reaches transient_snapshot through $(...), which is a subshell, and a
@@ -261,6 +265,12 @@ LOCAL_SNAP_KEEP_H=24            # h; matches macOS's own ~24h rotation
 LOCAL_SNAP_MAX=48               # cap for high-frequency intervals
 BACKUP_JOB="local.my-tm.backup"
 BACKUP_SCHEDULE="on-boot"       # on-boot | <N>s|m|h | HH:MM | Mon HH:MM ...
+JOBS_ACCESS_NETWORK_VOLUMES=0   # 1: the jobs may open locations on network
+                                # volumes (SMB, NFS, AFP, WebDAV). 0: they skip
+                                # them -- each sparsebundle attach over a share
+                                # costs minutes, and without Full Disk Access a
+                                # job cannot see inside one anyway. Commands you
+                                # run yourself are never limited by this.
 # --- backup control ---
 BACKUP_VOLUME=""                # "" = ask tmutil which destination this is.
                                 # Resolved ONCE at startup; the pre-backup
@@ -982,6 +992,7 @@ loc_uuid() {
 }
 
 loc_reachable() {
+	( job_skips_location "$1" ) && return 1
 	_t=$(loc_target "$1")
 	case "$_t" in
 		local) return 0 ;;
@@ -1606,7 +1617,51 @@ volume_state() {
 ## is attached but not mounted is invisible to every read in here, and the
 ## answer "no backups" would be a lie. Mount it, and remember that WE did,
 ## so it goes back exactly as it was found.
+## Mount points of network filesystems, one per line. The mount table needs no
+## Full Disk Access, so a job can read it even where it cannot look inside.
+network_mounts() {
+	if [ -n "$MOUNT_TABLE_FILE" ]; then cat "$MOUNT_TABLE_FILE"; else mount 2>/dev/null; fi |
+		awk '{
+			if (!match($0, / on .* \(/)) next
+			mp = substr($0, RSTART + 4, RLENGTH - 6)
+			fs = substr($0, RSTART + RLENGTH); sub(/[,)].*/, "", fs)
+			if (fs ~ /^(smbfs|nfs|afpfs|webdav|cifs|ftp)$/) print mp
+		}'
+}
+
+## Is this path on a network volume? Matched on whole path components, so
+## /Volumes/share does not claim /Volumes/shareX.
+path_on_network_volume() {
+	_pn_p="$1"
+	while IFS= read -r _pn_mp; do
+		[ -n "$_pn_mp" ] || continue
+		case "$_pn_p/" in "$_pn_mp"/*) return 0 ;; esac
+	done <<_EOF
+$(network_mounts)
+_EOF
+	return 1
+}
+
+## A job skips a location on a network volume unless JOBS_ACCESS_NETWORK_VOLUMES=1:
+## attaching a sparsebundle over a share costs minutes, and without Full Disk
+## Access a job cannot see inside one at all. Commands a person runs are never
+## gated. Only reaching a location is gated -- releasing a mount is not, and
+## the sweep does not come through here. Call it in a subshell: loc_target sets
+## the same scratch variables its callers use.
+job_skips_location() {
+	[ "$BACKGROUND_JOB" = "1" ] || return 1
+	[ "${JOBS_ACCESS_NETWORK_VOLUMES:-0}" = "1" ] && return 1
+	_js_t=$(loc_target "$1" 2>/dev/null) || return 1
+	case "$_js_t" in local) return 1 ;; esac
+	is_remote_target "$_js_t" && return 1
+	path_on_network_volume "$_js_t"
+}
+
 loc_open() {
+	if ( job_skips_location "$1" ); then
+		dbg "$1 is on a network volume the jobs skip (JOBS_ACCESS_NETWORK_VOLUMES=0)"
+		return 1
+	fi
 	_h="$1"
 	_t=$(loc_target "$_h")
 	case "$_t" in local) return 0 ;; esac
@@ -3748,6 +3803,12 @@ cmd_health() {
 	while IFS= read -r _h; do
 		[ -n "$_h" ] || continue
 		loc_line "$_h" >/dev/null 2>&1 || continue
+		## a location on a network volume the jobs skip is not "not reachable":
+		## checking it is not this run's business
+		if ( job_skips_location "$_h" ); then
+			dbg "$_h is on a network volume the jobs skip (JOBS_ACCESS_NETWORK_VOLUMES=0)"
+			continue
+		fi
 		## A destination my-tm itself put to sleep is not "not reachable" --
 		## it is exactly where it was left. Answer from the cache instead of
 		## spinning it up, and say so, because a cached age is a fact about
@@ -6882,6 +6943,57 @@ t_test_install_config() {
 ## The daemons' logs follow LOG_DIR. cmd_install needs root, so its body is read.
 ## REGRESSION: the job plists captured stderr only, so everything a daemon
 ## printed on stdout was discarded -- the whole --health report included.
+## The jobs skip locations on network volumes unless JOBS_ACCESS_NETWORK_VOLUMES=1.
+## Adversarial: the location EXISTS and is reachable, so only the gate can
+## refuse it; a mount point that is a string-prefix of another must not claim
+## it; and releasing a mount must stay outside the gate entirely.
+t_test_network_volume_gate() {
+	printf '\nJobs and network volumes\n'
+	_ng_save="$MOUNT_TABLE_FILE"; _ng_acc="$JOBS_ACCESS_NETWORK_VOLUMES"
+	_ng_bg="$BACKGROUND_JOB"
+	_ng_mnt="$T_ROOT/netmnt"; mkdir -p "$_ng_mnt/horse.sparsebundle" "$T_ROOT/netmntX"
+	: >"$_ng_mnt/horse.sparsebundle/Info.plist"
+	MOUNT_TABLE_FILE="$T_ROOT/mount.table"
+	{
+		printf '//me@ada/timeMachine on %s (smbfs, nodev, nosuid, mounted by me)\n' "$_ng_mnt"
+		printf '/dev/disk5s2 on /Volumes/TimeMachine.Horse (apfs, local, nodev, journaled)\n'
+		printf '/dev/disk7s1 on /Volumes/Backups of macado (apfs, local, nodev)\n'
+		printf 'ada:/export on /Volumes/nfs share (nfs, nodev)\n'
+	} >"$MOUNT_TABLE_FILE"
+
+	t_eq "an SMB share is a network volume" \
+		"$(path_on_network_volume "$_ng_mnt/horse.sparsebundle" && echo yes || echo no)" "yes"
+	t_eq "an NFS mount with a space in its name too" \
+		"$(path_on_network_volume "/Volumes/nfs share/a" && echo yes || echo no)" "yes"
+	t_eq "a local APFS volume is not" \
+		"$(path_on_network_volume /Volumes/TimeMachine.Horse && echo yes || echo no)" "no"
+	t_eq "a sibling whose name merely starts the same is not" \
+		"$(path_on_network_volume "$T_ROOT/netmntX/a" && echo yes || echo no)" "no"
+
+	printf 'netloc\t%s/horse.sparsebundle\t\n' "$_ng_mnt" >>"$T_ROOT/cache/locations.tsv"
+
+	BACKGROUND_JOB=1; JOBS_ACCESS_NETWORK_VOLUMES=0
+	t_eq "a job with JOBS_ACCESS_NETWORK_VOLUMES=0 cannot reach it" \
+		"$(loc_reachable netloc && echo reached || echo skipped)" "skipped"
+	t_eq "nor open it" \
+		"$(loc_open netloc >/dev/null 2>&1 && echo opened || echo skipped)" "skipped"
+	JOBS_ACCESS_NETWORK_VOLUMES=1
+	t_eq "with JOBS_ACCESS_NETWORK_VOLUMES=1 it can" \
+		"$(loc_reachable netloc && echo reached || echo skipped)" "reached"
+	BACKGROUND_JOB=0; JOBS_ACCESS_NETWORK_VOLUMES=0
+	t_eq "and a command a person runs is never gated" \
+		"$(loc_reachable netloc && echo reached || echo skipped)" "reached"
+
+	_ng_sw=$(sed -n '/^sweep() {$/,/^}$/p' "$T_MYTM")
+	t_eq "releasing mounts stays outside the gate" \
+		"$(printf '%s\n' "$_ng_sw" | count_match 'job_skips_location') $(printf '%s\n' "$_ng_sw" | count_match 'loc_reachable') $(printf '%s\n' "$_ng_sw" | count_match 'loc_open')" "0 0 0"
+
+	grep -v '^netloc	' "$T_ROOT/cache/locations.tsv" >"$T_ROOT/cache/l.ng" &&
+		mv "$T_ROOT/cache/l.ng" "$T_ROOT/cache/locations.tsv"
+	rm -rf "$_ng_mnt" "$T_ROOT/netmntX" "$MOUNT_TABLE_FILE"
+	MOUNT_TABLE_FILE="$_ng_save"; JOBS_ACCESS_NETWORK_VOLUMES="$_ng_acc"; BACKGROUND_JOB="$_ng_bg"
+}
+
 t_test_job_plist_streams() {
 	printf '\nDaemon plists capture both output streams\n'
 	_jt_bin="${MY_TM_BIN:-}"; _jt_log="${LOG_DIR_ROOT:-}"
@@ -7281,6 +7393,7 @@ run_tests() {
 	t_test_install_config
 	t_test_install_logs
 	t_test_job_plist_streams
+	t_test_network_volume_gate
 	t_test_ejected_destination
 	t_test_auto_mount_destinations
 	t_test_verify_reports
