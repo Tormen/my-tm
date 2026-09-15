@@ -21,6 +21,11 @@ if [ -z "${HOME:-}" ]; then
 	export HOME
 fi
 
+## Nothing my-tm creates is world-readable: its caches and logs describe what is
+## in the backups. Files take group-read; the directory they sit in decides
+## whether the group can reach them.
+umask 027
+
 US="${0##*/}"
 MY_TM_VERSION="0.9.2"
 
@@ -47,6 +52,13 @@ MOUNT_ROOT="/var/lib/my-tm/mount"
 ## says where --install WRITES.
 if [ -n "${SITE_CONF_DIR:-}" ]; then SITE_CONF_DIR_FROM_ENV=1; else SITE_CONF_DIR_FROM_ENV=0; fi
 SITE_CONF_DIR="${SITE_CONF_DIR:-/usr/local/etc}"
+## The value the SEARCH uses, frozen before any config is read: a config may move
+## SITE_CONF_DIR (where --install writes), never where a plain run looks.
+SITE_CONF_DIR_SEARCH="$SITE_CONF_DIR"
+## The site's primary config directory, spelled out: it cannot come from a
+## config, because it is where the config is found. A variable only so the suite
+## can point it at a scratch directory.
+CONFIG_SITE_DIR="/LINKS/default"
 NOTIFY_MOUNT_WARN=1
 CACHE_TTL=3600
 USAGE_SAMPLE_INTERVAL=21600
@@ -192,7 +204,8 @@ _default_config_content() {
 #
 # Search order (first existing wins):
 #   $MY_TM_CONFIG · --config <FILE> · $SITE_CONF_DIR when it came from the
-#   ENVIRONMENT · /LINKS/default/my-tm.conf · $SITE_CONF_DIR/my-tm.conf
+#   ENVIRONMENT · /LINKS/default/my-tm.conf (or the bare /LINKS/default/my-tm)
+#   · $SITE_CONF_DIR/my-tm.conf
 #   · ~/.my-tm.conf · /etc/my-tm.conf · /usr/local/etc/my-tm.conf
 # /LINKS/default is spelled out on purpose: a search keyed on a value that
 # lives INSIDE a config file cannot find that file.
@@ -289,8 +302,8 @@ _CFG_EOF
 ## value inside the config file it has not found yet, and one gated on $LINKS
 ## being exported skips the location silently in a root shell.
 config_search_dirs() {
-	[ "$SITE_CONF_DIR_FROM_ENV" = "1" ] && printf '%s\n' "$SITE_CONF_DIR"
-	printf '%s\n' /LINKS/default "$SITE_CONF_DIR" "$HOME" /etc /usr/local/etc
+	[ "$SITE_CONF_DIR_FROM_ENV" = "1" ] && printf '%s\n' "$SITE_CONF_DIR_SEARCH"
+	printf '%s\n' "$CONFIG_SITE_DIR" "$SITE_CONF_DIR_SEARCH" "$HOME" /etc /usr/local/etc
 }
 
 ## The same list as PATHS, for telling the user where we looked.  One source
@@ -302,7 +315,7 @@ config_search_paths() {
 			## Under /LINKS/default BOTH spellings count: the site's config
 			## farm holds some names with a .conf suffix and some without, so
 			## knowing only one of them ignores a file sitting right there.
-			/LINKS/default) printf '%s/my-tm.conf\n%s/my-tm\n' "$_cs_d" "$_cs_d" ;;
+			"$CONFIG_SITE_DIR") printf '%s/my-tm.conf\n%s/my-tm\n' "$_cs_d" "$_cs_d" ;;
 			*)       printf '%s/my-tm.conf\n' "$_cs_d" ;;
 		esac
 	done
@@ -315,10 +328,25 @@ config_search_paths() {
 ## point at a file my-tm would not read.
 config_offer_paths() {
 	_co_all=$(config_search_paths)
-	for _co_p in /LINKS/default/my-tm.conf /etc/my-tm.conf "$HOME/.my-tm.conf"; do
+	for _co_p in "$CONFIG_SITE_DIR/my-tm.conf" /etc/my-tm.conf "$HOME/.my-tm.conf"; do
 		printf '%s\n' "$_co_all" | grep -qxF "$_co_p" && printf '%s\n' "$_co_p"
 	done
 	return 0
+}
+
+## The first config a plain run finds. It iterates config_search_paths -- the
+## very list the missing-config offer is filtered through -- so what my-tm
+## offers and what it loads cannot drift. A private directory walk here once
+## offered /LINKS/default/my-tm while only ever loading my-tm.conf.
+config_search_first() {
+	for _f in $(config_search_paths); do
+		if [ -f "$_f" ]; then
+			[ -f "$_f.GLOBAL" ] && printf '%s\n' "$_f.GLOBAL"
+			printf '%s\n' "$_f"
+			return 0
+		fi
+	done
+	return 1
 }
 
 config_candidates() {
@@ -330,18 +358,7 @@ config_candidates() {
 		printf '%s\n' "$CONFIG_FILE"
 		return 0
 	fi
-	for _d in $(config_search_dirs); do
-		case "$_d" in
-			"$HOME") _f="$_d/.my-tm.conf" ;;
-			*)       _f="$_d/my-tm.conf" ;;
-		esac
-		if [ -f "$_f" ]; then
-			[ -f "$_f.GLOBAL" ] && printf '%s\n' "$_f.GLOBAL"
-			printf '%s\n' "$_f"
-			return 0
-		fi
-	done
-	return 1
+	config_search_first
 }
 
 load_config() {
@@ -419,12 +436,27 @@ need_dir() {
 }
 
 ## atomic_write <file>   -- stdin becomes <file>, all-or-nothing.
+## The mode of a file my-tm writes is decided by its DIRECTORY: where the group
+## may read the directory, the group may read the file (0640); anywhere else it
+## stays private (0600). Its group already comes from the directory, which is
+## where BSD puts a new file.
+file_mode_from_dir() {
+	case "$(stat -f '%Sp' "$(dirname "$1")" 2>/dev/null)" in
+		????r*) chmod 0640 "$1" 2>/dev/null ;;
+		*)      chmod 0600 "$1" 2>/dev/null ;;
+	esac
+	return 0
+}
+
 atomic_write() {
 	_f="$1"
 	_d=$(dirname "$_f")
 	need_dir "$_d" || return 1
 	_t=$(mktemp "$_d/.my-tm.XXXXXX") || return 1
 	cat >"$_t" || { rm -f "$_t"; return 1; }
+	## mktemp makes every temp 0600 and mv carries that onto the target -- which
+	## left the shared cache unreadable to the group it is shared with
+	file_mode_from_dir "$_t"
 	mv -f "$_t" "$_f" || { rm -f "$_t"; return 1; }
 	return 0
 }
@@ -820,17 +852,13 @@ autodetect_images() {
 		_age=$(( $(now_epoch) - $(stat -f '%m' "$_f" 2>/dev/null || echo 0) ))
 		[ "$_age" -lt "${IMAGE_SCAN_TTL:-300}" ] && { cat "$_f"; return 0; }
 	fi
-	_tmp=$(mktemp /tmp/my-tm.img.XXXXXX) || return 0
+	## through atomic_write like every other cache file: a list built in /tmp
+	## and moved in kept /tmp's group and mktemp's 0600
 	for _b in /Volumes/*/*.sparsebundle; do
 		[ -d "$_b" ] || continue
 		bundle_is_mine "$_b" || continue
-		printf '%s\n' "$_b" >>"$_tmp"
-	done
-	if need_dir "$(dirname "$_f")"; then
-		mv -f "$_tmp" "$_f" 2>/dev/null || rm -f "$_tmp"
-	else
-		rm -f "$_tmp"
-	fi
+		printf '%s\n' "$_b"
+	done | atomic_write "$_f" 2>/dev/null
 	cat "$_f" 2>/dev/null
 	return 0
 }
@@ -1106,6 +1134,12 @@ cache_write_checked() {
 cache_read_checked() {
 	_cf="$1"
 	[ -f "$_cf" ] || return 1
+	## exists but unreadable is a permission problem, not a malformed file --
+	## say so, or the group silently loses the cache it was meant to share
+	if [ ! -r "$_cf" ]; then
+		dbg "cannot read $_cf (permission) -- treating the cache as absent"
+		return 1
+	fi
 	_hdr=$(head -n 1 "$_cf" 2>/dev/null)
 	case "$_hdr" in
 		"$CACHE_MAGIC "*) : ;;
@@ -4569,6 +4603,45 @@ write_job() {
 
 SYNTH_COMMENT="# my-tm: browse Time Machine snapshots as directories, see \`my-tm --help\`"
 
+## Where --install puts the config it was run with. A plain run -- no --config,
+## no $MY_TM_CONFIG -- that already finds one needs no copy: a second copy only
+## drifts. Where the two differ, the user merges them; nothing is overwritten.
+install_config() {
+	_ic_src="$1"
+	[ -n "$_ic_src" ] || return 0
+	_ic_plain=$(config_search_first 2>/dev/null | tail -n 1)
+	if [ -n "$_ic_plain" ]; then
+		if cmp -s "$_ic_src" "$_ic_plain"; then
+			minor "config:     $_ic_plain"
+		else
+			warn "a plain '$US' reads $_ic_plain, not $_ic_src"
+			minor "merge them: vimdiff $_ic_src $_ic_plain"
+		fi
+		return 0
+	fi
+	_ic_dst="$SITE_CONF_DIR/my-tm.conf"
+	if [ -f "$_ic_dst" ]; then
+		if ! cmp -s "$_ic_src" "$_ic_dst"; then
+			warn "$_ic_dst exists and differs -- left as it is"
+			minor "merge them: vimdiff $_ic_src $_ic_dst"
+		fi
+	elif [ -d "$SITE_CONF_DIR" ]; then
+		run cp "$_ic_src" "$_ic_dst" && minor "copied $_ic_src -> $_ic_dst"
+	else
+		warn "$SITE_CONF_DIR does not exist -- the config was not copied"
+		return 0
+	fi
+	## a copy a plain run will not read is no help: offer where it does look
+	if ! config_search_paths | grep -qxF "$_ic_dst"; then
+		warn "a plain '$US' will not look at $_ic_dst"
+		note "put it where it does look, most common place first:"
+		config_offer_paths | while IFS= read -r _ic_p; do
+			if [ -f "$_ic_p" ]; then minor "vimdiff $_ic_dst $_ic_p"; else minor "cp $_ic_dst $_ic_p"; fi
+		done
+	fi
+	return 0
+}
+
 cmd_install() {
 	_go=0; _host=""
 	for _a in "$@"; do
@@ -4595,7 +4668,8 @@ cmd_install() {
 	fi
 
 	MY_TM_BIN=$(abs_path "$0")
-	LOG_DIR_ROOT="/var/log/my-tm"
+	## the daemons log where the config says, like every other my-tm run
+	LOG_DIR_ROOT="$LOG_DIR"
 	_group="$TM_GROUP"
 	[ -n "$_group" ] || _group=$(id -gn "$(invoking_user)" 2>/dev/null || echo wheel)
 	_synth="/etc/synthetic.conf"
@@ -4612,6 +4686,7 @@ cmd_install() {
 	minor "firmlink:   $FIRMLINK -> /$_target  (via $_synth, after a reboot)"
 	minor "jobs:       $MAINT_JOB${HEALTH_INTERVAL:+, $HEALTH_JOB}${BACKUP_SCHEDULE:+, $BACKUP_JOB}"
 	minor "tree:       built by $MAINT_JOB on its first run, not here"
+	minor "logs:       $LOG_DIR_ROOT"
 
 	## a job must not run a binary anyone but root can rewrite
 	if path_is_user_writable "$MY_TM_BIN"; then
@@ -4662,27 +4737,8 @@ cmd_install() {
 	[ -n "$BACKUP_SCHEDULE" ] && write_job "$BACKUP_JOB" "$BACKUP_SCHEDULE" --backup start
 	note "the $FIRMLINK tree is built by $MAINT_JOB on its first run -- to build it now: $US --refresh"
 
-	## 4. the config, under the name the search order expects
-	_src=$(printf '%s' "$CONFIG_SOURCED" | awk '{print $NF}')
-	if [ -n "$_src" ] && [ -d "$SITE_CONF_DIR" ] && [ "$_src" != "$SITE_CONF_DIR/my-tm.conf" ]; then
-		if [ -f "$SITE_CONF_DIR/my-tm.conf" ]; then
-			minor "$SITE_CONF_DIR/my-tm.conf already exists -- left as it is"
-		else
-			run cp "$_src" "$SITE_CONF_DIR/my-tm.conf" &&
-				minor "copied $_src -> $SITE_CONF_DIR/my-tm.conf"
-		fi
-		## and check that a plain run would actually FIND it there
-		case "$SITE_CONF_DIR" in
-			/usr/local/etc|/etc) : ;;
-			*)
-				warn "a plain '$US' will not look in $SITE_CONF_DIR: that value is only known once a config has been read."
-				printf '     Export it so the search can see it, e.g. in /etc/zshenv:\n' >&2
-				printf '       export SITE_CONF_DIR=%s\n' "$SITE_CONF_DIR" >&2
-				# shellcheck disable=SC2016  # the variable NAME is the advice here
-				printf '     or point $MY_TM_CONFIG at the file, or keep a copy at /etc/my-tm.conf.\n' >&2
-				;;
-		esac
-	fi
+	## 4. the config -- copied only where a plain run would otherwise find none
+	install_config "$(printf '%s' "$CONFIG_SOURCED" | awk '{print $NF}')"
 
 	## 5. completion, for the human who ran sudo -- never root's home
 	write_completion_file
@@ -5740,6 +5796,32 @@ t_test_atomic() {
 	t_eq "content is replaced" "$(cat "$_f")" "second"
 	t_eq "no temp files are left behind" \
 		"$(find "$T_ROOT" -name '.my-tm.*' | count_lines)" "0"
+
+	## REGRESSION: mktemp makes 0600 and mv carried that onto every target, so
+	## the shared cache was unreadable to the group it is shared with. The
+	## directory decides now.
+	_ad="$T_ROOT/grp"; mkdir -p "$_ad"; chmod 0750 "$_ad"
+	printf 'x\n' | atomic_write "$_ad/f"
+	t_eq "in a group-readable directory the group may read it" \
+		"$(stat -f '%Sp' "$_ad/f")" "-rw-r-----"
+	chmod 0600 "$_ad/f"
+	printf 'y\n' | atomic_write "$_ad/f"
+	t_eq "a rewrite restores that, instead of keeping 0600" \
+		"$(stat -f '%Sp' "$_ad/f")" "-rw-r-----"
+	_pd="$T_ROOT/priv"; mkdir -p "$_pd"; chmod 0700 "$_pd"
+	printf 'z\n' | atomic_write "$_pd/f"
+	t_eq "in a private directory it stays private" \
+		"$(stat -f '%Sp' "$_pd/f")" "-rw-------"
+	rm -rf "$_ad" "$_pd"
+	## and what my-tm writes by plain redirection is never world-readable.
+	## Adversarial: start the script under launchd's permissive umask 022 --
+	## an in-process check inherits whatever the caller's umask happens to be,
+	## and passed without the fix whenever that was already restrictive.
+	# shellcheck disable=SC2016  # $0 and $1 belong to the child shell
+	(umask 022; /bin/dash -c '"$0" --create-config "$1" >/dev/null 2>&1' "$T_MYTM" "$T_ROOT/umask.conf")
+	t_eq "a file written by plain redirect is not world-readable, even under umask 022" \
+		"$(stat -f '%Sp' "$T_ROOT/umask.conf" 2>/dev/null | cut -c8-10)" "---"
+	rm -f "$T_ROOT/umask.conf"
 }
 
 t_test_plists() {
@@ -6700,6 +6782,107 @@ t_test_previous_is_not_a_state() {
 ## "$HOME" in the defaults killed the script before it did anything -- every
 ## job --install wrote exited 1 at once. Adversarial: run the WHOLE script in
 ## that environment, not a unit of it, since the crash is at load time.
+## REGRESSION: the sparsebundle list was built in /tmp and moved into the
+## cache, keeping mktemp's 0600 -- unreadable to the group like the rest.
+t_test_autodetect_mode() {
+	printf '\nThe sparsebundle list follows its directory\n'
+	_am_save="$MAC_UUID"; MAC_UUID="00000000-0000-0000-0000-000000000000"
+	_am_f="$(cache_write_dir)/images.autodetect"
+	rm -f "$_am_f"
+	chmod 0750 "$(cache_write_dir)" 2>/dev/null
+	autodetect_images >/dev/null 2>&1
+	t_eq "it is written, even when empty" "$([ -f "$_am_f" ] && echo yes)" "yes"
+	t_eq "and group-readable like its directory" \
+		"$(stat -f '%Sp' "$_am_f")" "-rw-r-----"
+	MAC_UUID="$_am_save"
+}
+
+## REGRESSION: an unreadable shared cache was reported as "no integrity header",
+## sending anyone who looked after a malformed file that was not malformed.
+t_test_cache_unreadable() {
+	printf '\nA cache that cannot be read says so\n'
+	if is_root; then
+		t_skip "an unreadable cache" "root reads every file"
+		return 0
+	fi
+	_cu_f="$T_ROOT/unreadable.cache"
+	printf '%s x\nrow\n' "$CACHE_MAGIC" >"$_cu_f"
+	chmod 0000 "$_cu_f"
+	_cu_err=$( (DBG=1; cache_read_checked "$_cu_f") 2>&1 >/dev/null )
+	chmod 0600 "$_cu_f"
+	t_match "the real cause is reported" "$_cu_err" "cannot read"
+	t_eq "not a malformed file" \
+		"$(printf '%s\n' "$_cu_err" | count_match 'no integrity header')" "0"
+	rm -f "$_cu_f"
+}
+
+## REGRESSION: --install copied the config it found in the site directory into
+## SITE_CONF_DIR as a second copy that would drift, then warned that a plain run
+## would not find a config it had just found. It copies only when a plain run
+## finds none, and never overwrites a different file.
+t_test_install_config() {
+	printf '\n--install and the config it was run with\n'
+	_ic_root="$T_ROOT/icfg"; rm -rf "$_ic_root"
+	mkdir -p "$_ic_root/site" "$_ic_root/write" "$_ic_root/home" "$_ic_root/src"
+	_ic_s="$_ic_root/src/my-tm.local.conf"
+	printf 'CACHE_TTL=1\n' >"$_ic_s"
+	## scratch search directories only: the real site directory on the machine
+	## running the suite must take no part. Saved and restored explicitly, so
+	## nothing leaks into the tests that run after this one.
+	_ic_run() {
+		_ic_v1="$CONFIG_SITE_DIR"; _ic_v2="$SITE_CONF_DIR_SEARCH"
+		_ic_v3="$SITE_CONF_DIR_FROM_ENV"; _ic_v4="$HOME"
+		_ic_v5="${MY_TM_CONFIG:-}"; _ic_v6="$CONFIG_FILE"; _ic_v7="$SITE_CONF_DIR"
+		CONFIG_SITE_DIR="$_ic_root/site"; SITE_CONF_DIR_SEARCH="$_ic_root/nowhere"
+		SITE_CONF_DIR_FROM_ENV=0; HOME="$_ic_root/home"
+		MY_TM_CONFIG=''; CONFIG_FILE="$_ic_s"; SITE_CONF_DIR="$_ic_root/write"
+		install_config "$_ic_s" >"$_ic_root/out" 2>&1
+		CONFIG_SITE_DIR="$_ic_v1"; SITE_CONF_DIR_SEARCH="$_ic_v2"
+		SITE_CONF_DIR_FROM_ENV="$_ic_v3"; HOME="$_ic_v4"
+		MY_TM_CONFIG="$_ic_v5"; CONFIG_FILE="$_ic_v6"; SITE_CONF_DIR="$_ic_v7"
+		cat "$_ic_root/out"
+	}
+
+	cp "$_ic_s" "$_ic_root/site/my-tm.conf"
+	_ic_out=$(_ic_run)
+	t_eq "found on the search path: no second copy is made" \
+		"$([ -f "$_ic_root/write/my-tm.conf" ] && echo copied || echo none)" "none"
+	t_eq "and nothing is flagged" "$(printf '%s\n' "$_ic_out" | count_match '!!!')" "0"
+
+	printf 'CACHE_TTL=2\n' >"$_ic_root/site/my-tm.conf"
+	_ic_out=$(_ic_run)
+	t_eq "a different one on the search path: still no copy" \
+		"$([ -f "$_ic_root/write/my-tm.conf" ] && echo copied || echo none)" "none"
+	t_eq "the two are offered for merging" \
+		"$(printf '%s\n' "$_ic_out" | count_match "vimdiff $_ic_s $_ic_root/site/my-tm.conf")" "1"
+	rm -f "$_ic_root/site/my-tm.conf"
+
+	_ic_out=$(_ic_run)
+	t_eq "none on the search path: the config is copied" \
+		"$(cat "$_ic_root/write/my-tm.conf" 2>/dev/null)" "CACHE_TTL=1"
+	t_eq "and a plain run not looking there is said" \
+		"$(printf '%s\n' "$_ic_out" | count_match 'will not look at')" "1"
+
+	printf 'CACHE_TTL=9\n' >"$_ic_root/write/my-tm.conf"
+	_ic_out=$(_ic_run)
+	t_eq "an existing, different copy is never overwritten" \
+		"$(cat "$_ic_root/write/my-tm.conf")" "CACHE_TTL=9"
+	t_eq "it is offered for merging instead" \
+		"$(printf '%s\n' "$_ic_out" | count_match "vimdiff $_ic_s $_ic_root/write/my-tm.conf")" "1"
+	rm -rf "$_ic_root"
+}
+
+## The daemons' logs follow LOG_DIR. cmd_install needs root, so its body is read.
+t_test_install_logs() {
+	printf '\nDaemon logs follow LOG_DIR\n'
+	_il=$(sed -n '/^cmd_install() {$/,/^}$/p' "$T_MYTM")
+	# shellcheck disable=SC2016  # the literal source text is matched, not a variable
+	t_eq "the daemons log where the config says" \
+		"$(printf '%s\n' "$_il" | count_match 'LOG_DIR_ROOT="$LOG_DIR"')" "1"
+	t_eq "and nowhere hard-coded" \
+		"$(printf '%s\n' "$_il" | count_match '/var/log/my-tm')" "0"
+}
+
 t_test_runs_without_home() {
 	printf '\nA daemon environment without HOME\n'
 	_nh_err="$T_ROOT/nohome.err"
@@ -6858,12 +7041,16 @@ t_test_config_search_order() {
 
 	## the escape hatch keeps its rank: an env var is an explicit override,
 	## the same class as $MY_TM_CONFIG and --config
+	## Simulated the way a real run gets it: the ENVIRONMENT's value, frozen
+	## before any config loads. Adversarial: SITE_CONF_DIR itself still holds
+	## whatever the loaded config set, so a search that used it would fail here.
+	_se_v="$SITE_CONF_DIR_SEARCH"; SITE_CONF_DIR_SEARCH="$T_ROOT/from-env"
 	SITE_CONF_DIR_FROM_ENV=1
 	t_eq "SITE_CONF_DIR from the environment still wins" \
-		"$(config_search_dirs | sed -n '1p')" "$SITE_CONF_DIR"
+		"$(config_search_dirs | sed -n '1p')" "$T_ROOT/from-env"
 	t_eq "with the primary location right behind it" \
 		"$(config_search_dirs | sed -n '2p')" "/LINKS/default"
-	SITE_CONF_DIR_FROM_ENV=0
+	SITE_CONF_DIR_FROM_ENV=0; SITE_CONF_DIR_SEARCH="$_se_v"
 
 	## the paths the user is TOLD about are the paths that were searched --
 	## naming one hand-picked location is what sent people to the wrong file
@@ -6878,6 +7065,21 @@ t_test_config_search_order() {
 		"$(config_search_paths | sed -n '1p')" "/LINKS/default/my-tm.conf"
 	t_match "and \$HOME renders as a dotfile" \
 		"$(config_search_paths)" "$HOME/.my-tm.conf"
+
+	## REGRESSION: the list offered the bare /LINKS/default/my-tm, but the
+	## loader walked its own directory list and only ever tried my-tm.conf.
+	## Adversarial: the bare name is the ONLY config there is.
+	_cf_v1="$CONFIG_SITE_DIR"; _cf_v2="$HOME"
+	_cf_v3="$SITE_CONF_DIR_SEARCH"; _cf_v4="$SITE_CONF_DIR_FROM_ENV"
+	_cf_d="$T_ROOT/site-bare"; mkdir -p "$_cf_d" "$T_ROOT/home-bare"
+	printf 'ID_LEN=6\n' >"$_cf_d/my-tm"
+	CONFIG_SITE_DIR="$_cf_d"; HOME="$T_ROOT/home-bare"
+	SITE_CONF_DIR_SEARCH="$T_ROOT/nowhere-bare"; SITE_CONF_DIR_FROM_ENV=0
+	_cf_found=$(config_search_first | tail -n 1)
+	CONFIG_SITE_DIR="$_cf_v1"; HOME="$_cf_v2"
+	SITE_CONF_DIR_SEARCH="$_cf_v3"; SITE_CONF_DIR_FROM_ENV="$_cf_v4"
+	t_eq "a config under the bare name is actually loaded" "$_cf_found" "$_cf_d/my-tm"
+	rm -rf "$_cf_d" "$T_ROOT/home-bare"
 
 	## What a user with no config is TOLD to do. Ordered by how often each
 	## place is the right answer -- site, then system, then user -- which is
@@ -7048,6 +7250,10 @@ run_tests() {
 	t_test_lsof_never_answers
 	t_test_install_builds_no_tree
 	t_test_runs_without_home
+	t_test_autodetect_mode
+	t_test_cache_unreadable
+	t_test_install_config
+	t_test_install_logs
 	t_test_ejected_destination
 	t_test_auto_mount_destinations
 	t_test_verify_reports

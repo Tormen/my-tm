@@ -691,7 +691,8 @@ change before making it.
 
 1. creates `$CACHE_DIR` and `$MOUNT_ROOT` — owner `root`, group `$TM_GROUP`
    (empty by default: the invoking user's primary group), mode `0750`: root
-   writes, the group reads, others see nothing. Everything a non-root run needs
+   writes, the group reads, others see nothing — files inside likewise, `0640`.
+   Everything a non-root run needs
    to write goes to that user's own overlay and log dirs (§13), created on
    first use.
 2. checks `/etc/synthetic.conf` for the firmlink and adds it if missing, with
@@ -1006,12 +1007,14 @@ several users and root each to rescan. An unprivileged run reads the shared
 set and writes what it may not share into its own overlay; index queries pass
 both sets to `locate -d`, so an unprivileged `--index` is still useful — to
 that user — until a root run folds the work in. Deterministic IDs (§5) mean
-concurrent writers can never disagree. Writes are atomic (tmpfile + `mv`).
+concurrent writers can never disagree. Writes are atomic (tmpfile + `mv`), and a written file takes its mode from its
+directory: group-readable (`0640`) where the directory lets the group read,
+private (`0600`) elsewhere, never world-readable — my-tm runs under `umask 027`.
 Caches are line-oriented TSV: greppable, human-readable, rebuilt by `--refresh`.
 `--status`'s footer reports their size, so they never grow unnoticed.
 
 **Neutral defaults, site values in the config.** Every default built into
-my-tm is generic — `/var/lib/my-tm`, `/var/log/my-tm`, job labels under
+my-tm is generic — `/var/lib/my-tm`, `~/Library/Logs/my-tm` (`$LOG_DIR`, which the daemons use too), job labels under
 `local.my-tm.*`, no group, no notifier. Anything that reflects one site's
 conventions (a private reverse-domain for launchd labels, a shared admin group,
 a site-wide config directory, a preferred notifier) is set in the config file,
@@ -1022,7 +1025,8 @@ location below, and it is deliberate.
 
 Config search order (first wins): `$MY_TM_CONFIG` · `--config FILE` ·
 `$SITE_CONF_DIR` **when it was set in the environment** ·
-`/LINKS/default/my-tm.conf` · `$SITE_CONF_DIR/my-tm.conf` · `~/.my-tm.conf` ·
+`/LINKS/default/my-tm.conf` (or the bare `/LINKS/default/my-tm`) ·
+`$SITE_CONF_DIR/my-tm.conf` · `~/.my-tm.conf` ·
 `/etc/my-tm.conf` · `/usr/local/etc/my-tm.conf`. Plain shell, `.`-sourced.
 `--create-config` prints it (or writes `FILE`, never overwriting); with no
 config anywhere, my-tm names every path it searched, one ready-to-run
@@ -1047,10 +1051,15 @@ degenerates to plain "the local one wins" whenever the local file is complete.
 `--install` needs a config to exist (`$MY_TM_CONFIG`, `--config`, or one already
 in the search order) and refuses with a one-line pointer to `--create-config`
 otherwise: it installs job labels, directories and a group that are all
-site-specific, and guessing them is worse than asking. It copies the file you
-point it at to `$SITE_CONF_DIR/my-tm.conf` — **renamed**, so a
-`my-tm.local.conf` you keep out of version control lands as the plain
-`my-tm.conf` the search order expects.
+site-specific, and guessing them is worse than asking.
+
+When a plain run would already find a config, `--install` copies **nothing** —
+a second copy would only drift — and if that config differs from the one you
+pointed it at, it prints the `vimdiff` that merges them. Only when a plain run
+would find none does it copy the file to `$SITE_CONF_DIR/my-tm.conf` —
+**renamed**, so a `my-tm.local.conf` you keep out of version control lands as
+the plain `my-tm.conf`. It never overwrites a different file there (it offers
+`vimdiff` instead), and says so when a plain run would not look there either.
 
 ```sh
 # Locations live in $CACHE_DIR/locations.tsv, maintained by --add / --forget —
