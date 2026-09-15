@@ -4630,6 +4630,119 @@ plist_schedule() {
 }
 
 ## write_job <label> <schedule> <arg>...
+## The launcher's C source, carried INSIDE my-tm: the installed copy has no
+## source tree beside it and must not know where one lives. The project's
+## my-tm-launcher.c holds the same bytes, and the suite fails if they differ.
+launcher_source() {
+	cat <<'_LAUNCHER_C_EOF'
+/*
+ * my-tm-launcher -- runs ONE program, fixed when this file is compiled, with
+ * the arguments it was given, and nothing else.
+ *
+ * It exists to hold macOS Full Disk Access for my-tm's LaunchDaemons. macOS
+ * grants that access per program; the jobs would otherwise run /bin/dash,
+ * and a grant on /bin/dash would cover every dash script on the Mac.
+ *
+ * Built by `my-tm --install` when JOBS_RUN_WITH_FULL_DISK_ACCESS=1: compiled,
+ * then ad-hoc signed. The program path and the hash of this source are
+ * compiled in, never written here:
+ *     -DMY_TM_PATH='"/path/to/my-tm"' -DLAUNCHER_SOURCE_HASH='"<md5>"'
+ * macOS ties the grant to that exact build, so a rebuild needs granting again.
+ */
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+
+#ifndef MY_TM_PATH
+#error "build with -DMY_TM_PATH='\"/path/to/my-tm\"'"
+#endif
+#ifndef LAUNCHER_SOURCE_HASH
+#define LAUNCHER_SOURCE_HASH "unknown"
+#endif
+
+static void explain(FILE *out)
+{
+	fprintf(out,
+	    "usage: my-tm-launcher [--help] [--version] <MY-TM-ARGUMENTS>\n"
+	    "\n"
+	    "Runs %s with the arguments given, and nothing else.\n"
+	    "It holds Full Disk Access for the my-tm LaunchDaemons, so the jobs can\n"
+	    "look inside network volumes and verify backups. That access is granted in\n"
+	    "System Settings > Privacy & Security > Full Disk Access.\n"
+	    "Built and installed by `my-tm --install` (JOBS_RUN_WITH_FULL_DISK_ACCESS=1).\n",
+	    MY_TM_PATH);
+}
+
+int main(int argc, char *argv[])
+{
+	if (argc == 1) {
+		explain(stderr);
+		return 64;
+	}
+	if (argc == 2 && strcmp(argv[1], "--help") == 0) {
+		explain(stdout);
+		return 0;
+	}
+	if (argc == 2 && strcmp(argv[1], "--version") == 0) {
+		printf("my-tm-launcher (runs %s, source %s)\n", MY_TM_PATH, LAUNCHER_SOURCE_HASH);
+		return 0;
+	}
+	argv[0] = (char *)MY_TM_PATH;
+	execv(MY_TM_PATH, argv);
+	perror("my-tm-launcher: cannot run " MY_TM_PATH);
+	return 126;
+}
+_LAUNCHER_C_EOF
+}
+
+## md5 of that source -- what the launcher's --version reports, so a stale
+## build is recognisable.
+launcher_source_hash() {
+	_lh_f=$(mktemp /tmp/my-tm.lsrc.XXXXXX) || return 1
+	launcher_source >"$_lh_f"
+	md5_file "$_lh_f"
+	rm -f "$_lh_f"
+}
+
+## Build the launcher for MY-TM-PATH into OUT: compile with that path and the
+## source hash baked in, then ad-hoc sign it as my-tm-launcher. OUT is written
+## only when both steps succeed. The path is pasted into a compiler define, so
+## a quote or backslash in it would inject code: such a path is refused.
+launcher_build() {
+	_lb_bin="$1"; _lb_out="$2"
+	case "$_lb_bin" in
+		/*) : ;;
+		*) warn "the launcher needs an absolute my-tm path, not '$_lb_bin'"; return 1 ;;
+	esac
+	case "$_lb_bin" in
+		*'"'*|*\\*) warn "cannot build the launcher for a path with a quote or backslash: $_lb_bin"; return 1 ;;
+	esac
+	for _lb_tool in clang codesign; do
+		command -v "$_lb_tool" >/dev/null 2>&1 ||
+			{ warn "cannot build the launcher: $_lb_tool is not installed"; return 1; }
+	done
+	_lb_dir=$(mktemp -d /tmp/my-tm.launcher.XXXXXX) || return 1
+	launcher_source >"$_lb_dir/my-tm-launcher.c"
+	_lb_hash=$(md5_file "$_lb_dir/my-tm-launcher.c")
+	if ! run clang -Wall -Wextra -Werror -O2 \
+			-DMY_TM_PATH="\"$_lb_bin\"" -DLAUNCHER_SOURCE_HASH="\"$_lb_hash\"" \
+			-o "$_lb_dir/my-tm-launcher" "$_lb_dir/my-tm-launcher.c" >"$_lb_dir/build.log" 2>&1; then
+		warn "the launcher did not compile:"
+		sed 's/^/     /' "$_lb_dir/build.log" >&2
+		rm -rf "$_lb_dir"
+		return 1
+	fi
+	if ! run codesign -s - -f -i my-tm-launcher "$_lb_dir/my-tm-launcher" >"$_lb_dir/sign.log" 2>&1; then
+		warn "the launcher could not be signed:"
+		sed 's/^/     /' "$_lb_dir/sign.log" >&2
+		rm -rf "$_lb_dir"
+		return 1
+	fi
+	mv -f "$_lb_dir/my-tm-launcher" "$_lb_out" || { rm -rf "$_lb_dir"; return 1; }
+	rm -rf "$_lb_dir"
+	return 0
+}
+
 ## The LaunchDaemon plist for one job, on stdout. Both output streams are
 ## captured -- <label>.log for stdout, <label>.err for stderr: a job without
 ## StandardOutPath discards everything it prints, and --health reports on stdout.
@@ -6947,6 +7060,60 @@ t_test_install_config() {
 ## Adversarial: the location EXISTS and is reachable, so only the gate can
 ## refuse it; a mount point that is a string-prefix of another must not claim
 ## it; and releasing a mount must stay outside the gate entirely.
+## The Full Disk Access launcher. Adversarial where it counts: its arguments
+## must arrive intact (one per line, so "a b" cannot silently split); with no
+## arguments it must run NOTHING; and a quote in the my-tm path -- pasted into a
+## compiler define -- must be refused, not compiled.
+t_test_launcher() {
+	printf '\nThe Full Disk Access launcher\n'
+	_ln_c="$(dirname "$T_MYTM")/my-tm-launcher.c"
+	if [ -f "$_ln_c" ]; then
+		t_eq "the source carried inside my-tm is my-tm-launcher.c, byte for byte" \
+			"$(launcher_source_hash)" "$(md5_file "$_ln_c")"
+	else
+		t_skip "embedded launcher source matches my-tm-launcher.c" "not in a checkout"
+	fi
+	if ! command -v clang >/dev/null 2>&1 || ! command -v codesign >/dev/null 2>&1; then
+		t_skip "building the launcher" "needs clang and codesign"
+		return 0
+	fi
+	_ln_d="$T_ROOT/launcher"; mkdir -p "$_ln_d"
+	# shellcheck disable=SC2016  # writing a script: $@ belongs to the stub
+	printf '#!/bin/dash\nprintf "%%s\\n" "$@" >"%s/ran.args"\n' "$_ln_d" >"$_ln_d/fake-my-tm"
+	chmod 755 "$_ln_d/fake-my-tm"
+	_ln_b="$_ln_d/my-tm-launcher"
+
+	launcher_build "$_ln_d/fake-my-tm" "$_ln_b" >/dev/null 2>&1
+	t_eq "it builds" "$([ -x "$_ln_b" ] && echo built)" "built"
+
+	"$_ln_b" >"$_ln_d/o" 2>"$_ln_d/e"; _ln_rc=$?
+	t_eq "with no arguments it runs nothing, prints no output, exits 64" \
+		"$_ln_rc $(wc -c <"$_ln_d/o" | tr -d ' ') $([ -f "$_ln_d/ran.args" ] && echo ran || echo idle)" "64 0 idle"
+	t_match "and explains itself" "$(cat "$_ln_d/e")" "usage: my-tm-launcher"
+	## each check starts clean, so it fails for its own reason only
+	rm -f "$_ln_d/ran.args"
+	t_eq "--help explains, exits 0, runs nothing" \
+		"$("$_ln_b" --help >/dev/null 2>&1; echo $?) $([ -f "$_ln_d/ran.args" ] && echo ran || echo idle)" "0 idle"
+	t_eq "--version names the program and THIS source" \
+		"$("$_ln_b" --version)" "my-tm-launcher (runs $_ln_d/fake-my-tm, source $(launcher_source_hash))"
+
+	"$_ln_b" --maintenance "a b" >/dev/null 2>&1
+	t_eq "anything else runs the fixed program, arguments intact" \
+		"$(tr '\n' '|' <"$_ln_d/ran.args" 2>/dev/null)" "--maintenance|a b|"
+	rm -f "$_ln_d/ran.args"
+	"$_ln_b" --help extra >/dev/null 2>&1
+	t_eq "--help with more arguments is passed through" \
+		"$(tr '\n' '|' <"$_ln_d/ran.args" 2>/dev/null)" "--help|extra|"
+	t_match "it is ad-hoc signed as my-tm-launcher" "$(codesign -dv "$_ln_b" 2>&1)" "Identifier=my-tm-launcher"
+
+	## a payload that still COMPILES: C joins adjacent string literals, so
+	## '.../a" "b' would build cleanly and quietly run '.../ab' instead
+	launcher_build "$_ln_d/a\" \"b" "$_ln_d/evil" >/dev/null 2>&1
+	t_eq "a my-tm path containing a quote is refused, nothing written" \
+		"$([ -e "$_ln_d/evil" ] && echo written || echo refused)" "refused"
+	rm -rf "$_ln_d"
+}
+
 t_test_network_volume_gate() {
 	printf '\nJobs and network volumes\n'
 	_ng_save="$MOUNT_TABLE_FILE"; _ng_acc="$JOBS_ACCESS_NETWORK_VOLUMES"
@@ -7394,6 +7561,7 @@ run_tests() {
 	t_test_install_logs
 	t_test_job_plist_streams
 	t_test_network_volume_gate
+	t_test_launcher
 	t_test_ejected_destination
 	t_test_auto_mount_destinations
 	t_test_verify_reports
