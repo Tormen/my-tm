@@ -2067,13 +2067,17 @@ tm_refresh() {
 	done <<_EOF
 $_locs
 _EOF
-	tm_write_readme
 	return 0
 }
 
 tm_write_readme() {
 	[ -d "$MOUNT_ROOT" ] || return 0
-	_r=$(tm_root)
+	## Name the firmlink, the path the user types -- not tm_root, which is
+	## $MOUNT_ROOT until the reboot that creates $FIRMLINK. --install runs
+	## BEFORE that reboot, so the text would otherwise be stale the moment it
+	## is reachable, and only --refresh could correct it. Written this way it
+	## is right once, and --install is its only writer.
+	_r="$FIRMLINK"
 	cat <<_EOF | atomic_write "$MOUNT_ROOT/README" 2>/dev/null
 Time Machine snapshots, browsable as ordinary directories.
 
@@ -4596,6 +4600,7 @@ cmd_install() {
 	minor "mounts:     $MOUNT_ROOT"
 	minor "firmlink:   $FIRMLINK -> /$_target  (via $_synth, after a reboot)"
 	minor "jobs:       $MAINT_JOB${HEALTH_INTERVAL:+, $HEALTH_JOB}${BACKUP_SCHEDULE:+, $BACKUP_JOB}"
+	minor "tree:       built by $MAINT_JOB on its first run, not here"
 
 	## a job must not run a binary anyone but root can rewrite
 	if path_is_user_writable "$MY_TM_BIN"; then
@@ -4630,8 +4635,12 @@ cmd_install() {
 		minor "synthetic entries only appear after a reboot; until then my-tm uses $MOUNT_ROOT"
 	fi
 
-	## 3. tree + jobs
-	tm_refresh
+	## 3. the /tm README + jobs
+	## The browse tree is NOT built here. Building it reads every store, and
+	## on a fresh install nothing is cached, so a sparsebundle on a share has
+	## to be attached -- minutes of waiting, for a tree $MAINT_JOB builds on
+	## its first run and that is only reachable as $FIRMLINK after the reboot.
+	tm_write_readme
 	write_job "$MAINT_JOB" "${MAINT_INTERVAL}s" --maintenance
 	if [ -n "$HEALTH_INTERVAL" ] && [ "$HEALTH_INTERVAL" != "0" ] && [ "$HEALTH_INTERVAL" != "false" ]; then
 		_hi=$(parse_interval "$HEALTH_INTERVAL") || _hi=86400
@@ -4640,6 +4649,7 @@ cmd_install() {
 		minor "HEALTH_INTERVAL is empty -- no health daemon installed"
 	fi
 	[ -n "$BACKUP_SCHEDULE" ] && write_job "$BACKUP_JOB" "$BACKUP_SCHEDULE" --backup start
+	note "the $FIRMLINK tree is built by $MAINT_JOB on its first run -- to build it now: $US --refresh"
 
 	## 4. the config, under the name the search order expects
 	_src=$(printf '%s' "$CONFIG_SOURCED" | awk '{print $NF}')
@@ -6670,6 +6680,47 @@ t_test_previous_is_not_a_state() {
 ## observed live, where even `lsof /tmp` never returned. The sweep runs from a
 ## daemon every MAINT_INTERVAL seconds, so an unbounded wait there stops the
 ## daemon for good. Adversarial first: the test is the lsof that NEVER answers.
+## REGRESSION: --install built the /tm tree, which reads every store. On a
+## fresh install nothing is cached, so it attached a sparsebundle over a share
+## and sat for minutes on work the maintenance job does on its first run.
+## cmd_install writes /etc/synthetic.conf and LaunchDaemons, so it cannot run
+## here; this reads its body from the script instead.
+t_test_install_builds_no_tree() {
+	printf '\n--install leaves the tree to the maintenance job\n'
+	_ib=$(sed -n '/^cmd_install() {$/,/^}$/p' "$T_MYTM")
+	t_eq "the function body was found" \
+		"$([ -n "$_ib" ] && echo found)" "found"
+	t_eq "it does not build the tree" \
+		"$(printf '%s\n' "$_ib" | grep -v '^[[:space:]]*#' | count_match 'tm_refresh')" "0"
+	t_eq "it still writes the /tm README" \
+		"$(printf '%s\n' "$_ib" | grep -v '^[[:space:]]*#' | count_match 'tm_write_readme')" "1"
+
+	## /tm/README has ONE writer, --install. That holds only because its text
+	## names $FIRMLINK: were it built from tm_root, it would name $MOUNT_ROOT
+	## until the reboot that creates the firmlink, and need rewriting after.
+	_rb=$(sed -n '/^tm_refresh() {$/,/^}$/p' "$T_MYTM")
+	t_eq "--refresh does not rewrite the README" \
+		"$(printf '%s\n' "$_rb" | grep -v '^[[:space:]]*#' | count_match 'tm_write_readme')" "0"
+	## Adversarial: a firmlink that does NOT exist yet -- the state --install
+	## writes in. A real /tm on the machine running the suite would let a
+	## tm_root-based README pass too, and prove nothing.
+	_fl_save="$FIRMLINK"; FIRMLINK="$T_ROOT/firmlink-not-created-yet"
+	need_dir "$MOUNT_ROOT"
+	tm_write_readme
+	t_eq "the README names the firmlink before it exists" \
+		"$(count_match "$FIRMLINK/<location>/<snapshot>" < "$MOUNT_ROOT/README")" "1"
+	t_eq "and never the mount root" \
+		"$(count_match "$MOUNT_ROOT/<location>" < "$MOUNT_ROOT/README")" "0"
+	FIRMLINK="$_fl_save"
+	## fixed-string matches: the text looked for is the SOURCE, with its '$'
+	# shellcheck disable=SC2016  # the literal source text is matched, not a variable
+	t_eq "the plan says who builds the tree" \
+		"$(printf '%s\n' "$_ib" | count_match 'tree:       built by $MAINT_JOB on its first run, not here')" "1"
+	# shellcheck disable=SC2016  # the literal source text is matched, not a variable
+	t_eq "and the user is told how to build it now" \
+		"$(printf '%s\n' "$_ib" | count_match 'to build it now: $US --refresh')" "1"
+}
+
 t_test_lsof_never_answers() {
 	printf '\nA wedged lsof must not stop the sweep\n'
 	_lt_save="$LSOF_TIMEOUT"; LSOF_TIMEOUT=2
@@ -6969,6 +7020,7 @@ run_tests() {
 	t_test_config_search_order
 	t_test_attach_progress
 	t_test_lsof_never_answers
+	t_test_install_builds_no_tree
 	t_test_ejected_destination
 	t_test_auto_mount_destinations
 	t_test_verify_reports

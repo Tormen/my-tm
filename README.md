@@ -516,7 +516,8 @@ It does three cheap things, and a third daemon is not needed for any of them:
 1. **releases mounts** (below);
 2. **refreshes `/tm`** when a location's `backup_manifest.plist` mtime changed —
    a `stat` per location, then a placeholder/symlink rewrite only if something
-   moved. That is what keeps `ls /tm` truthful at all times; without it new
+   moved, and on the job's first run, which is what builds the tree after
+   `--install`. That is what keeps `ls /tm` truthful at all times; without it new
    snapshots are missing from `/tm` and deleted ones leave stale dirs and
    dangling `latest`/`by-id` links until someone happens to run my-tm;
 3. **takes a local snapshot** if `LOCAL_SNAP_INTERVAL` says one is due, and
@@ -626,7 +627,7 @@ line that matches nothing real is dropped, not obeyed.
 
 `/tm/<loc>/<ts>/` directories are shown as **empty placeholders** when nothing
 is mounted, so `ls` still tells you which snapshots exist. An empty
-`/tm/local` means **you have no local APFS snapshots yet** — `/tm/README` says so — and
+`/tm/local` means **you have no local APFS snapshots yet**, and
 my-tm mounts what does exist for you on `--mount`, `--open`, `--cat`, `--cp`
 and `--diff`.
 
@@ -712,6 +713,13 @@ change before making it.
    a path writable by neither group nor other; `--install` verifies that of the
    binary it registers and refuses a path inside any user-writable tree (such
    as a source checkout), naming the fix.
+
+   It does **not** build the `/tm` tree. Building it reads every store, and on
+   a fresh install nothing is cached, so a sparsebundle on a share would have
+   to be attached — minutes of waiting, for a tree that `$MAINT_JOB` builds on
+   its first run and that only becomes reachable as `/tm` after the reboot.
+   `--install` says so in one line and names `my-tm --refresh` for building it
+   at once.
 4. writes the completion file to the **invoking** user's
    `~/.zsh/completions/_my-tm` (`$SUDO_USER`'s home, owned by them, never
    root's), and only when the content differs — that also happens on every
