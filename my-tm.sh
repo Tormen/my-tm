@@ -4403,6 +4403,46 @@ backup_volume() {
 	return 0
 }
 
+## Time Machine's own record of the last attempt on a destination. 0 is a
+## success; anything else is a failure. tmutil's exit code is NOT that answer:
+## on horse `tmutil startbackup --block` exited 0 while Time Machine recorded
+## 704 and wrote no snapshot at all.
+TM_PREFS_PLIST="/Library/Preferences/com.apple.TimeMachine.plist"
+## where mounted volumes appear; overridden by the tests only
+VOLUMES_DIR="/Volumes"
+
+tm_result_for() {
+	_tr_id="${1:-}"
+	[ -n "$_tr_id" ] || return 1
+	[ -f "$TM_PREFS_PLIST" ] || return 1
+	_tr_n=0
+	while [ "$_tr_n" -lt 32 ]; do
+		_tr_d=$(plutil -extract "Destinations.$_tr_n.DestinationID" raw -o - "$TM_PREFS_PLIST" 2>/dev/null) || return 1
+		if [ "$_tr_d" = "$_tr_id" ]; then
+			## no RESULT yet (a destination never backed up to) counts as 0
+			plutil -extract "Destinations.$_tr_n.RESULT" raw -o - "$TM_PREFS_PLIST" 2>/dev/null ||
+				printf '0\n'
+			return 0
+		fi
+		_tr_n=$(( _tr_n + 1 ))
+	done
+	return 1
+}
+
+## the destination id tmutil knows a volume by -- matched on the volume NAME or
+## on the last component of its mount point, since "Mount Point" is printed
+## only while it is mounted
+backup_destination_id() {
+	tmutil destinationinfo 2>/dev/null | awk -v v="${1:-}" '
+		/^Name/ { sub(/^[^:]*: */, ""); name = $0 }
+		/^Mount Point/ { sub(/^[^:]*: */, ""); mp = $0 }
+		/^ID/ { sub(/^[^:]*: */, ""); id = $0
+			n = mp; sub(/.*\//, "", n)
+			if (!f && (name == v || n == v)) { print id; f = 1 }
+			name = ""; mp = ""; id = "" }
+		END { exit(f ? 0 : 1) }'
+}
+
 ## What happens to the disk when a backup finishes, for one location: its
 ## POST_BACKUP (set_location_parameters), else POST_BACKUP_DEFAULT. An unknown
 ## value is a config error, not a silent fallback.
@@ -4434,6 +4474,22 @@ loc_is_quiet() {
 ## spin it down on its own timer, which is what an enclosure that does not
 ## survive an eject needs.  Retries are shared: both can lose to a straggler
 ## holding the volume open.
+## An interrupted run leaves .inprogress / .interrupted directories behind, and
+## Time Machine's structure check then refuses the whole store ("Expected
+## SnapshotInProgressContainer metadata type ..."). Naming them turns an opaque
+## RESULT into something actionable.
+backup_leftovers_hint() {
+	_bl_v="${1:-}"
+	## the directory volumes appear under; a variable so the tests can look
+	## somewhere they are allowed to create one
+	_bl_d="${VOLUMES_DIR:-/Volumes}/$_bl_v"
+	[ -n "$_bl_v" ] && [ -d "$_bl_d" ] || return 0
+	_bl_n=$(find "$_bl_d" -maxdepth 1 \( -name '*.inprogress' -o -name '*.interrupted' \) 2>/dev/null | count_lines)
+	[ "$_bl_n" -gt 0 ] || return 0
+	note "$_bl_n interrupted leftover(s) on $_bl_v -- Time Machine refuses the store until they are gone ($US --health lists them)"
+	return 0
+}
+
 do_post_backup() {
 	_pv=$(backup_volume)
 	[ -n "$_pv" ] || {
@@ -4525,12 +4581,25 @@ cmd_backup() {
 	run tmutil startbackup --block
 	## its own name: the cache writers below set _rc
 	_bk_rc=$?
+	## tmutil's exit code alone is not the truth: ask Time Machine what it
+	## recorded for this destination, and print both next to the conclusion
+	_bk_res=""
+	_bk_did=$(backup_destination_id "$_bv") && _bk_res=$(tm_result_for "$_bk_did")
+	_bk_raw="rc $_bk_rc, Time Machine RESULT ${_bk_res:-?}"
 	case "$_bk_rc" in
-		0) msg "backup finished"
-		   [ "$NOTIFY_END" = "1" ] && notify "Time Machine backup finished" ;;
-		3) msg "a backup was already running"
+		0) if [ -n "$_bk_res" ] && [ "$_bk_res" != "0" ]; then
+			   warn "Time Machine recorded a FAILURE for ${_bv:-the destination} [$_bk_raw] -- nothing was written"
+			   backup_leftovers_hint "$_bv"
+			   [ "$NOTIFY_END" = "1" ] && notify "Time Machine backup FAILED (RESULT $_bk_res)"
+			   _bk_rc=1
+		   else
+			   msg "backup finished [$_bk_raw]"
+			   [ "$NOTIFY_END" = "1" ] && notify "Time Machine backup finished"
+		   fi ;;
+		3) msg "a backup was already running [$_bk_raw]"
 		   [ "$NOTIFY_END" = "1" ] && notify "Time Machine backup already in progress" ;;
-		*) warn "backup FAILED (rc=$_bk_rc)"
+		*) warn "backup FAILED [$_bk_raw]"
+		   backup_leftovers_hint "$_bv"
 		   [ "$NOTIFY_END" = "1" ] && notify "Time Machine backup FAILED ($_bk_rc)" ;;
 	esac
 	## re-read the table of the disk just backed up WHILE it is still mounted:
@@ -8078,6 +8147,76 @@ t_test_config_search_order() {
 ## disk was unmounted when --backup start ran, tmutil printed no "Mount Point",
 ## backup_volume resolved to nothing, and POST_BACKUP then did nothing at all --
 ## silently, because that line was only shown under -V.
+## Reporting what Time Machine actually did. Adversarial: on horse
+## `tmutil startbackup --block` exited 0, my-tm printed "backup finished", and
+## Time Machine had recorded RESULT 704 and written no snapshot -- the run left
+## .inprogress leftovers that its structure check rejects.
+# shellcheck disable=SC2031  # its own subshells set these on purpose
+t_test_backup_result() {
+	printf '\nThe recorded Time Machine result decides\n'
+	_tr_save="$TM_PREFS_PLIST"; _tr_v="$BACKUP_VOLUME"; _tr_p="$POST_BACKUP_DEFAULT"
+	_tr_plist="$T_ROOT/tm.plist"
+	t_tm_plist() {
+		{
+			printf '<?xml version="1.0" encoding="UTF-8"?>\n'
+			printf '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+			printf '<plist version="1.0"><dict><key>Destinations</key><array>\n'
+			printf '<dict><key>DestinationID</key><string>OTHER-ID</string><key>RESULT</key><integer>0</integer></dict>\n'
+			printf '<dict><key>DestinationID</key><string>11111111-2222-3333-4444-555555555555</string><key>RESULT</key><integer>%s</integer></dict>\n' "$1"
+			printf '</array></dict></plist>\n'
+		} >"$_tr_plist"
+	}
+	TM_PREFS_PLIST="$_tr_plist"
+
+	t_tm_plist 704
+	t_eq "the result is read for the matching destination, not the first one" \
+		"$(tm_result_for 11111111-2222-3333-4444-555555555555)" "704"
+	t_eq "and for the other one" "$(tm_result_for OTHER-ID)" "0"
+	if tm_result_for NO-SUCH-ID >/dev/null 2>&1; then
+		t_bad "an unknown destination must not resolve" ""
+	else
+		t_ok "an unknown destination does not resolve"
+	fi
+	t_eq "the stub's destination id is found by volume name" \
+		"$(backup_destination_id store)" "11111111-2222-3333-4444-555555555555"
+
+	## a run tmutil calls success, which Time Machine recorded as a failure
+	# shellcheck disable=SC2030  # the settings are meant to stay in the subshell
+	( is_root() { return 0; }
+	  LOCKFILE="$T_ROOT/tr.lock"; BACKUP_VOLUME="store"; unset BACKUP_VOLUME_RESOLVED
+	  POST_BACKUP_DEFAULT="none"; NOTIFY_BEGIN=0; NOTIFY_END=0
+	  cmd_backup start ) >"$T_ROOT/tr.out" 2>&1
+	_tr_o=$(cat "$T_ROOT/tr.out")
+	t_match "a recorded failure is reported as one" "$_tr_o" "recorded a FAILURE"
+	t_match "with both raw values beside it" "$_tr_o" "rc 0, Time Machine RESULT 704"
+	t_eq "and never as finished" "$(printf '%s\n' "$_tr_o" | count_match 'backup finished')" "0"
+
+	## the same run, recorded as a success
+	t_tm_plist 0
+	( is_root() { return 0; }
+	  LOCKFILE="$T_ROOT/tr.lock"; BACKUP_VOLUME="store"; unset BACKUP_VOLUME_RESOLVED
+	  POST_BACKUP_DEFAULT="none"; NOTIFY_BEGIN=0; NOTIFY_END=0
+	  cmd_backup start ) >"$T_ROOT/tr.out" 2>&1
+	_tr_o=$(cat "$T_ROOT/tr.out")
+	t_match "RESULT 0 is a finished backup" "$_tr_o" "backup finished"
+	t_match "and says so with the raw values" "$_tr_o" "rc 0, Time Machine RESULT 0"
+
+	## leftovers are named, since they are what the store is refused for
+	_tr_vd="$VOLUMES_DIR"; VOLUMES_DIR="$T_ROOT/vols"
+	mkdir -p "$VOLUMES_DIR/store/2026-09-16-010719.inprogress"
+	t_eq "an interrupted leftover is named" \
+		"$(backup_leftovers_hint store 2>&1 | count_match 'interrupted leftover')" "1"
+	rmdir "$VOLUMES_DIR/store/2026-09-16-010719.inprogress"
+	t_eq "and a clean store says nothing" \
+		"$(backup_leftovers_hint store 2>&1 | count_match 'interrupted leftover')" "0"
+	VOLUMES_DIR="$_tr_vd"
+
+	rm -f "$T_ROOT/tr.lock" "$T_ROOT/tr.out" "$_tr_plist"
+	TM_PREFS_PLIST="$_tr_save"; BACKUP_VOLUME="$_tr_v"; POST_BACKUP_DEFAULT="$_tr_p"
+	unset BACKUP_VOLUME_RESOLVED
+	return 0
+}
+
 # shellcheck disable=SC2031  # a neighbouring test sets these inside its own subshell
 t_test_backup_volume_unmounted() {
 	printf '\nThe backup destination resolves while unmounted\n'
@@ -8315,6 +8454,7 @@ run_tests() {
 	t_test_post_backup
 	t_test_backup_already_running
 	t_test_backup_volume_unmounted
+	t_test_backup_result
 	t_test_config_search_order
 	t_test_attach_progress
 	t_test_lsof_never_answers
