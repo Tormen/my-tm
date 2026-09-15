@@ -10,6 +10,17 @@
 
 set -u
 
+## A LaunchDaemon starts with a near-empty environment: no HOME. Under set -u
+## the first "$HOME" below then kills the script before it does anything --
+## every job --install writes died that way ("HOME: unbound variable"). Take
+## the home directory from the passwd entry, the same place login does, and
+## export it for the tools my-tm runs. Should even that come back empty, the
+## paths built on it degrade instead of the script crashing.
+if [ -z "${HOME:-}" ]; then
+	HOME=$(id -P 2>/dev/null | awk -F: '{print $9}')
+	export HOME
+fi
+
 US="${0##*/}"
 MY_TM_VERSION="0.9.2"
 
@@ -6685,6 +6696,21 @@ t_test_previous_is_not_a_state() {
 ## and sat for minutes on work the maintenance job does on its first run.
 ## cmd_install writes /etc/synthetic.conf and LaunchDaemons, so it cannot run
 ## here; this reads its body from the script instead.
+## REGRESSION: launchd starts a daemon with no HOME, and under set -u the first
+## "$HOME" in the defaults killed the script before it did anything -- every
+## job --install wrote exited 1 at once. Adversarial: run the WHOLE script in
+## that environment, not a unit of it, since the crash is at load time.
+t_test_runs_without_home() {
+	printf '\nA daemon environment without HOME\n'
+	_nh_err="$T_ROOT/nohome.err"
+	env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin "$T_MYTM" --version >/dev/null 2>"$_nh_err"
+	_nh_rc=$?
+	t_eq "the script runs with no HOME at all" "$_nh_rc" "0"
+	t_eq "and nothing is reported unbound" \
+		"$(count_match 'unbound variable' < "$_nh_err")" "0"
+	rm -f "$_nh_err"
+}
+
 t_test_install_builds_no_tree() {
 	printf '\n--install leaves the tree to the maintenance job\n'
 	_ib=$(sed -n '/^cmd_install() {$/,/^}$/p' "$T_MYTM")
@@ -7021,6 +7047,7 @@ run_tests() {
 	t_test_attach_progress
 	t_test_lsof_never_answers
 	t_test_install_builds_no_tree
+	t_test_runs_without_home
 	t_test_ejected_destination
 	t_test_auto_mount_destinations
 	t_test_verify_reports
