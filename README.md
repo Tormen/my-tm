@@ -1014,7 +1014,7 @@ Caches are line-oriented TSV: greppable, human-readable, rebuilt by `--refresh`.
 `--status`'s footer reports their size, so they never grow unnoticed.
 
 **Neutral defaults, site values in the config.** Every default built into
-my-tm is generic — `/var/lib/my-tm`, `~/Library/Logs/my-tm` (`$LOG_DIR`, which the daemons use too), job labels under
+my-tm is generic — `/var/lib/my-tm`, `~/Library/Logs/my-tm` (`$LOG_DIR`, which the daemons use too: each job's stdout goes to `<label>.log`, its stderr to `<label>.err`), job labels under
 `local.my-tm.*`, no group, no notifier. Anything that reflects one site's
 conventions (a private reverse-domain for launchd labels, a shared admin group,
 a site-wide config directory, a preferred notifier) is set in the config file,

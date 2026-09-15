@@ -4569,26 +4569,33 @@ plist_schedule() {
 }
 
 ## write_job <label> <schedule> <arg>...
+## The LaunchDaemon plist for one job, on stdout. Both output streams are
+## captured -- <label>.log for stdout, <label>.err for stderr: a job without
+## StandardOutPath discards everything it prints, and --health reports on stdout.
+job_plist() {
+	_jp_label="$1"; _jp_sched="$2"; shift 2
+	_jp_args=""
+	for _jp_a in "$@"; do
+		_jp_args="$_jp_args		<string>$_jp_a</string>
+"
+	done
+	printf '<?xml version="1.0" encoding="UTF-8"?>\n'
+	printf '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+	printf '<plist version="1.0">\n<dict>\n'
+	printf '\t<key>Label</key>\n\t<string>%s</string>\n' "$_jp_label"
+	printf '\t<key>ProgramArguments</key>\n\t<array>\n\t\t<string>%s</string>\n%s\t</array>\n' \
+		"$MY_TM_BIN" "$_jp_args"
+	plist_schedule "$_jp_sched"
+	printf '\t<key>StandardOutPath</key>\n\t<string>%s/%s.log</string>\n' "$LOG_DIR_ROOT" "$_jp_label"
+	printf '\t<key>StandardErrorPath</key>\n\t<string>%s/%s.err</string>\n' "$LOG_DIR_ROOT" "$_jp_label"
+	printf '</dict>\n</plist>\n'
+}
+
 write_job() {
 	_label="$1"; _sched="$2"; shift 2
 	_prog="$MY_TM_BIN"
 	_pl="/Library/LaunchDaemons/$_label.plist"
-	_args=""
-	for _a in "$@"; do
-		_args="$_args		<string>$_a</string>
-"
-	done
-	{
-		printf '<?xml version="1.0" encoding="UTF-8"?>\n'
-		printf '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
-		printf '<plist version="1.0">\n<dict>\n'
-		printf '\t<key>Label</key>\n\t<string>%s</string>\n' "$_label"
-		printf '\t<key>ProgramArguments</key>\n\t<array>\n\t\t<string>%s</string>\n%s\t</array>\n' \
-			"$_prog" "$_args"
-		plist_schedule "$_sched"
-		printf '\t<key>StandardErrorPath</key>\n\t<string>%s/%s.err</string>\n' "$LOG_DIR_ROOT" "$_label"
-		printf '</dict>\n</plist>\n'
-	} >"$_pl" || return 1
+	job_plist "$_label" "$_sched" "$@" >"$_pl" || return 1
 	plutil -lint "$_pl" >/dev/null 2>&1 || { warn "$_pl did not lint"; return 1; }
 	msg "installed job $_label"
 	minor "$_pl -> $_prog $*"
@@ -6873,6 +6880,25 @@ t_test_install_config() {
 }
 
 ## The daemons' logs follow LOG_DIR. cmd_install needs root, so its body is read.
+## REGRESSION: the job plists captured stderr only, so everything a daemon
+## printed on stdout was discarded -- the whole --health report included.
+t_test_job_plist_streams() {
+	printf '\nDaemon plists capture both output streams\n'
+	_jt_bin="${MY_TM_BIN:-}"; _jt_log="${LOG_DIR_ROOT:-}"
+	MY_TM_BIN="/usr/local/sbin/my-tm"; LOG_DIR_ROOT="$T_ROOT/logs"
+	_jt_f="$T_ROOT/job.plist"
+	job_plist test.my-tm.job 86400s --health >"$_jt_f"
+	t_eq "the plist lints" "$(plutil -lint "$_jt_f" >/dev/null 2>&1 && echo ok)" "ok"
+	t_eq "stdout is captured, as <label>.log" \
+		"$(plutil -extract StandardOutPath raw -o - "$_jt_f" 2>/dev/null)" "$T_ROOT/logs/test.my-tm.job.log"
+	t_eq "stderr is captured, as <label>.err" \
+		"$(plutil -extract StandardErrorPath raw -o - "$_jt_f" 2>/dev/null)" "$T_ROOT/logs/test.my-tm.job.err"
+	t_eq "the job runs the installed binary with its arguments" \
+		"$(plutil -extract ProgramArguments.1 raw -o - "$_jt_f" 2>/dev/null)" "--health"
+	rm -f "$_jt_f"
+	MY_TM_BIN="$_jt_bin"; LOG_DIR_ROOT="$_jt_log"
+}
+
 t_test_install_logs() {
 	printf '\nDaemon logs follow LOG_DIR\n'
 	_il=$(sed -n '/^cmd_install() {$/,/^}$/p' "$T_MYTM")
@@ -7254,6 +7280,7 @@ run_tests() {
 	t_test_cache_unreadable
 	t_test_install_config
 	t_test_install_logs
+	t_test_job_plist_streams
 	t_test_ejected_destination
 	t_test_auto_mount_destinations
 	t_test_verify_reports
