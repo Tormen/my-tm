@@ -4382,8 +4382,15 @@ backup_volume() {
 	if [ -n "$BACKUP_VOLUME" ]; then
 		BACKUP_VOLUME_RESOLVED="$BACKUP_VOLUME"
 	else
-		_bv_mp=$(tmutil destinationinfo 2>/dev/null |
+		_bv_out=$(tmutil destinationinfo 2>/dev/null)
+		## "Mount Point" is printed only while the destination is MOUNTED. A disk
+		## my-tm ejected after the last backup has none, and resolving to nothing
+		## silently skipped both the pre-backup mount and POST_BACKUP -- seen on
+		## horse. Fall back to the destination's Name, which is always printed.
+		_bv_mp=$(printf '%s\n' "$_bv_out" |
 			sed -nE 's/^[[:space:]]*Mount Point[[:space:]]*:[[:space:]]*(.*)$/\1/p')
+		[ -n "$_bv_mp" ] || _bv_mp=$(printf '%s\n' "$_bv_out" |
+			sed -nE 's/^[[:space:]]*Name[[:space:]]*:[[:space:]]*(.*)$/\1/p')
 		_bv_n=$(printf '%s\n' "$_bv_mp" | count_lines)
 		case "$_bv_n" in
 			0) BACKUP_VOLUME_RESOLVED="" ;;
@@ -4430,7 +4437,8 @@ loc_is_quiet() {
 do_post_backup() {
 	_pv=$(backup_volume)
 	[ -n "$_pv" ] || {
-		why "no backup destination to act on"
+		## silence here once hid a POST_BACKUP that never ran
+		warn "no backup destination to act on -- POST_BACKUP did nothing; name one with BACKUP_VOLUME in the config"
 		return 0
 	}
 	## the location this volume IS, so its own POST_BACKUP applies: the same
@@ -8066,6 +8074,54 @@ t_test_config_search_order() {
 ## anyway, cutting Time Machine's run off. And the lookup for the volume's
 ## location must CONSUME locations_all: an early exit closed the pipe and the
 ## producer took a SIGPIPE ("write error: Broken pipe").
+## Resolving the destination when it is NOT mounted. Adversarial: on horse the
+## disk was unmounted when --backup start ran, tmutil printed no "Mount Point",
+## backup_volume resolved to nothing, and POST_BACKUP then did nothing at all --
+## silently, because that line was only shown under -V.
+# shellcheck disable=SC2031  # a neighbouring test sets these inside its own subshell
+t_test_backup_volume_unmounted() {
+	printf '\nThe backup destination resolves while unmounted\n'
+	_bu_v="$BACKUP_VOLUME"; _bu_p="$POST_BACKUP_DEFAULT"
+	_bu_stub="$(t_stub_dir)/tmutil"; cp -p "$_bu_stub" "$T_ROOT/tmutil.bu"
+
+	## one destination, no Mount Point line: exactly horse's case
+	# shellcheck disable=SC2016  # writing a script: its $1 and $@ are the stub's own
+	{
+		printf '#!/bin/sh\n'
+		printf 'if [ "$1" = "destinationinfo" ]; then\n'
+		printf '\tprintf "====\\nName          : TimeMachine.Horse\\nKind          : Local\\nID            : 1111\\n"\n'
+		printf '\texit 0\n'
+		printf 'fi\n'
+		printf 'exec "%s" "$@"\n' "$T_ROOT/tmutil.bu"
+	} >"$_bu_stub"
+	chmod 0755 "$_bu_stub"
+	BACKUP_VOLUME=""; unset BACKUP_VOLUME_RESOLVED
+	t_eq "an unmounted destination resolves by its name" "$(backup_volume)" "TimeMachine.Horse"
+
+	## and POST_BACKUP then acts on it
+	: >"$(t_calls)"
+	POST_BACKUP_DEFAULT="eject"; unset BACKUP_VOLUME_RESOLVED
+	do_post_backup >/dev/null 2>&1
+	t_eq "so POST_BACKUP acts on it" \
+		"$(count_match 'diskutil eject /Volumes/TimeMachine.Horse' < "$(t_calls)")" "1"
+
+	## no destination at all: say so, do not fall silent
+	# shellcheck disable=SC2016  # same
+	{
+		printf '#!/bin/sh\n'
+		printf 'if [ "$1" = "destinationinfo" ]; then printf "No destinations configured.\\n"; exit 0; fi\n'
+		printf 'exec "%s" "$@"\n' "$T_ROOT/tmutil.bu"
+	} >"$_bu_stub"
+	chmod 0755 "$_bu_stub"
+	unset BACKUP_VOLUME_RESOLVED
+	_bu_err=$( do_post_backup 2>&1 >/dev/null )
+	t_match "with no destination at all it says so" "$_bu_err" "POST_BACKUP did nothing"
+
+	mv -f "$T_ROOT/tmutil.bu" "$_bu_stub"
+	BACKUP_VOLUME="$_bu_v"; POST_BACKUP_DEFAULT="$_bu_p"; unset BACKUP_VOLUME_RESOLVED
+	return 0
+}
+
 # shellcheck disable=SC2031  # its own subshell sets these on purpose; cmd_backup's EXIT trap needs one
 t_test_backup_already_running() {
 	printf '\nA backup already running is left alone\n'
@@ -8258,6 +8314,7 @@ run_tests() {
 	t_test_version_output
 	t_test_post_backup
 	t_test_backup_already_running
+	t_test_backup_volume_unmounted
 	t_test_config_search_order
 	t_test_attach_progress
 	t_test_lsof_never_answers
