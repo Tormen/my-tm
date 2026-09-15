@@ -4127,7 +4127,9 @@ cmd_rm() {
 		require_root "deleting a backup snapshot"
 	fi
 
+	_rm_locs=""
 	while IFS="$(printf '\t')" read -r _loc _ts _id _u; do
+		_rm_locs="$_rm_locs $_loc"
 		if [ "$(loc_target "$_loc")" = "local" ]; then
 			run tmutil deletelocalsnapshots "$_ts" || warn "$_id: delete failed"
 		else
@@ -4135,7 +4137,11 @@ cmd_rm() {
 		fi
 	done <"$_plan"
 	rm -f "$_plan"
-	snapshots_cache_invalidate
+	## drop the table of each store deleted from, and nothing else: the cache
+	## also holds the last known table of every disk that is away
+	for _rm_h in $(printf '%s' "$_rm_locs" | tr ' ' '\n' | sort -u); do
+		snapshots_cache_drop "$_rm_h"
+	done
 	return 0
 }
 
@@ -4242,6 +4248,8 @@ cmd_thin() {
 
 	while IFS= read -r _h; do
 		[ -n "$_h" ] || continue
+		## kept apart: the functions called below set _h themselves
+		_thin_h="$_h"
 		loc_ready "$_h" || continue
 		## CLI beats per-location beats global
 		_p="$_policy"
@@ -4280,7 +4288,7 @@ cmd_thin() {
 				run tmutil delete -d "$(loc_store_path "$_h")" -t "$_ts" || warn "$_ts: delete failed"
 			fi
 		done
-		snapshots_cache_invalidate
+		snapshots_cache_drop "$_thin_h"
 	done <<_EOF
 $_locs
 _EOF
@@ -4444,18 +4452,25 @@ cmd_backup() {
 	fi
 	[ "$NOTIFY_BEGIN" = "1" ] && notify "Time Machine backup starting"
 	run tmutil startbackup --block
-	_rc=$?
-	case "$_rc" in
+	## its own name: the cache writers below set _rc
+	_bk_rc=$?
+	case "$_bk_rc" in
 		0) msg "backup finished"
 		   [ "$NOTIFY_END" = "1" ] && notify "Time Machine backup finished" ;;
 		3) msg "a backup was already running"
 		   [ "$NOTIFY_END" = "1" ] && notify "Time Machine backup already in progress" ;;
-		*) warn "backup FAILED (rc=$_rc)"
-		   [ "$NOTIFY_END" = "1" ] && notify "Time Machine backup FAILED ($_rc)" ;;
+		*) warn "backup FAILED (rc=$_bk_rc)"
+		   [ "$NOTIFY_END" = "1" ] && notify "Time Machine backup FAILED ($_bk_rc)" ;;
 	esac
+	## re-read the table of the disk just backed up WHILE it is still mounted:
+	## POST_BACKUP may eject it next, and a disk that is away only shows its
+	## last known table
+	for _bk_h in $(locations_all | awk -F'\t' -v t="/Volumes/$_bv" '$2 == t {print $1}'); do
+		snapshots_cache_drop "$_bk_h"
+		snapshots_get "$_bk_h" >/dev/null
+	done
 	do_post_backup
-	snapshots_cache_invalidate
-	return "$_rc"
+	return "$_bk_rc"
 }
 
 #############################################################################
@@ -4640,7 +4655,11 @@ cmd_forget() {
 
 cmd_refresh() {
 	_only="${1:-}"
-	snapshots_cache_invalidate
+	## re-read every table that CAN be read; a disk that is away keeps its last
+	## known one, since nothing could replace it
+	for _rf_h in ${_only:-$(locations_all | awk -F'\t' '{print $1}')}; do
+		loc_reachable "$_rf_h" && snapshots_cache_drop "$_rf_h"
+	done
 	## drop remembered per-file facts too: --refresh is what someone reaches
 	## for when they suspect my-tm is telling them something stale or wrong
 	for _d in $(cache_read_dirs); do
@@ -6508,6 +6527,85 @@ t_test_version_store_generation() {
 
 ## REGRESSION: local snapshots are purgeable -- macOS deletes them at any age.
 ## A cached list produced mounts of snapshots that no longer existed.
+## Commands that change a store re-read THAT store. Adversarial: --rm, --thin,
+## --backup and --refresh must each keep the last known table of a disk that is
+## away (nothing can read it again until the disk is back), and still drop the
+## stale table of the store they changed. Nothing is deleted: tmutil and
+## diskutil are the stubs, and the test refuses to run without them.
+t_test_commands_keep_other_tables() {
+	printf '\nCommands re-read only the store they changed\n'
+	case "$(command -v tmutil)" in
+		"$(t_stub_dir)"/*) : ;;
+		*) t_skip "commands keep other tables" "tmutil is not the stub"; return 0 ;;
+	esac
+	_ck_cf=$(snapshots_cache_file)
+	_ck_lf="$T_ROOT/cache/locations.tsv"
+	cp -p "$_ck_lf" "$T_ROOT/locations.ck"
+	## no ssh fixture: resolving an ID and --refresh read every location
+	awk -F'\t' '$1 != "remote"' "$T_ROOT/locations.ck" >"$_ck_lf"
+	## --refresh also drops the version store; put it back afterwards
+	for _ck_d in "$T_ROOT/cache" "$T_ROOT/ucache"; do
+		[ -f "$_ck_d/index/versions.tsv" ] && cp -p "$_ck_d/index/versions.tsv" "$_ck_d/index/versions.tsv.ck"
+	done
+	_ck_away() {
+		snapshots_cache_drop awaydisk
+		printf 'awaydisk\t2026-01-01-000000\t1767225600\taway01\t-\t-\t-\t-\t-\tok\tData\n' | t_cache_add
+	}
+	_ck_count() {
+		cache_read_checked "$_ck_cf" 2>/dev/null | awk -F'\t' -v l="$1" '$1 == l { n++ } END { print n + 0 }'
+	}
+
+	## --rm <ID> go, as root: is_root answers yes inside the subshell only
+	_ck_id=$(snapshots_get store 2>/dev/null | head -n 1 | awk -F'\t' '{print $4}')
+	if [ -n "$_ck_id" ]; then
+		_ck_away
+		( is_root() { return 0; }; cmd_rm "$_ck_id" go ) >/dev/null 2>&1
+		t_eq "--rm go keeps the away disk's table" "$(_ck_count awaydisk)" "1"
+		t_eq "and drops the table of the store it deleted from" "$(_ck_count store)" "0"
+	else
+		t_skip "--rm go keeps other tables" "no snapshots enumerated from the stub"
+	fi
+
+	## --thin <LOCATION> <POLICY> go
+	snapshots_get store >/dev/null 2>&1
+	_ck_away
+	cmd_thin store "*:none" go >/dev/null 2>&1
+	t_eq "--thin go keeps the away disk's table" "$(_ck_count awaydisk)" "1"
+	t_eq "and drops the table of the store it thinned" "$(_ck_count store)" "0"
+
+	## --backup start: the disk just backed up is re-read before POST_BACKUP
+	printf 'testvol\t/Volumes/TestVol\t\n' >>"$_ck_lf"
+	printf 'testvol\t2025-01-01-000000\t1735689600\tstale1\t-\t-\t-\t-\t-\tok\tData\n' | t_cache_add
+	_ck_away
+	## a subshell on purpose: cmd_backup's EXIT trap ends it, and these settings
+	## must not outlive it
+	# shellcheck disable=SC2030  # the changes are meant to stay in the subshell
+	( is_root() { return 0; }
+	  LOCKFILE="$T_ROOT/backup.lock"; BACKUP_VOLUME="TestVol"; unset BACKUP_VOLUME_RESOLVED
+	  POST_BACKUP="none"; NOTIFY_BEGIN=0; NOTIFY_END=0; NO_EJECT_FLAGFILE="$T_ROOT/no-eject.ck"
+	  cmd_backup start ) >/dev/null 2>&1
+	t_eq "--backup keeps the away disk's table" "$(_ck_count awaydisk)" "1"
+	t_eq "and drops the stale table of the disk it backed up" "$(_ck_count testvol)" "0"
+
+	## --refresh <LOCATION>, then --refresh, with the away disk registered
+	printf 'awaydisk\t%s/gone-disk\t\n' "$T_ROOT" >>"$_ck_lf"
+	_ck_away
+	( tm_refresh() { :; }; cmd_refresh store ) >/dev/null 2>&1
+	t_eq "--refresh store keeps the away disk's table" "$(_ck_count awaydisk)" "1"
+	_ck_away
+	( tm_refresh() { :; }; cmd_refresh ) >/dev/null 2>&1
+	t_eq "--refresh keeps the away disk's table" "$(_ck_count awaydisk)" "1"
+
+	mv -f "$T_ROOT/locations.ck" "$_ck_lf"
+	snapshots_cache_drop awaydisk
+	snapshots_cache_drop testvol
+	for _ck_d in "$T_ROOT/cache" "$T_ROOT/ucache"; do
+		[ -f "$_ck_d/index/versions.tsv.ck" ] && mv -f "$_ck_d/index/versions.tsv.ck" "$_ck_d/index/versions.tsv"
+	done
+	rm -f "$T_ROOT/backup.lock" "$T_ROOT/no-eject.ck"
+	return 0
+}
+
 ## The maintenance daemon re-reads what changed. Adversarial: a run must not
 ## throw away the last known table of a disk that is away (nothing can read it
 ## again until the disk is back), must not rebuild local when no local snapshot
@@ -7825,6 +7923,7 @@ t_test_config_search_order() {
 	SITE_CONF_DIR_FROM_ENV="$_cso_save"
 }
 
+# shellcheck disable=SC2031  # another test changes these settings only inside its own subshell
 t_test_post_backup() {
 	printf '\nPost-backup disk action\n'
 	_pb_save_v="$BACKUP_VOLUME"; _pb_save_p="$POST_BACKUP"
@@ -8003,6 +8102,7 @@ run_tests() {
 	t_test_version_store_generation
 	t_test_local_list_never_cached
 	t_test_maintenance_keeps_other_tables
+	t_test_commands_keep_other_tables
 	t_test_local_snapshots
 
 	t_teardown
