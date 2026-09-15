@@ -135,6 +135,10 @@ MOUNT_TABLE_FILE=""
 ## The program the job plists run: the launcher when the jobs have Full Disk
 ## Access, otherwise my-tm itself. Set by --install; empty means my-tm.
 JOB_PROGRAM=""
+## An attach this slow, in a job allowed onto network volumes, earns a hint that
+## JOBS_ACCESS_NETWORK_VOLUMES=0 would avoid it. A variable only so the suite
+## need not wait a minute.
+SLOW_ATTACH_S=60
 
 ## Mountpoints to release when this run ends.  A FILE, not a variable: every
 ## caller reaches transient_snapshot through $(...), which is a subshell, and a
@@ -282,8 +286,10 @@ JOBS_ACCESS_NETWORK_VOLUMES=0   # 1: the jobs may open locations on network
                                 # volumes (SMB, NFS, AFP, WebDAV). 0: they skip
                                 # them -- each sparsebundle attach over a share
                                 # costs minutes, and without Full Disk Access a
-                                # job cannot see inside one anyway. Commands you
-                                # run yourself are never limited by this.
+                                # job cannot see inside one anyway, so 1 needs
+                                # JOBS_RUN_WITH_FULL_DISK_ACCESS=1 (--install warns
+                                # otherwise). Commands you run yourself are never
+                                # limited by this.
 # --- backup control ---
 BACKUP_VOLUME=""                # "" = ask tmutil which destination this is.
                                 # Resolved ONCE at startup; the pre-backup
@@ -1480,6 +1486,7 @@ image_attach() {
 	_att_pid=$!
 	_att_t0=$(now_epoch)
 	_att_said=0
+	_att_hint=0
 	while kill -0 "$_att_pid" 2>/dev/null; do
 		sleep 2
 		_att_el=$(( $(now_epoch) - _att_t0 ))
@@ -1492,8 +1499,28 @@ image_attach() {
 			minor "still attaching, ${_att_el}s so far"
 			_att_next=$(( _att_el + 15 ))
 		fi
+		## Only a JOB allowed onto network volumes learns that the setting would
+		## spare it this wait: a person's own attach would not get any faster.
+		if [ "$_att_hint" = "0" ] && [ "$_att_el" -ge "$SLOW_ATTACH_S" ] &&
+		   [ "$BACKGROUND_JOB" = "1" ] && [ "${JOBS_ACCESS_NETWORK_VOLUMES:-0}" = "1" ] &&
+		   path_on_network_volume "$_img"; then
+			minor "still attaching $(basename "$_img"), ${_att_el}s so far -- JOBS_ACCESS_NETWORK_VOLUMES=0 would skip network volumes in the jobs"
+			_att_hint=1
+		fi
 	done
-	if ! wait "$_att_pid"; then
+	_att_rc=0
+	wait "$_att_pid" || _att_rc=1
+	## the wait a hint was given for is recorded (a day's worth kept), so the
+	## next health report can say what it cost; never on stdout, which is the
+	## mountpoint this function returns
+	if [ "$_att_hint" = "1" ]; then
+		_att_sf="$(cache_write_dir)/slow-attaches.tsv"
+		{
+			awk -F'\t' -v since="$(( $(now_epoch) - 172800 ))" '$1 >= since' "$_att_sf" 2>/dev/null
+			printf '%s\t%s\t%s\n' "$(now_epoch)" "$(basename "$_img")" "$(( $(now_epoch) - _att_t0 ))"
+		} | atomic_write "$_att_sf" 2>/dev/null
+	fi
+	if [ "$_att_rc" != "0" ]; then
 		rm -f "$_pl"
 		[ "$_att_said" = "1" ] && warn "attach of $(basename "$_img") failed after $(( $(now_epoch) - _att_t0 ))s"
 		return 1
@@ -1661,6 +1688,40 @@ _EOF
 ## gated. Only reaching a location is gated -- releasing a mount is not, and
 ## the sweep does not come through here. Call it in a subshell: loc_target sets
 ## the same scratch variables its callers use.
+## Why the jobs will not look at LOCATION, if they will not: "skip" when
+## JOBS_ACCESS_NETWORK_VOLUMES keeps them off network volumes, "blind" when they
+## may go there but lack Full Disk Access to see inside. Nothing -- and a
+## non-zero return -- for a location not on a network volume, or when both
+## settings let the jobs in. Call it in $(...).
+jobs_skip_reason() {
+	_jr_t=$(loc_target "$1" 2>/dev/null) || return 1
+	case "$_jr_t" in local) return 1 ;; esac
+	is_remote_target "$_jr_t" && return 1
+	path_on_network_volume "$_jr_t" || return 1
+	if [ "${JOBS_ACCESS_NETWORK_VOLUMES:-0}" != "1" ]; then
+		printf 'skip\n'
+	elif [ "${JOBS_RUN_WITH_FULL_DISK_ACCESS:-0}" != "1" ]; then
+		printf 'blind\n'
+	else
+		return 1
+	fi
+	return 0
+}
+
+## The jobs' slow network attaches of the last day, as one phrase, or nothing.
+slow_attaches_today() {
+	_sa_f="$(cache_write_dir)/slow-attaches.tsv"
+	[ -f "$_sa_f" ] || return 0
+	awk -F'\t' -v since="$(( $(now_epoch) - 86400 ))" -v slow="$SLOW_ATTACH_S" '
+		$1 >= since {
+			t += $3; n++
+			if (!($2 in seen)) { seen[$2] = 1; names = names (names == "" ? "" : ", ") $2 }
+		}
+		END {
+			if (n) printf "the jobs spent %ds attaching %s [%d attach%s over %ds]\n", t, names, n, (n == 1 ? "" : "es"), slow
+		}' "$_sa_f"
+}
+
 job_skips_location() {
 	[ "$BACKGROUND_JOB" = "1" ] || return 1
 	[ "${JOBS_ACCESS_NETWORK_VOLUMES:-0}" = "1" ] && return 1
@@ -2652,6 +2713,19 @@ _EOF
 $_locs
 _EOF
 
+	## locations the jobs leave alone, each named once with the setting that would
+	## change it -- nothing for any other location
+	while IFS="$(printf '\t')" read -r _nh _nt _ni; do
+		[ -n "$_nh" ] || continue
+		[ -n "$_only" ] && [ "$_nh" != "$_only" ] && continue
+		case "$(jobs_skip_reason "$_nh")" in
+			skip)  note "$_nh is on a network volume the jobs skip: not in $(tm_root), no daily checks -- JOBS_ACCESS_NETWORK_VOLUMES=1" ;;
+			blind) note "$_nh is on a network volume the jobs cannot see into: not in $(tm_root), no daily checks -- JOBS_RUN_WITH_FULL_DISK_ACCESS=1" ;;
+		esac
+	done <<_EOF
+$_locs
+_EOF
+
 	## footer: what the caches cost, and whether the index is behind
 	_csize="-"
 	_cf=$(snapshots_cache_file)
@@ -3171,8 +3245,13 @@ cmd_show() {
 			printf ' %-10s %s  (%s --mount %s <TTL> to fill it)\n' \
 				BROWSE "$_browse" "$US" "$_id"
 		else
-			printf ' %-10s %s  (%s --refresh %s to build the tree)\n' \
-				BROWSE "$_browse" "$US" "$_loc"
+			case "$(jobs_skip_reason "$_loc")" in
+				skip)  _why="; the jobs skip network volumes -- JOBS_ACCESS_NETWORK_VOLUMES=1 keeps it built" ;;
+				blind) _why="; the jobs cannot see into network volumes -- JOBS_RUN_WITH_FULL_DISK_ACCESS=1 keeps it built" ;;
+				*)     _why="" ;;
+			esac
+			printf ' %-10s %s  (%s --refresh %s to build the tree%s)\n' \
+				BROWSE "$_browse" "$US" "$_loc" "$_why"
 		fi
 		return 0
 	fi
@@ -3793,6 +3872,7 @@ health_say() {
 	case "$_lvl" in
 		fail) printf ' !!! %s\n' "$*"; [ "$HEALTH_RC" -lt 2 ] && HEALTH_RC=2 ;;
 		warn) printf '  >> %s\n' "$*"; [ "$HEALTH_RC" -lt 1 ] && HEALTH_RC=1 ;;
+		hint) printf '  >> %s\n' "$*" ;;
 		*)    printf '    > %s\n' "$*" ;;
 	esac
 	return 0
@@ -3934,9 +4014,29 @@ _EOF
 	## Full Disk Access -- one pointer, not a stack of errors from each command
 	## that would have needed it
 	if ! has_full_disk_access; then
-		health_say warn "no Full Disk Access: --rm, --verify and Time Machine's own listings will fail. Grant it in System Settings > Privacy & Security > Full Disk Access, to the program that runs my-tm (your terminal, or the job binary)"
+		if [ "${JOBS_RUN_WITH_FULL_DISK_ACCESS:-0}" = "1" ]; then
+			health_say warn "no Full Disk Access: --rm, --verify and Time Machine's own listings will fail. Grant it in System Settings > Privacy & Security > Full Disk Access -- to your terminal, or for the jobs to $JOBS_LAUNCHER"
+		else
+			health_say warn "no Full Disk Access: --rm, --verify and Time Machine's own listings will fail. Grant it in System Settings > Privacy & Security > Full Disk Access, to the program that runs my-tm (your terminal, or the job binary)"
+		fi
 	else
 		health_say ok "Full Disk Access is granted"
+	fi
+
+	## the two job settings -- a line only where one changed what the jobs could
+	## do today
+	for _gh in $(locations_all | awk -F'\t' '{print $1}'); do
+		case "$(jobs_skip_reason "$_gh")" in
+			skip)  health_say hint "$_gh is on a network volume the jobs skip -- JOBS_ACCESS_NETWORK_VOLUMES=1 would include it" ;;
+			blind) health_say hint "$_gh is on a network volume, but the jobs lack Full Disk Access to see inside -- JOBS_RUN_WITH_FULL_DISK_ACCESS=1" ;;
+		esac
+	done
+	if [ -n "$HEALTH_VERIFY" ] && [ "${JOBS_RUN_WITH_FULL_DISK_ACCESS:-0}" != "1" ] && ! has_full_disk_access; then
+		health_say hint "HEALTH_VERIFY needs Full Disk Access in the jobs -- JOBS_RUN_WITH_FULL_DISK_ACCESS=1"
+	fi
+	if [ "${JOBS_ACCESS_NETWORK_VOLUMES:-0}" = "1" ]; then
+		_gsa=$(slow_attaches_today)
+		[ -n "$_gsa" ] && health_say hint "$_gsa -- JOBS_ACCESS_NETWORK_VOLUMES=0 would skip that"
 	fi
 
 	## the jobs we installed
@@ -4544,6 +4644,12 @@ cmd_refresh() {
 		tm_refresh
 	fi
 	msg "caches and $(tm_root) rebuilt"
+	for _rh in ${_only:-$(locations_all | awk -F'\t' '{print $1}')}; do
+		case "$(jobs_skip_reason "$_rh")" in
+			skip)  note "built $_rh; the jobs will not keep it current -- JOBS_ACCESS_NETWORK_VOLUMES=1" ;;
+			blind) note "built $_rh; the jobs cannot see into it to keep it current -- JOBS_RUN_WITH_FULL_DISK_ACCESS=1" ;;
+		esac
+	done
 	return 0
 }
 
@@ -5337,7 +5443,15 @@ INSTALL & SET UP
                                  Without \`go\` it only prints what it would do,
                                  every host listed. Needs root + Full Disk
                                  Access locally and on each configured ssh host;
-                                 <SSH-HOST> does just that one, all if omitted
+                                 <SSH-HOST> does just that one, all if omitted.
+                                 The jobs get Full Disk Access only with
+                                 JOBS_RUN_WITH_FULL_DISK_ACCESS=1 -- through a
+                                 launcher --install builds, granted once in
+                                 System Settings -- and open locations on
+                                 network volumes only with
+                                 JOBS_ACCESS_NETWORK_VOLUMES=1, which needs the
+                                 first. A command says so where either one
+                                 changed what it did
   --setup                        interactive setup of Time Machine itself --
                                  destinations, exclusions, quota.
                                  See \`--setup --help\` for the flags to do it
@@ -7153,6 +7267,84 @@ t_test_install_config() {
 ## exactly ONE of the four combinations; the plists must switch their program;
 ## and a launcher built for a DIFFERENT my-tm must count as stale, or an install
 ## after moving my-tm would keep a launcher that runs the old path.
+## Guidance on the two job settings. Adversarial: a hint must come only where a
+## setting changed what the jobs could do -- never for a location off the
+## network, never as a failure, never to a person whose own attach would not
+## get faster -- and an old slow attach must not be reported as today's.
+t_test_job_guidance() {
+	printf '\nGuidance on the two job settings\n'
+	_jg_tf="$MOUNT_TABLE_FILE"; _jg_a="$JOBS_RUN_WITH_FULL_DISK_ACCESS"
+	_jg_n="$JOBS_ACCESS_NETWORK_VOLUMES"; _jg_bg="$BACKGROUND_JOB"; _jg_slow="$SLOW_ATTACH_S"
+	_jg_mnt="$T_ROOT/jgnet"; mkdir -p "$_jg_mnt/tmdisk" "$_jg_mnt/b.sparsebundle"
+	: >"$_jg_mnt/b.sparsebundle/Info.plist"
+	MOUNT_TABLE_FILE="$T_ROOT/jg.table"
+	printf '//me@ada/tm on %s (smbfs, nodev, nosuid)\n' "$_jg_mnt" >"$MOUNT_TABLE_FILE"
+	printf 'jgnet\t%s/tmdisk\t\n' "$_jg_mnt" >>"$T_ROOT/cache/locations.tsv"
+
+	for _jg_c in "0 0" "1 0" "1 1" "0 1"; do
+		JOBS_RUN_WITH_FULL_DISK_ACCESS=${_jg_c% *}; JOBS_ACCESS_NETWORK_VOLUMES=${_jg_c#* }
+		printf '%s:%s:%s\n' "$_jg_c" "$(jobs_skip_reason jgnet)" "$(jobs_skip_reason store)"
+	done >"$T_ROOT/jg.reasons"
+	t_eq "skipped with network 0, unseen with access 0 -- and never a reason for a local location" \
+		"$(tr '\n' '|' <"$T_ROOT/jg.reasons")" "0 0:skip:|1 0:skip:|1 1::|0 1:blind:|"
+
+	HEALTH_RC=0
+	health_say hint "x" >/dev/null
+	t_eq "a health hint leaves the exit code alone" "$HEALTH_RC" "0"
+
+	JOBS_RUN_WITH_FULL_DISK_ACCESS=1; JOBS_ACCESS_NETWORK_VOLUMES=0
+	_jg_st=$(cmd_status 2>/dev/null)
+	t_eq "--status names the location the jobs skip" \
+		"$(printf '%s\n' "$_jg_st" | count_match 'jgnet is on a network volume the jobs skip')" "1"
+	t_eq "and nothing else" "$(printf '%s\n' "$_jg_st" | count_match 'on a network volume the jobs')" "1"
+	JOBS_ACCESS_NETWORK_VOLUMES=1
+	t_eq "with both settings on, --status says nothing about it" \
+		"$(cmd_status 2>/dev/null | count_match 'on a network volume the jobs')" "0"
+
+	_jg_sf="$(cache_write_dir)/slow-attaches.tsv"
+	printf '%s\tb.sparsebundle\t312\n%s\told.sparsebundle\t999\n' \
+		"$(( $(now_epoch) - 100 ))" "$(( $(now_epoch) - 200000 ))" >"$_jg_sf"
+	t_eq "today's slow attaches are summed, with the time spent" \
+		"$(slow_attaches_today | count_match 'spent 312s attaching b.sparsebundle [1 attach over')" "1"
+	t_eq "and one from two days ago is not" "$(slow_attaches_today | count_match 'old.sparsebundle')" "0"
+	rm -f "$_jg_sf"
+
+	_jg_stub="$(t_stub_dir)/hdiutil"
+	{
+		printf '#!/bin/sh\n'
+		# shellcheck disable=SC2016  # writing a script: $1 is the STUB's argument
+		printf 'if [ "$1" = "info" ]; then exit 0; fi\n'
+		printf 'sleep 9\n'
+		printf '%s\n' 'cat <<XEOF'
+		printf '<?xml version="1.0" encoding="UTF-8"?>\n'
+		printf '<plist version="1.0"><dict><key>system-entities</key><array><dict>\n'
+		printf '<key>mount-point</key><string>/Volumes/SlowNet</string>\n'
+		printf '</dict></array></dict></plist>\n'
+		printf 'XEOF\n'
+		printf 'exit 0\n'
+	} >"$_jg_stub"
+	chmod 0755 "$_jg_stub"
+	SLOW_ATTACH_S=7; JOBS_ACCESS_NETWORK_VOLUMES=1
+
+	BACKGROUND_JOB=1
+	image_attach "$_jg_mnt/b.sparsebundle" >/dev/null 2>"$T_ROOT/jg.err"
+	t_eq "a job waiting on a slow network attach is told what would avoid it" \
+		"$(count_match 'JOBS_ACCESS_NETWORK_VOLUMES=0 would skip' <"$T_ROOT/jg.err")" "1"
+	t_eq "and the wait is recorded" "$(awk -F'\t' '{print $2}' "$_jg_sf" 2>/dev/null)" "b.sparsebundle"
+
+	BACKGROUND_JOB=0; rm -f "$_jg_sf"
+	image_attach "$_jg_mnt/b.sparsebundle" >/dev/null 2>"$T_ROOT/jg.err"
+	t_eq "a person's own slow attach gets no such hint, and nothing is recorded" \
+		"$(count_match 'JOBS_ACCESS_NETWORK_VOLUMES' <"$T_ROOT/jg.err") $([ -f "$_jg_sf" ] && echo recorded || echo none)" "0 none"
+
+	rm -f "$_jg_stub" "$_jg_sf" "$T_ROOT/jg.err" "$T_ROOT/jg.reasons" "$MOUNT_TABLE_FILE"
+	grep -v '^jgnet	' "$T_ROOT/cache/locations.tsv" >"$T_ROOT/cache/l.jg" &&
+		mv "$T_ROOT/cache/l.jg" "$T_ROOT/cache/locations.tsv"
+	rm -rf "$_jg_mnt"
+	MOUNT_TABLE_FILE="$_jg_tf"; JOBS_RUN_WITH_FULL_DISK_ACCESS="$_jg_a"
+	JOBS_ACCESS_NETWORK_VOLUMES="$_jg_n"; BACKGROUND_JOB="$_jg_bg"; SLOW_ATTACH_S="$_jg_slow"
+}
+
 t_test_install_launcher() {
 	printf '\n--install and the Full Disk Access launcher\n'
 	_il_a="$JOBS_RUN_WITH_FULL_DISK_ACCESS"; _il_n="$JOBS_ACCESS_NETWORK_VOLUMES"
@@ -7708,6 +7900,7 @@ run_tests() {
 	t_test_network_volume_gate
 	t_test_launcher
 	t_test_install_launcher
+	t_test_job_guidance
 	t_test_ejected_destination
 	t_test_auto_mount_destinations
 	t_test_verify_reports

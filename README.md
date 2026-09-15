@@ -523,6 +523,13 @@ It does three cheap things, and a third daemon is not needed for any of them:
 3. **takes a local snapshot** if `LOCAL_SNAP_INTERVAL` says one is due, and
    trims by `LOCAL_SNAP_KEEP_H` / `LOCAL_SNAP_MAX`.
 
+A location on a network volume (SMB, NFS, AFP, WebDAV — read from `mount`,
+matched on whole path components) is skipped by the maintenance and health
+jobs unless `JOBS_ACCESS_NETWORK_VOLUMES=1`: each sparsebundle attach over a
+share costs minutes, and without Full Disk Access a job cannot see inside one
+anyway (§9). Releasing mounts is not affected — the sweep detaches without
+opening a location. Commands you run yourself are never limited by it.
+
 ### What the sweep is for
 
 Every mount pins its snapshot: **a mounted snapshot cannot be deleted**, so
@@ -721,18 +728,69 @@ change before making it.
    its first run and that only becomes reachable as `/tm` after the reboot.
    `--install` says so in one line and names `my-tm --refresh` for building it
    at once.
-4. writes the completion file to the **invoking** user's
+4. with `JOBS_RUN_WITH_FULL_DISK_ACCESS=1`, builds the launcher the jobs run
+   through (below) and prints the one manual step, granting it Full Disk Access.
+5. writes the completion file to the **invoking** user's
    `~/.zsh/completions/_my-tm` (`$SUDO_USER`'s home, owned by them, never
    root's), and only when the content differs — that also happens on every
    ordinary run.
 
-`--uninstall` reverses 1–3: unloads and removes the jobs, unmounts everything
+`--uninstall` reverses 1–4: unloads and removes the jobs and the launcher, unmounts everything
 under `$MOUNT_ROOT`, and **deletes** the `/etc/synthetic.conf` comment+entry
 pair — that file is synced line-by-line across your hosts, so leaving a
 commented corpse behind would spread; a diff of the file from before `--install`
 to after `--uninstall` must be empty. The `/tm` link itself only disappears
 after a reboot, which `--uninstall` says in one line. It asks before deleting
 `$CACHE_DIR` — the index is expensive to rebuild.
+
+### Full Disk Access for the jobs
+
+macOS grants Full Disk Access per program. The jobs run `/bin/dash`, and
+granting that would give every dash script on the Mac the access — so a small
+launcher holds the grant instead, and the jobs run my-tm through it. Two config
+values decide it, both `0` by default; set them in the site's global config and
+override them per Mac in the local one, which is loaded on top:
+
+| `JOBS_RUN_WITH_FULL_DISK_ACCESS` | `JOBS_ACCESS_NETWORK_VOLUMES` | what the jobs do |
+|---|---|---|
+| 0 | 0 | skip locations on network volumes; `HEALTH_VERIFY` checksums fail |
+| 1 | 0 | checksums work, but no sparsebundle is ever attached over a share |
+| 1 | 1 | everything, locations on network volumes included |
+| 0 | 1 | cannot see inside network volumes — `--install` installs, and warns |
+
+The first is an access decision; the second a cost decision — minutes per
+attach, the network, the remote disk kept awake.
+
+The launcher, `my-tm-launcher.c` (carried inside my-tm, byte for byte):
+
+* runs ONE path, compiled in at build time — the installed my-tm — with its
+  arguments passed through. It cannot run anything else, and no site path is
+  written in its source;
+* with no arguments, or exactly `--help`, explains itself and runs nothing;
+  `--version` prints the my-tm path and the hash of the source it was built from;
+* is built with `clang`, ad-hoc signed (`codesign -s -`) and installed at
+  `JOBS_LAUNCHER`, `0700 root:wheel`. `--install` rebuilds it only when it is
+  missing or its `--version` no longer matches, and refuses a `JOBS_LAUNCHER`
+  inside a group- or world-writable tree. Without `clang` or `codesign` the
+  jobs run my-tm directly, and `--install` says so.
+
+**One manual step:** System Settings > Privacy & Security > Full Disk Access >
+add the launcher. macOS ties the grant to that exact build: a rebuild needs
+granting again, editing my-tm does not. Only the launcher's fixed my-tm gains
+the access, and only root can change that file; run from Terminal, the
+launcher is covered by Terminal's grant, not its own.
+
+**Hints.** A command mentions these values only where they changed what it did
+in that run, in one line naming the value to flip:
+
+* the maintenance job, when an attach over a share passes 60 s while
+  `JOBS_ACCESS_NETWORK_VOLUMES=1` — said while it waits, and the wait recorded;
+* `--health`: a location the jobs skip or cannot see into, `HEALTH_VERIFY`
+  without the access, and the day's slow attaches;
+* `--status`, `--show` (on its `BROWSE` line) and `--refresh`: a location on a
+  network volume whose `/tm` tree the jobs will not keep current.
+
+Every other command runs with your own access, and says nothing about them.
 
 ## 10. Managing the backups *(spec)*
 
@@ -796,8 +854,11 @@ non-zero on the worst — suitable for cron and for a LaunchDaemon.
 | stale mounts | a my-tm mount past its TTL that `lsof` says is idle but could not be released |
 | ownership | destination claimed by another machine (`inheritbackup` needed) |
 | jobs | a my-tm LaunchDaemon/Agent is loaded but failing, or points at a path that no longer exists |
-| Full Disk Access | missing — reported once, as a pointer, not a stack of errors |
+| Full Disk Access | missing — reported once, as a pointer (to the launcher when the jobs use one), not a stack of errors |
 | checksums | only when `HEALTH_VERIFY` names a path (below) |
+
+Hints about the two job settings (§9) are printed beside the checks and never
+change the exit code.
 
 Scheduling: `HEALTH_INTERVAL` (e.g. `4h`, `1d`) — empty / `0` / `false` means
 never, and no daemon is installed. `--install` writes
@@ -1114,6 +1175,9 @@ BACKUP_SCHEDULE="on-boot"       # space-separated, combinable. Examples:
                                 #   03:30              -> daily at 03:30
                                 #   on-boot 03:30 15:30 -> RunAtLoad + both times
                                 #   Mon 03:30          -> weekly
+JOBS_RUN_WITH_FULL_DISK_ACCESS=0 # 1: the jobs run my-tm through JOBS_LAUNCHER (§9)
+JOBS_LAUNCHER="/usr/local/sbin/my-tm-launcher"  # built by --install; root:wheel 0700
+JOBS_ACCESS_NETWORK_VOLUMES=0   # 1: the jobs may open locations on network volumes
 # --- backup control (from the old my-tm.sh) ---
 BACKUP_VOLUME=""                # "" = ask tmutil. Resolved ONCE at startup
 POST_BACKUP="eject"             # none | unmount | eject, when a backup ends
@@ -1358,7 +1422,7 @@ without ever being destructive.
   after an ID.
 * **Full Disk Access**: `tmutil listbackups|compare|delete|verifychecksums` need
   it. my-tm detects the denial and prints one pointer line rather than a stack
-  of errors.
+  of errors. The jobs get it through a launcher (§9).
 * **Verbosity**: `-D` always; `-V` because there are real commands to echo;
   `-DD` for `set -x`. No `-VV` — there is no third level of informational output
   to justify it.
