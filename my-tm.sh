@@ -4438,7 +4438,7 @@ do_post_backup() {
 	_pv_h="${1:-}"
 	[ -n "$_pv_h" ] || _pv_h=$(locations_all | awk -F'\t' -v v="$_pv" '
 		$2 == "local" || $2 ~ /:/ { next }
-		{ n = $2; sub(/.*\//, "", n) } n == v { print $1; exit }')
+		{ n = $2; sub(/.*\//, "", n) } n == v && !f { print $1; f = 1 }')
 	_pol=$(post_backup_policy "$_pv_h")
 	if [ -f "$NO_EJECT_FLAGFILE" ]; then
 		msg "leaving $_pv mounted [policy $_pol suppressed by $NO_EJECT_FLAGFILE]"
@@ -4532,7 +4532,14 @@ cmd_backup() {
 		snapshots_cache_drop "$_bk_h"
 		snapshots_get "$_bk_h" >/dev/null
 	done
-	do_post_backup
+	## A backup my-tm did not start is STILL WRITING to that disk: parking it
+	## now cuts the run off. Seen on horse -- "a backup was already running",
+	## then eject, and Time Machine's run ended there.
+	if [ "$_bk_rc" = "3" ]; then
+		minor "leaving ${_bv:-the destination} mounted -- POST_BACKUP does not end a backup my-tm did not start"
+	else
+		do_post_backup
+	fi
 	return "$_bk_rc"
 }
 
@@ -5221,7 +5228,7 @@ _EOF
 
 install_remote() {
 	_h="$1"; _go="$2"
-	_loc=$(locations_all | awk -F'\t' -v h="$_h" '$2 ~ ("^" h ":") {print $1; exit}')
+	_loc=$(locations_all | awk -F'\t' -v h="$_h" '$2 ~ ("^" h ":") && !f {print $1; f = 1}')
 	_idir=$(loc_install_dir "${_loc:-}")
 	[ -n "$_idir" ] || _idir="/usr/local/sbin"
 	msg "remote install on $_h -> $_idir/my-tm"
@@ -8054,6 +8061,53 @@ t_test_config_search_order() {
 	SITE_CONF_DIR_FROM_ENV="$_cso_save"
 }
 
+## What happens to the disk when the backup was NOT ours. Adversarial: on horse
+## `my-tm --backup start` met "a backup was already running" and ejected the disk
+## anyway, cutting Time Machine's run off. And the lookup for the volume's
+## location must CONSUME locations_all: an early exit closed the pipe and the
+## producer took a SIGPIPE ("write error: Broken pipe").
+# shellcheck disable=SC2031  # its own subshell sets these on purpose; cmd_backup's EXIT trap needs one
+t_test_backup_already_running() {
+	printf '\nA backup already running is left alone\n'
+	_br_v="$BACKUP_VOLUME"; _br_p="$POST_BACKUP_DEFAULT"
+	_br_stub="$(t_stub_dir)/tmutil"; cp -p "$_br_stub" "$T_ROOT/tmutil.br"
+	# shellcheck disable=SC2016  # writing a script: its $1 and $@ are the stub's own
+	{
+		printf '#!/bin/sh\n'
+		printf 'if [ "$1" = "startbackup" ]; then printf "tmutil: Backup already in progress.\\n" >&2; exit 3; fi\n'
+		printf 'exec "%s" "$@"\n' "$T_ROOT/tmutil.br"
+	} >"$_br_stub"
+	chmod 0755 "$_br_stub"
+	: >"$(t_calls)"
+	# shellcheck disable=SC2030  # the settings are meant to stay in the subshell
+	( is_root() { return 0; }
+	  LOCKFILE="$T_ROOT/br.lock"; BACKUP_VOLUME="store"; unset BACKUP_VOLUME_RESOLVED
+	  POST_BACKUP_DEFAULT="eject"; NOTIFY_BEGIN=0; NOTIFY_END=0
+	  cmd_backup start ) >"$T_ROOT/br.out" 2>&1
+	t_eq "a backup already running is not ejected" \
+		"$(count_match 'diskutil eject' < "$(t_calls)")" "0"
+	t_eq "and not unmounted either" \
+		"$(count_match 'diskutil unmountDisk' < "$(t_calls)")" "0"
+	t_match "and my-tm says why" "$(cat "$T_ROOT/br.out")" "does not end a backup my-tm did not start"
+	mv -f "$T_ROOT/tmutil.br" "$_br_stub"
+
+	## No reader of locations_all may end its awk early: loc_line says why
+	## ("awk must CONSUME the whole pipe here"), and on horse an early exit
+	## made the producer take a SIGPIPE -- "printf: write error: Broken pipe"
+	## during --backup. Reproducing that needs the real timing, so this is a
+	## check of the SOURCE, not of a run.
+	if [ -r "$T_MYTM" ]; then
+		t_eq "no reader of locations_all ends its awk early" \
+			"$(awk '/locations_all \| awk/, /\)|;/ { if (/exit/) n++ } END { print n + 0 }' "$T_MYTM")" "0"
+	else
+		t_skip "no reader of locations_all ends its awk early" "not a readable checkout"
+	fi
+
+	rm -f "$T_ROOT/br.lock" "$T_ROOT/br.out"
+	BACKUP_VOLUME="$_br_v"; POST_BACKUP_DEFAULT="$_br_p"; unset BACKUP_VOLUME_RESOLVED
+	return 0
+}
+
 # shellcheck disable=SC2031  # another test changes these settings only inside its own subshell
 t_test_post_backup() {
 	printf '\nPost-backup disk action\n'
@@ -8203,6 +8257,7 @@ run_tests() {
 	t_test_paths
 	t_test_version_output
 	t_test_post_backup
+	t_test_backup_already_running
 	t_test_config_search_order
 	t_test_attach_progress
 	t_test_lsof_never_answers
