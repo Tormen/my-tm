@@ -1011,8 +1011,15 @@ read-only mirror.
 **A location is named to the remote by its PATH.** Handles are this Mac's
 private names and the far side has its own, so machine to machine my-tm sends
 the one thing both ends agree on: where the store is. `<LOCATION>` therefore
-accepts a path as well as a handle everywhere — locally too. A handle always
-wins, which costs nothing since a handle can never look like an absolute path.
+accepts a path as well as a handle everywhere, and a path to a registered store
+resolves to its handle. The far side need not have registered that path at all:
+a READ command (`--ls`, `--status`, `--health`, `--mount`, `--umount`,
+`--refresh`) given an unregistered path that holds a store — a
+`backup_manifest.plist` at its root, or a disk image with its `Info.plist` —
+takes it for that run under a handle of its own (`path-horse`), and never writes
+it to `locations.tsv`. Commands that write the list or delete snapshots
+(`--index`, `--no-index`, `--rm-index`, `--thin`) still need a registered
+location, and a bare `my-tm <path>` with no command stays a file to look up.
 
 **A host that is off is not "reachable".** my-tm makes one `BatchMode`
 connection attempt with a `SSH_CONNECT_TIMEOUT` (3 s) before reading an ssh

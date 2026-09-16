@@ -1040,6 +1040,8 @@ _EOF
 $_imgs
 _EOF
 	fi
+	## stores named by path this run (loc_resolve ... adhoc), never persisted
+	[ -f "$RUN_DIR/adhoc" ] && cat "$RUN_DIR/adhoc"
 	case " $_seen " in
 		*" local "*) : ;;
 		*) printf 'local\tlocal\t\n' ;;
@@ -1076,6 +1078,52 @@ loc_line() {
 		      exit 1 }'
 }
 
+## A location someone NAMED, as its handle: by handle, by target path, or --
+## with "adhoc", for commands that only read -- a Time Machine store the path
+## points at that nothing has registered or detected. That last case is exactly
+## what a remote is sent: machine to machine a location is named by its path,
+## and the far side need not have registered it (ada answered "no such
+## location" for horse's old bundle, so horse@ada showed nothing at all). Such a
+## store joins THIS run's location list under a handle of its own and is never
+## written to locations.tsv. A path is accepted only if it holds a store:
+## backup_manifest.plist at its root, or a disk image with its Info.plist.
+## Resolving to the handle matters on its own too: a path used AS a handle ends
+## up in cache keys and mount directory names, and a path contains "/".
+loc_resolve() {                 # <name> [adhoc]
+	_lv=$(loc_line "$1" 2>/dev/null | awk -F'\t' '{print $1}')
+	if [ -n "$_lv" ]; then
+		## a store only ever named by path is in the run's list after the first
+		## read -- but it is still not a LOCATION to anything that writes the
+		## list, or it would be saved into locations.tsv by the back door
+		if [ "${2:-}" != "adhoc" ] && loc_is_adhoc "$_lv"; then
+			return 1
+		fi
+		printf '%s\n' "$_lv"
+		return 0
+	fi
+	[ "${2:-}" = "adhoc" ] || return 1
+	case "$1" in /*) : ;; *) return 1 ;; esac
+	if is_image_target "$1"; then
+		[ -f "$1/Info.plist" ] || [ -f "$1" ] || return 1
+	else
+		[ -f "$1/backup_manifest.plist" ] || return 1
+	fi
+	_lv_b=$(basename "$1"); _lv_b=${_lv_b%.sparsebundle}
+	_lv_h="path-$(slug "$_lv_b")"; _lv_n="$_lv_h"; _lv_i=1
+	while loc_line "$_lv_n" >/dev/null 2>&1; do
+		_lv_i=$(( _lv_i + 1 )); _lv_n="$_lv_h-$_lv_i"
+	done
+	printf '%s\t%s\t\n' "$_lv_n" "$1" >>"$RUN_DIR/adhoc"
+	locations_run_cache_drop
+	printf '%s\n' "$_lv_n"
+}
+
+## was this handle only named by path during this run?
+loc_is_adhoc() {
+	[ -f "$RUN_DIR/adhoc" ] || return 1
+	awk -F'\t' -v h="$1" '$1 == h {f = 1} END {exit(f ? 0 : 1)}' "$RUN_DIR/adhoc"
+}
+
 loc_target() { loc_line "$1" | awk -F'\t' '{print $2}'; }
 loc_install_dir() { loc_line "$1" | awk -F'\t' '{print $3}'; }
 
@@ -1106,6 +1154,8 @@ loc_indexes() {
 ## Field 3 is where my-tm lives on an ssh host, field 4 the INDEX column.
 loc_set_field() {               # <handle> <3|4> <value>
 	_sx_h="$1"; _sx_n="$2"; _sx_v="$3"
+	## never persist a store that was only named by path this run
+	loc_is_adhoc "$_sx_h" && return 1
 	_sx_l=$(loc_line "$_sx_h") || return 1
 	_sx_t=$(printf '%s' "$_sx_l" | awk -F'\t' '{print $2}')
 	_sx_i=$(printf '%s' "$_sx_l" | awk -F'\t' '{print $3}')
@@ -3150,6 +3200,9 @@ index_mark_covered() {
 
 cmd_status() {
 	_only="${1:-}"
+	if [ -n "$_only" ]; then
+		_only=$(loc_resolve "$_only" adhoc) || err "${1}: no such location. Try: $US --status"
+	fi
 	_ix_lines=""
 	_locs=$(locations_all)
 	[ -n "$_locs" ] || { note "no locations. Add one: $US --add <FOLDER> [<HANDLE>]"; return 0; }
@@ -3428,7 +3481,7 @@ _EOF
 cmd_ls() {
 	_only="${1:-}"
 	if [ -n "$_only" ]; then
-		loc_line "$_only" >/dev/null 2>&1 || err "$_only: no such location. Try: $US --status"
+		_only=$(loc_resolve "$_only" adhoc) || err "${1}: no such location. Try: $US --status"
 		_locs="$_only"
 	else
 		_locs=$(locations_all | awk -F'\t' '{print $1}')
@@ -3985,8 +4038,7 @@ cmd_mount() {
 		err "'$_ttl_s' is not a TTL. Use <N>m, <N>h or <N>d, combinable: 7m / 4h / 5h3m / 2d"
 
 	## a location: its newest snapshot, or every one with --all
-	if loc_line "$_what" >/dev/null 2>&1; then
-		_h="$_what"
+	if _h=$(loc_resolve "$_what" adhoc); then
 		ttl_sanity_warn "$_h" "$_ttl"
 		if [ "$OPT_ALL" = "1" ]; then
 			_list=$(snapshots_get "$_h" | sort -t"$(printf '\t')" -k3,3n | awk -F'\t' '{print $2"\t"$11}')
@@ -4036,8 +4088,8 @@ cmd_umount() {
 	printf '%s\n' "$_records" >"$_tmp"
 	_hitloc=""; _hitid=""
 	if [ "$OPT_ALL" != "1" ] && [ -n "$_what" ]; then
-		if loc_line "$_what" >/dev/null 2>&1; then
-			_hitloc="$_what"
+		if _hl=$(loc_resolve "$_what" adhoc); then
+			_hitloc="$_hl"
 		else
 			_h=$(resolve_id "$_what") || snapshot_gone "$_what"
 			_hitid=$(printf '%s' "$_h" | awk -F'\t' '{print $3}')
@@ -4224,8 +4276,8 @@ cmd_index() {
 		fi
 	else
 		for _t in $_targets; do
-			if loc_line "$_t" >/dev/null 2>&1; then
-				_locs="$_locs $_t"
+			if _tl=$(loc_resolve "$_t"); then
+				_locs="$_locs $_tl"
 			else
 				_snaps="$_snaps $_t"
 			fi
@@ -4294,11 +4346,13 @@ _EOF
 ## updated still answers --find for the snapshots it covers.
 cmd_no_index() {
 	[ "$#" -ge 1 ] || err "--no-index needs a <LOCATION>"
+	_nxs=""
 	for _nx in "$@"; do
-		loc_line "$_nx" >/dev/null 2>&1 || err "no such location: $_nx ($US --status lists them)"
+		_nh=$(loc_resolve "$_nx") || err "no such location: $_nx ($US --status lists them)"
+		_nxs="$_nxs $_nh"
 	done
-	locations_writable "--no-index$(printf ' %s' "$@")"
-	for _nx in "$@"; do
+	locations_writable "--no-index$_nxs"
+	for _nx in $_nxs; do
 		loc_set_index "$_nx" 0 || err "$_nx: could not write the location list"
 		_nx_c=$(index_covered_count "$_nx")
 		if [ "$_nx_c" -gt 0 ]; then
@@ -4314,11 +4368,13 @@ cmd_no_index() {
 ## Stop indexing a location AND delete what it has.
 cmd_rm_index() {
 	[ "$#" -ge 1 ] || err "--rm-index needs a <LOCATION>"
+	_rxs=""
 	for _rx in "$@"; do
-		loc_line "$_rx" >/dev/null 2>&1 || err "no such location: $_rx ($US --status lists them)"
+		_rh=$(loc_resolve "$_rx") || err "no such location: $_rx ($US --status lists them)"
+		_rxs="$_rxs $_rh"
 	done
-	locations_writable "--rm-index$(printf ' %s' "$@")"
-	for _rx in "$@"; do
+	locations_writable "--rm-index$_rxs"
+	for _rx in $_rxs; do
 		_rx_c=$(index_covered_count "$_rx")
 		loc_set_index "$_rx" 0 || err "$_rx: could not write the location list"
 		_rx_n=$(index_rm "$_rx")
@@ -4632,7 +4688,7 @@ cmd_health() {
 	HEALTH_PROBLEMS=0; HEALTH_FIRST_FAIL=""; HEALTH_FIRST_WARN=""
 	_only="${1:-}"
 	if [ -n "$_only" ]; then
-		_locs="$_only"
+		_locs=$(loc_resolve "$_only" adhoc) || err "${_only}: no such location. Try: $US --status"
 	else
 		_locs=$(health_locations)
 	fi
@@ -5005,7 +5061,10 @@ cmd_thin() {
 	done
 	_policy=$(printf '%s' "$_policy" | sed 's/^ //')
 
-	if [ -n "$_loc" ]; then _locs="$_loc"; else
+	if [ -n "$_loc" ]; then
+		_loc=$(loc_resolve "$_loc") || err "no such location: $_loc ($US --status lists them)"
+		_locs="$_loc"
+	else
 		_locs=$(locations_all | awk -F'\t' '{print $1}')
 	fi
 	_now=$(now_epoch)
@@ -5540,6 +5599,9 @@ cmd_forget() {
 
 cmd_refresh() {
 	_only="${1:-}"
+	if [ -n "$_only" ]; then
+		_only=$(loc_resolve "$_only" adhoc) || err "${1}: no such location. Try: $US --status"
+	fi
 	## re-read every table that CAN be read; a disk that is away keeps its last
 	## known one, since nothing could replace it
 	for _rf_h in ${_only:-$(locations_all | awk -F'\t' '{print $1}')}; do
@@ -6592,14 +6654,18 @@ classify_one() {
 		rung "ladder rung 1: '$_w' is a snapshot ID"
 		printf 'id\t%s\n' "$_w"; return 0
 	fi
-	if loc_line "$_w" >/dev/null 2>&1; then
+	## registered or detected only: a bare path that is not a location stays a
+	## path to look up, so no ad-hoc store here
+	if _wl=$(loc_resolve "$_w"); then
 		rung "ladder rung 2: '$_w' is a location handle"
-		printf 'loc\t%s\n' "$_w"; return 0
+		printf 'loc\t%s\n' "$_wl"; return 0
 	fi
 	case "$_w" in
 		/*)
 			_h=$(locations_all | awk -F'\t' -v p="$_w" \
 				'$2 != "local" && index(p, $2) == 1 && !f {print $1; f = 1}')
+			## a store only named by path this run is not a backup disk here either
+			[ -n "$_h" ] && loc_is_adhoc "$_h" && _h=""
 			if [ -n "$_h" ]; then
 				rung "ladder rung 3: '$_w' is inside backup disk '$_h'"
 				printf 'loc\t%s\n' "$_h"; return 0
@@ -8872,6 +8938,52 @@ t_test_run_cache() {
 	printf '%s\n' "$_rc_save" | cache_write_locations
 }
 
+## Naming a location by its path. Adversarial, from horse@ada: ada's my-tm was
+## sent a path it had never registered and answered "no such location", so the
+## row stayed empty for ever. But accepting a path must not turn EVERY path into
+## a location: only one holding a store, never through the bare-word ladder
+## (where a path is a file to look up), never persisted, and never for a
+## command that writes the list or deletes snapshots. And a registered store
+## named by its path must resolve to its HANDLE, not be used as one.
+t_test_loc_resolve() {
+	printf '\nA location named by its path\n'
+	_lr_save=$(cat "$T_ROOT/cache/locations.tsv")
+	_lr_s="$T_ROOT/unregistered"; mkdir -p "$_lr_s" "$T_ROOT/plaindir"
+	cp "$T_ROOT/store/backup_manifest.plist" "$_lr_s/"
+
+	t_eq "a registered store named by its path resolves to its handle" \
+		"$(loc_resolve "$T_ROOT/store") $(loc_resolve store)" "store store"
+	_lr_o=$( (
+		RUN_DIR=$(mktemp -d "$T_ROOT/my-tm.run.XXXXXX")
+		printf 'plain=%s ' "$(loc_resolve "$_lr_s" >/dev/null 2>&1 && echo found || echo refused)"
+		_h=$(loc_resolve "$_lr_s" adhoc) || _h=none
+		printf 'adhoc=%s ' "$_h"
+		printf 'target=%s ' "$( [ "$(loc_target "$_h")" = "$_lr_s" ] && echo ok || echo wrong)"
+		printf 'again=%s ' "$(loc_resolve "$_lr_s" adhoc)"
+		printf 'nostore=%s ' "$(loc_resolve "$T_ROOT/plaindir" adhoc >/dev/null 2>&1 && echo found || echo refused)"
+		printf 'relative=%s ' "$(cd "$T_ROOT" && loc_resolve unregistered adhoc >/dev/null 2>&1 && echo found || echo refused)"
+		printf 'ladder=%s ' "$(classify_one "$_lr_s" 2>/dev/null | cut -f1)"
+		printf 'noindex=%s' "$( ( cmd_no_index "$_lr_s" ) >/dev/null 2>&1 && echo accepted || echo refused)"
+	) 2>/dev/null )
+	t_match "an unregistered path is not a location to a command that writes" "$_lr_o" "plain=refused"
+	t_match "a read command takes it, under a handle of its own" "$_lr_o" "adhoc=path-unregistered"
+	t_match "which leads back to the path" "$_lr_o" "target=ok"
+	t_match "and naming it again gives the same handle, not a second one" "$_lr_o" "again=path-unregistered "
+	t_match "a directory with no store in it is not a location" "$_lr_o" "nostore=refused"
+	t_match "nor is a relative path" "$_lr_o" "relative=refused"
+	t_eq "a bare path to look up stays a path" \
+		"$(printf '%s' "$_lr_o" | sed -n 's/.*ladder=\([a-z]*\).*/\1/p')" "path"
+	t_match "--no-index refuses a store nothing registered" "$_lr_o" "noindex=refused"
+	t_eq "and nothing was written to locations.tsv" \
+		"$(cat "$T_ROOT/cache/locations.tsv")" "$_lr_save"
+	## the table by path is the table by handle
+	t_eq "--ls by path shows the same table as --ls by handle" \
+		"$(cmd_ls "$T_ROOT/store" 2>&1 | shasum)" "$(cmd_ls store 2>&1 | shasum)"
+
+	rm -rf "$_lr_s" "$T_ROOT/plaindir"
+	printf '%s\n' "$_lr_save" | cache_write_locations
+}
+
 ## REGRESSION: the design promised an "exclusive size" column from tmutil
 ## uniquesize. That tool refuses on an APFS Time Machine store
 ## ("pathInAPFSBackup"), and nothing else on macOS reports per-snapshot space,
@@ -10336,6 +10448,7 @@ run_tests() {
 	t_test_index_progress_visible
 	t_test_status_index_size
 	t_test_run_cache
+	t_test_loc_resolve
 	t_test_launcher
 	t_test_install_launcher
 	t_test_job_guidance
