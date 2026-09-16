@@ -944,38 +944,56 @@ A `locations.tsv` line (§13) may carry an optional third field, the directory
 my-tm is installed in on that host:
 
 ```text
-# $CACHE_DIR/locations.tsv — HANDLE  TARGET  [REMOTE-INSTALL-DIR]
-host1	host1:/Volumes/TimeMachine.Ext	/usr/local/bin
+# $CACHE_DIR/locations.tsv — HANDLE  TARGET  [REMOTE-INSTALL-DIR]  [INDEX]
+host1	host1:/Volumes/TimeMachine.Ext	/usr/local/sbin	1
 host2	host2:/Volumes/Backup
 ```
 
-* **Installed (third field present) — the real mode.** `--install` sets that
-  host up too: copies my-tm there, creates its cache and log dirs, installs the
-  jobs. The remote then has somewhere to *store* things, which matters because
-  the search index is the whole reason to care: `--index` on that location runs
-  and stays remote, where the disk is.
-* **Ephemeral (third field absent).** my-tm `scp`s itself to the remote's temp
-  dir, runs, and removes it. Fine for `--status` and `--ls`; the ~200 ms per
-  call is not free but is invisible next to the ssh round trips already
-  involved. `--index` still **works**, provided `INDEX_REMOTE_COPY=1`: the walk
-  happens on the remote where the disk is, and the finished database is copied
-  back here, because here is the only place left to keep it. The cost is that
-  nothing persists on that host, so installing my-tm there later means building
-  the index again from scratch. With `INDEX_REMOTE_COPY=0` and no install dir
-  there is nowhere to put the result at all, and `--index` is refused in one
-  line saying which of the two to change.
+**my-tm is installed on the host — that is the normal way.** `--install
+<SSH-HOST>` copies my-tm there, creates its cache and log dirs, installs the
+jobs, and **records the directory it used** in the third field, so later
+commands find it instead of asking. `--uninstall <SSH-HOST>` is the mirror: it
+runs my-tm's own `--uninstall` there, removes the binary, and clears the field.
 
-`INDEX_REMOTE_COPY=1` pulls a finished remote index database back to the local
-cache, so `--find` still answers for that location while the host is offline.
-When the host is installed, the remote copy also **stays** — that is the one
-that keeps getting extended, and the local one is a read-only mirror.
+**`--copy-self` is the way out when it is not.** It ships my-tm to the host for
+*that one call* and removes it again in the same `ssh` invocation — so a run
+interrupted here cannot leave a copy of my-tm on someone else's machine. It is
+a global option accepted anywhere on the line, which is what makes
+`alias my-tm='my-tm --copy-self'` work. Without an install and without the
+flag, a command says which of the two to reach for:
 
-**No host is ever probed.** my-tm never makes an extra `ssh` call to ask whether
-it is installed somewhere. It simply runs the command; a `command not found`
-comes back as one clear line — `host1: my-tm not installed there. Run: my-tm
---install host1` — which is also what you get after adding a new host to the
-config. `--install <SSH-HOST>` does that one host; `--install` with no argument
-does the local machine and every configured host.
+```text
+!!! my-tm is not installed on ada -- run: my-tm --install ada   (or add --copy-self to this call)
+```
+
+**The index lives where the disk is.** `--index` on an ssh location runs on that
+host and stays there, because the walk has to be next to the disk.
+`SHADOW_SSH_INDEX_FILES=1` (the default) additionally copies the finished
+database here, so `--find` answers for that location while the host is offline;
+the remote copy is the one that keeps getting extended, and the shadow is a
+read-only mirror. `--index --copy-self` therefore needs it — nothing persists on
+the host, so here is the only place an index could live:
+
+```text
+!!! --index --copy-self leaves nothing on ada, so the index can only live here -- set SHADOW_SSH_INDEX_FILES=1, or: my-tm --install ada
+```
+
+**A location is named to the remote by its PATH.** Handles are this Mac's
+private names and the far side has its own, so machine to machine my-tm sends
+the one thing both ends agree on: where the store is. `<LOCATION>` therefore
+accepts a path as well as a handle everywhere — locally too. A handle always
+wins, which costs nothing since a handle can never look like an absolute path.
+
+**A host that is off is not "reachable".** my-tm makes one `BatchMode`
+connection attempt with a `SSH_CONNECT_TIMEOUT` (3 s) before reading an ssh
+location. Assuming reachability was worse than the round trip: `--health` used
+to report *"no snapshots found"* for a Mac that was merely switched off, which
+reads as data loss.
+
+**Deleting happens where the store is.** `--rm` and `--thin` refuse an ssh
+location and name the command to run on that host. Run here, `tmutil delete -d
+host:/path` addresses a *local* path — which either fails or, far worse, does
+not.
 
 ### Network stores: `<host>.sparsebundle` *(spec)*
 
@@ -1209,8 +1227,9 @@ CACHE_TTL=3600                  # s; older -> rescan mounted locations
 INDEX_BASELINES="newest oldest" # snapshots --index walks when none are named
 INDEX_INC_MAX=16                # consolidate the increments once there are
                                 # this many
-INDEX_REMOTE_COPY=1             # also keep a local copy of a remote index, so
-                                # --find works while that host is offline
+SHADOW_SSH_INDEX_FILES=1        # shadow an ssh location's index here too, so
+                                # --find answers while that host is offline
+SSH_CONNECT_TIMEOUT=3           # s before an ssh host counts as unreachable
 AUTO_INDEX_TM_BACKUP_DISKS=0    # 1: this Mac's backup disks are indexed without
                                 # --index. Never local snapshots, never ssh
 INDEX_INTERVAL_DEFAULT="1d"     # only when Time Machine has no schedule of its

@@ -65,7 +65,8 @@ IMAGE_GRACE=600
 IMAGE_SCAN_TTL=300
 INDEX_BASELINES="newest oldest"
 INDEX_INC_MAX=16
-INDEX_REMOTE_COPY=1
+SHADOW_SSH_INDEX_FILES=1
+SSH_CONNECT_TIMEOUT=3
 AUTO_INDEX_TM_BACKUP_DISKS=0
 # shellcheck disable=SC2034  # read through loc_param, which builds its name
 INDEX_INTERVAL_DEFAULT="1d"
@@ -126,6 +127,9 @@ VS_GENERATION=2
 
 VRB=0; DBG=0; DEEPDBG=0; DBG_PATH=""
 JSON=0; OPT_ALL=0; LIMIT=""; FORCE=0; SRC=""
+## --copy-self: ship my-tm to the ssh host for THIS call instead of using an
+## installed copy. A global option, so `alias my-tm='my-tm --copy-self'` works.
+COPY_SELF=0
 CONFIG_FILE=""; CONFIG_SOURCED=""
 EXIT_RC=0
 ## set by the daemons only.  A background job may read what is already
@@ -243,8 +247,13 @@ CACHE_TTL=3600                  # s; older -> rescan mounted locations
 INDEX_BASELINES="newest oldest" # snapshots --index walks when none are named
 INDEX_INC_MAX=16                # consolidate the increments once there are
                                 # this many
-INDEX_REMOTE_COPY=1             # also keep a local copy of a remote index, so
-                                # --find works while that host is offline
+SHADOW_SSH_INDEX_FILES=1        # keep a shadow copy of an ssh location's index
+                                # here as well, so --find answers while that
+                                # host is offline. The index itself lives on the
+                                # host that holds the disk, and is built there
+SSH_CONNECT_TIMEOUT=3           # s to wait for an ssh host before calling it
+                                # unreachable; a host that is off must not make
+                                # a command hang
 AUTO_INDEX_TM_BACKUP_DISKS=0    # 1: Time Machine backups on a disk connected to
                                 # this Mac (internal or external, a sparsebundle
                                 # stored on one included) are indexed without
@@ -461,7 +470,8 @@ config_refuse_old_names() {
 		POST_BACKUP_PER_LOCATION:set_location_parameters \
 		HEALTH_MAX_AGE_H:HEALTH_MAX_AGE_DEFAULT \
 		AUTODETECT_LOCAL_TM_BACKUPS:REMOVED \
-		JOBS_ACCESS_NETWORK_VOLUMES:REMOVED; do
+		JOBS_ACCESS_NETWORK_VOLUMES:REMOVED \
+		INDEX_REMOTE_COPY:SHADOW_SSH_INDEX_FILES; do
 		_on_old=${_on%%:*}
 		eval "_on_set=\${$_on_old+set}"
 		[ -n "$_on_set" ] || continue
@@ -948,12 +958,21 @@ handle_is_sane() {
 	return 0
 }
 
+## A location, by HANDLE or by TARGET. The path matters for ssh: handles are
+## this machine's names for things and the remote has its own, so machine to
+## machine my-tm names a location by the one thing both ends agree on -- where
+## the store actually is. A handle always wins, so a path can never shadow one.
+##
 ## awk must CONSUME the whole pipe here: an early `exit` closes it and the
 ## producing printf takes a SIGPIPE, which surfaces as a write error.
 loc_line() {
 	_want="$1"
-	locations_all | awk -F'\t' -v w="$_want" '$1 == w && !f { print; f = 1 }
-		END { exit(f ? 0 : 1) }'
+	locations_all | awk -F'\t' -v w="$_want" '
+		$1 == w && !h { print; h = 1 }
+		$2 == w && p == "" { p = $0 }
+		END { if (h) exit 0
+		      if (p != "") { print p; exit 0 }
+		      exit 1 }'
 }
 
 loc_target() { loc_line "$1" | awk -F'\t' '{print $2}'; }
@@ -980,24 +999,33 @@ loc_indexes() {
 	return 1
 }
 
-## Write the INDEX column. A detected location has no row yet, so this CREATES
-## one -- which is also what makes --forget work for it afterwards. The caller
-## has already checked that the list is writable.
-loc_set_index() {               # <handle> <0|1>
-	_sx_h="$1"; _sx_v="$2"
+## Write ONE field of a location's row. A detected location has no row yet, so
+## this CREATES one -- which is also what makes --forget work for it afterwards.
+## The caller has already checked that the list is writable.
+## Field 3 is where my-tm lives on an ssh host, field 4 the INDEX column.
+loc_set_field() {               # <handle> <3|4> <value>
+	_sx_h="$1"; _sx_n="$2"; _sx_v="$3"
 	_sx_l=$(loc_line "$_sx_h") || return 1
 	_sx_t=$(printf '%s' "$_sx_l" | awk -F'\t' '{print $2}')
 	_sx_i=$(printf '%s' "$_sx_l" | awk -F'\t' '{print $3}')
+	_sx_x=$(printf '%s' "$_sx_l" | awk -F'\t' '{print $4}')
+	case "$_sx_n" in
+		3) _sx_i="$_sx_v" ;;
+		4) _sx_x="$_sx_v" ;;
+		*) return 1 ;;
+	esac
 	_sx_f=$(locations_file)
 	[ -f "$_sx_f" ] || : >"$_sx_f" 2>/dev/null || return 1
 	## rewritten in place, so the row keeps its position in the file
-	awk -F'\t' -v h="$_sx_h" -v t="$_sx_t" -v i="$_sx_i" -v v="$_sx_v" '
+	awk -F'\t' -v h="$_sx_h" -v t="$_sx_t" -v i="$_sx_i" -v v="$_sx_x" '
 		$1 == h { printf "%s\t%s\t%s\t%s\n", h, t, i, v; seen = 1; next }
 		{ print }
 		END { if (!seen) printf "%s\t%s\t%s\t%s\n", h, t, i, v }
 	' "$_sx_f" | cache_write_locations
 	return 0
 }
+
+loc_set_index() { loc_set_field "$1" 4 "$2"; }
 
 ## A sparsebundle is a Time Machine store inside a disk image: the store is
 ## only readable once the image is attached, but its identity is readable
@@ -1082,6 +1110,15 @@ is_remote_target() {
 }
 
 loc_is_remote() { is_remote_target "$(loc_target "$1")"; }
+
+## Is the host that stores an ssh location actually there? One connection
+## attempt, no password prompt, short timeout. Answering "yes" without asking
+## is what made --health report "no snapshots found" for a host that was merely
+## switched off -- a wrong answer dressed up as a real one.
+remote_reachable() {
+	ssh -o BatchMode=yes -o ConnectTimeout="${SSH_CONNECT_TIMEOUT:-3}" \
+		"$1" true >/dev/null 2>&1
+}
 
 remote_host() { printf '%s\n' "${1%%:*}"; }
 remote_path() { printf '%s\n' "${1#*:}"; }
@@ -1186,7 +1223,7 @@ loc_reachable() {
 	case "$_t" in
 		local) return 0 ;;
 	esac
-	is_remote_target "$_t" && return 0
+	is_remote_target "$_t" && { remote_reachable "$(remote_host "$_t")"; return $?; }
 	## an image only has to BE there; opening it is a separate, later cost
 	is_image_target "$_t" && { [ -f "$_t/Info.plist" ] || [ -f "$_t" ]; return $?; }
 	[ -d "$_t" ]
@@ -3730,7 +3767,10 @@ cmd_cat() {
 	if loc_is_remote "$_loc"; then
 		_t=$(loc_target "$_loc")
 		_ts=$(printf '%s' "$_i" | awk -F'\t' '{print $2}')
-		run ssh "$(remote_host "$_t")" "$(remote_install_cmd "$_loc") --cat $_ts$_rel" && return 0
+		## TWO arguments: the remote's --cat is <ID> <PATH>, and one string
+		## with the two run together is neither. The path is the one inside the
+		## volume, so the remote resolves it against its own mountpoint.
+		remote_run "$_loc" --cat "$_ts" "$_rel" && return 0
 		err "remote cat failed"
 	fi
 	[ -f "$_full" ] || err "$_rel: not in that snapshot"
@@ -4039,33 +4079,57 @@ index_consolidate_all() {
 
 index_remote() {
 	_h="$1"
-	_idir=$(loc_install_dir "$_h")
-	if [ -z "$_idir" ] && [ "$INDEX_REMOTE_COPY" != "1" ]; then
-		err "$_h: nowhere to keep the index -- give it a remote install dir in locations.tsv, or set INDEX_REMOTE_COPY=1"
-	fi
 	_t=$(loc_target "$_h")
-	msg "indexing '$_h' on $(remote_host "$_t") (the walk stays where the disk is)"
-	run ssh "$(remote_host "$_t")" "$(remote_install_cmd "$_h") --index $(remote_path "$_t")" || return 1
-	if [ "$INDEX_REMOTE_COPY" = "1" ]; then
+	_rhost=$(remote_host "$_t")
+	## An index has to LIVE somewhere. --copy-self removes my-tm from the host
+	## when the call ends, so the only place left is here -- and that is exactly
+	## what SHADOW_SSH_INDEX_FILES provides. Without it there would be nowhere.
+	if [ -z "$(loc_install_dir "$_h")" ] && [ "$COPY_SELF" = "1" ] &&
+	   [ "${SHADOW_SSH_INDEX_FILES:-1}" != "1" ]; then
+		err "--index --copy-self leaves nothing on $_rhost, so the index can only live here -- set SHADOW_SSH_INDEX_FILES=1, or: $US --install $_rhost"
+	fi
+	msg "indexing '$_h' on $_rhost (the walk stays where the disk is)"
+	remote_run "$_h" --index "$(remote_path "$_t")" || return 1
+	if [ "${SHADOW_SSH_INDEX_FILES:-1}" = "1" ]; then
 		_dir=$(index_dir); need_dir "$_dir"
-		run scp "$(remote_host "$_t"):$CACHE_DIR/index/*.db" "$_dir/" 2>/dev/null ||
-			dbg "no remote index database to copy back yet"
+		run scp "$_rhost:$CACHE_DIR/index/*.db" "$_dir/" 2>/dev/null ||
+			dbg "no index database on $_rhost to shadow yet"
 	fi
 	return 0
 }
 
-## how to invoke my-tm on a remote host: the installed copy, or a shipped one
-remote_install_cmd() {
-	_idir=$(loc_install_dir "$1")
-	if [ -n "$_idir" ]; then printf '%s/my-tm\n' "$_idir"; else printf 'my-tm\n'; fi
+## Run ONE my-tm command on the host that stores this location, and give back
+## what it printed. The disk is there, so the reading and the indexing happen
+## there too; only results cross the network.
+##
+## Normally that is the copy `--install <host>` put on the host, whose directory
+## locations.tsv records. With --copy-self my-tm is shipped over for this one
+## call and removed again in the SAME ssh invocation -- so a run killed here
+## cannot leave a copy of my-tm lying about on someone else's machine.
+remote_run() {                  # <handle> <args...>
+	_rr_h="$1"; shift
+	_rr_t=$(loc_target "$_rr_h")
+	_rr_host=$(remote_host "$_rr_t")
+	_rr_dir=$(loc_install_dir "$_rr_h")
+	if [ -n "$_rr_dir" ]; then
+		# shellcheck disable=SC2029  # building the remote command line here is the point
+		ssh "$_rr_host" "$_rr_dir/my-tm $*"
+		return $?
+	fi
+	[ "$COPY_SELF" = "1" ] ||
+		err "my-tm is not installed on $_rr_host -- run: $US --install $_rr_host   (or add --copy-self to this call)"
+	_rr_tmp="/tmp/my-tm.copy-self.$$"
+	scp -q "$(abs_path "$0")" "$_rr_host:$_rr_tmp" >/dev/null 2>&1 ||
+		err "could not copy my-tm to $_rr_host:$_rr_tmp"
+	# shellcheck disable=SC2029  # ditto; the rm runs on the remote, whatever happens here
+	ssh "$_rr_host" "chmod 0755 $_rr_tmp && $_rr_tmp $*; _rc=\$?; rm -f $_rr_tmp; exit \$_rc"
+	return $?
 }
 
 remote_snap_names() {
 	_t=$(loc_target "$1")
-	## the command line is deliberately built HERE and sent as one string: the
-	## remote copy of my-tm answers in JSON, so nothing has to be re-parsed.
-	# shellcheck disable=SC2029  # local expansion is the point
-	ssh "$(remote_host "$_t")" "$(remote_install_cmd "$1") -J --ls $(remote_path "$_t")" 2>/dev/null |
+	## the remote copy of my-tm answers in JSON, so nothing has to be re-parsed
+	remote_run "$1" -J --ls "$(remote_path "$_t")" 2>/dev/null |
 		sed -nE 's/.*"snapshot": *"([0-9-]+)".*/\1/p' | sort
 	return 0
 }
@@ -4400,6 +4464,15 @@ _EOF
 ## --rm   (snapshots; forgetting a location is --forget)
 #############################################################################
 
+## Deleting a snapshot happens where the store is. `tmutil delete` run HERE
+## with a host:/path would address a local path that does not exist -- or, far
+## worse, one that does. Refuse, and name the command to run on the host.
+refuse_remote_delete() {        # <handle> <what>
+	loc_is_remote "$1" || return 1
+	_rd_t=$(loc_target "$1")
+	err "$1 is on $(remote_host "$_rd_t") -- $2 deletes where the store is: ssh $(remote_host "$_rd_t") my-tm $2 ..."
+}
+
 cmd_rm() {
 	_go=0; _ids=""
 	for _a in "$@"; do
@@ -4417,6 +4490,7 @@ cmd_rm() {
 		_loc=$(printf '%s' "$_hit" | awk -F'\t' '{print $1}')
 		_ts=$(printf '%s' "$_hit" | awk -F'\t' '{print $2}')
 		_id=$(printf '%s' "$_hit" | awk -F'\t' '{print $3}')
+		refuse_remote_delete "$_loc" --rm
 		## The cache is an index, never the authority for a destructive call, so
 		## the store itself is asked. But "I cannot see the store" is NOT "the
 		## snapshot is gone": saying so about a detached disk would report a
@@ -4590,6 +4664,13 @@ cmd_thin() {
 		[ -n "$_h" ] || continue
 		## kept apart: the functions called below set _h themselves
 		_thin_h="$_h"
+		## named explicitly -> refuse and say where to run it; swept over as
+		## part of "every location" -> pass it by, it is not this Mac's to thin
+		if loc_is_remote "$_h"; then
+			[ -n "$_loc" ] && refuse_remote_delete "$_h" --thin
+			dbg "$_h is on another host -- it thins its own store"
+			continue
+		fi
 		loc_ready "$_h" || continue
 		## the CLI beats the location's THIN_POLICY_TO_KEEP (its _DEFAULT unless
 		## set_location_parameters says otherwise)
@@ -5606,14 +5687,54 @@ install_remote() {
 		return 0
 	fi
 	run scp "$(abs_path "$0")" "$_h:$_idir/my-tm" || { warn "$_h: copy failed"; return 1; }
+	# shellcheck disable=SC2029  # building the remote command line here is the point
 	run ssh "$_h" "chmod 0755 $_idir/my-tm && $_idir/my-tm --install go" ||
 		warn "$_h: remote --install failed"
+	## record WHERE it went, so later commands find it instead of asking for
+	## --copy-self on a host that is perfectly well installed
+	if [ -n "${_loc:-}" ] && [ "$(loc_install_dir "$_loc")" != "$_idir" ]; then
+		locations_writable "--install $_h"
+		loc_set_field "$_loc" 3 "$_idir" &&
+			minor "recorded $_idir for '$_loc' in $(locations_file)"
+	fi
+	return 0
+}
+
+## The reverse: my-tm's own --uninstall on the host, then the binary itself.
+uninstall_remote() {
+	_ur_h="$1"; _ur_go="$2"
+	_ur_loc=$(locations_all | awk -F'\t' -v h="$_ur_h" '$2 ~ ("^" h ":") && !f {print $1; f = 1}')
+	_ur_dir=$(loc_install_dir "${_ur_loc:-}")
+	[ -n "$_ur_dir" ] || _ur_dir="/usr/local/sbin"
+	msg "remote uninstall on $_ur_h -> $_ur_dir/my-tm"
+	if [ "$_ur_go" != "1" ]; then
+		minor "dry run -- add the word go"
+		return 0
+	fi
+	# shellcheck disable=SC2029  # building the remote command line here is the point
+	run ssh "$_ur_h" "$_ur_dir/my-tm --uninstall go; rm -f $_ur_dir/my-tm" ||
+		warn "$_ur_h: remote --uninstall failed"
+	if [ -n "${_ur_loc:-}" ] && [ -n "$(loc_install_dir "$_ur_loc")" ]; then
+		locations_writable "--uninstall $_ur_h"
+		loc_set_field "$_ur_loc" 3 "" &&
+			minor "'$_ur_loc' no longer has my-tm on $_ur_h -- later calls need --copy-self"
+	fi
 	return 0
 }
 
 cmd_uninstall() {
-	_go=0
-	for _a in "$@"; do [ "$_a" = "go" ] && _go=1; done
+	_go=0; _host=""
+	for _a in "$@"; do
+		case "$_a" in
+			go) _go=1 ;;
+			*) _host="$_a" ;;
+		esac
+	done
+	## <SSH-HOST> does that host and nothing local -- the mirror of --install
+	if [ -n "$_host" ]; then
+		uninstall_remote "$_host" "$_go"
+		return $?
+	fi
 	require_root "--uninstall"
 	_synth="/etc/synthetic.conf"
 	_fl="${FIRMLINK#/}"
@@ -5802,6 +5923,7 @@ completion_bash() {
 _my_tm() {
   local cur="${COMP_WORDS[COMP_CWORD]}"
   local cmds="--status --ls --lookup --find --show --mount --umount --open --cat
+    --copy-self
     --cp --diff --index --no-index --rm-index --verify --local-snapshot
     --health --rm --thin
     --backup --install --uninstall --setup --add --forget --refresh
@@ -5958,6 +6080,10 @@ INSTALL & SET UP
                                  destinations, exclusions, quota.
                                  See \`--setup --help\` for the flags to do it
                                  from a script instead
+  --copy-self                    (anywhere on the line) ship my-tm to the ssh
+                                 host for THIS call instead of using the copy
+                                 --install put there, and remove it again.
+                                 Handy as: alias my-tm='my-tm --copy-self'
   --add <FOLDER> [<HANDLE>]      register a location; <HANDLE> defaults to a
                                  slug of the volume name
   --forget <HANDLE>              forget a location; no backup is touched
@@ -6138,6 +6264,7 @@ main() {
 			-A|--all) OPT_ALL=1 ;;
 			-J|--json) JSON=1 ;;
 			-f|--force) FORCE=1 ;;
+			--copy-self) COPY_SELF=1 ;;
 			-L|--limit) LIMIT="${1:-}"; shift; _i=$(( _i + 1 )) ;;
 			--limit=*) LIMIT="${_a#*=}" ;;
 			-S|--source) SRC="${1:-}"; shift; _i=$(( _i + 1 )) ;;
@@ -6305,6 +6432,18 @@ case "\$1" in
   *) : ;;
 esac
 exit 0
+_EOF
+	## no host is reachable in the suite: a real ssh would wait out the
+	## timeout, or worse, actually connect to something
+	cat >"$_s/ssh" <<_EOF
+#!/bin/sh
+printf 'ssh %s\n' "\$*" >>"$(t_calls)"
+exit 255
+_EOF
+	cat >"$_s/scp" <<_EOF
+#!/bin/sh
+printf 'scp %s\n' "\$*" >>"$(t_calls)"
+exit 255
 _EOF
 	cat >"$_s/diskutil" <<_EOF
 #!/bin/sh
@@ -7719,6 +7858,78 @@ t_test_headless_health_notifies() {
 
 	rm -f "$NOTIFY_CMD" "$_hn_log"
 	NOTIFY_CMD="$_hn_nc"; HEADLESS_NOTIFY_HEALTH_WARNINGS="$_hn_w"
+}
+
+## ssh locations. Adversarial: a host that is simply switched off must not read
+## as "reachable" -- answering yes without asking is what made --health report
+## "no snapshots found" for a Mac that was off; a delete must never be run HERE
+## for a store that is THERE, since `tmutil delete -d host:/path` addresses a
+## local path; and a host with no my-tm must say which of the two ways out to
+## take rather than failing at the ssh.
+t_test_ssh_locations() {
+	printf '\nAn ssh location is read on the host that stores it\n'
+	_r7_save=$(cat "$T_ROOT/cache/locations.tsv")
+	printf 'noinst\thost2:/Volumes/TM2\t\n' >>"$T_ROOT/cache/locations.tsv"
+
+	## machine to machine, a location is named by the one thing both ends agree
+	## on: where the store is. A handle is this Mac's private name for it.
+	t_eq "a location resolves by its target as well as its handle" \
+		"$(loc_line "$T_ROOT/store" | awk -F'\t' '{print $1}') $(loc_line store | awk -F'\t' '{print $1}')" \
+		"store store"
+	t_eq "an ssh location too -- this is what the remote is sent" \
+		"$(loc_line "host1:/Volumes/TM.Ext" | awk -F'\t' '{print $1}')" "remote"
+	t_eq "and an unknown name is still unknown" \
+		"$(loc_line "/no/such/store" >/dev/null 2>&1 && echo found || echo no)" "no"
+
+	## the ssh stub refuses to connect, which is what a Mac that is off looks like
+	t_eq "a host that cannot be reached is not reachable" \
+		"$(loc_reachable remote && echo reached || echo no)" "no"
+
+	## a delete belongs where the store is
+	_r7_rm=$( ( refuse_remote_delete remote --rm ) 2>&1 >/dev/null )
+	t_match "--rm on another host's store is refused" "$_r7_rm" "ssh host1 my-tm --rm"
+	t_eq "and a local store is not refused at all" \
+		"$( ( refuse_remote_delete store --rm ) >/dev/null 2>&1; printf 'rc=%s' "$?")" "rc=1"
+	t_eq "--rm asks before it plans anything" \
+		"$(sed -n '/^cmd_rm() {$/,/^}$/p' "$T_MYTM" | count_match 'refuse_remote_delete')" "1"
+	t_eq "and --thin does too" \
+		"$(sed -n '/^cmd_thin() {$/,/^}$/p' "$T_MYTM" | count_match 'refuse_remote_delete')" "1"
+
+	## a host with no my-tm on it: two ways out, both named
+	_r7_e=$( ( COPY_SELF=0; remote_run noinst --ls /x ) 2>&1 >/dev/null )
+	t_match "a host without my-tm says how to install it" "$_r7_e" "not installed on host2"
+	## the OFFER, not the /tmp/my-tm.copy-self.<pid> path in a later message
+	t_match "and offers the flag for this one call" "$_r7_e" "or add --copy-self to this call"
+	_r7_c=$( ( COPY_SELF=1; remote_run noinst --ls /x ) 2>&1 >/dev/null )
+	t_match "with --copy-self it ships my-tm over instead" "$_r7_c" "could not copy my-tm to host2"
+
+	## an index has to live somewhere: --copy-self leaves nothing on the host
+	_r7_i=$( ( COPY_SELF=1; SHADOW_SSH_INDEX_FILES=0; index_remote noinst ) 2>&1 >/dev/null )
+	t_match "--index --copy-self needs somewhere for the index to live" \
+		"$_r7_i" "SHADOW_SSH_INDEX_FILES=1"
+	t_eq "with the shadow on, it goes ahead" \
+		"$( ( COPY_SELF=1; SHADOW_SSH_INDEX_FILES=1; index_remote noinst ) 2>&1 >/dev/null |
+		    count_match 'SHADOW_SSH_INDEX_FILES=1, or')" "0"
+
+	## the retired name
+	# shellcheck disable=SC2034  # config_refuse_old_names reads it through eval
+	t_eq "a config still setting INDEX_REMOTE_COPY is refused, naming what replaced it" \
+		"$( ( unset THIN_POLICY_TO_KEEP THIN_POLICY_PER_LOCATION POST_BACKUP \
+		            POST_BACKUP_PER_LOCATION HEALTH_MAX_AGE_H AUTODETECT_LOCAL_TM_BACKUPS \
+		            JOBS_ACCESS_NETWORK_VOLUMES
+		      INDEX_REMOTE_COPY=1; config_refuse_old_names ) 2>&1 |
+		    count_match 'use SHADOW_SSH_INDEX_FILES instead')" "1"
+
+	## --copy-self is a global option, so an alias can carry it
+	t_eq "--copy-self is accepted before and after the command" \
+		"$("$T_MYTM" --copy-self --version >/dev/null 2>&1 && echo ok || echo no) $("$T_MYTM" --version --copy-self >/dev/null 2>&1 && echo ok || echo no)" \
+		"ok ok"
+
+	## --uninstall takes a host, like --install
+	t_eq "--uninstall <HOST> does that host" \
+		"$(sed -n '/^cmd_uninstall() {$/,/^}$/p' "$T_MYTM" | count_match 'uninstall_remote')" "1"
+
+	printf '%s\n' "$_r7_save" | cache_write_locations
 }
 
 ## REGRESSION: the design promised an "exclusive size" column from tmutil
@@ -9171,6 +9382,7 @@ run_tests() {
 	t_test_opt_in_indexing
 	t_test_index_timing
 	t_test_headless_health_notifies
+	t_test_ssh_locations
 	t_test_launcher
 	t_test_install_launcher
 	t_test_job_guidance
