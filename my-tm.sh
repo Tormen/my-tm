@@ -5144,7 +5144,25 @@ add_one() {
 		err "handle '$_handle' is already registered"
 
 	## probe before writing anything
-	if is_image_target "$_folder"; then
+	if is_remote_target "$_folder"; then
+		## The store is on ANOTHER host, so ask that host. Testing "$_folder"
+		## here tests a path of the form `ada:/Volumes/...` against this
+		## machine's filesystem, where it can never exist -- which reported
+		## "it does not look like a sparsebundle" about a path nothing had
+		## looked at, for a bundle that was perfectly fine on ada.
+		_ad_rh=$(remote_host "$_folder"); _ad_rp=$(remote_path "$_folder")
+		if ! remote_reachable "$_ad_rh"; then
+			minor "$_ad_rh is not reachable right now -- registering it unchecked"
+		elif is_image_target "$_folder"; then
+			# shellcheck disable=SC2029  # the path is expanded HERE on purpose
+			if ssh -o BatchMode=yes -o ConnectTimeout="${SSH_CONNECT_TIMEOUT:-3}" \
+			     "$_ad_rh" "test -f '$_ad_rp/Info.plist'" >/dev/null 2>&1; then
+				minor "disk image store on $_ad_rh"
+			else
+				warn "$_ad_rp has no Info.plist on $_ad_rh -- it does not look like a sparsebundle"
+			fi
+		fi
+	elif is_image_target "$_folder"; then
 		## a store inside a disk image: its manifest is only readable once the
 		## image is attached, but Info.plist identifies it without attaching
 		if [ -f "$_folder/Info.plist" ]; then
@@ -5152,7 +5170,7 @@ add_one() {
 		else
 			warn "$_folder has no Info.plist -- it does not look like a sparsebundle"
 		fi
-	elif ! is_remote_target "$_folder"; then
+	else
 		_vols=$(manifest_parse "$_folder" 2>/dev/null | awk -F'\t' '{print $5}' | sort -u | tr '\n' ' ')
 		if [ -z "$(printf '%s' "$_vols" | tr -d ' ')" ]; then
 			warn "$_folder has no readable backup_manifest.plist -- adding it anyway, but it may not be a Time Machine store"
@@ -5710,16 +5728,22 @@ install_remote() {
 		return 0
 	fi
 	run scp "$(abs_path "$0")" "$_h:$_idir/my-tm" || { warn "$_h: copy failed"; return 1; }
+	_ir_ok=1
 	# shellcheck disable=SC2029  # building the remote command line here is the point
-	run ssh "$_h" "chmod 0755 $_idir/my-tm && $_idir/my-tm --install go" ||
+	run ssh "$_h" "chmod 0755 $_idir/my-tm && $_idir/my-tm --install go" || {
 		warn "$_h: remote --install failed"
-	## record WHERE it went, so later commands find it instead of asking for
-	## --copy-self on a host that is perfectly well installed
-	if [ -n "${_loc:-}" ] && [ "$(loc_install_dir "$_loc")" != "$_idir" ]; then
+		_ir_ok=0
+	}
+	## Record WHERE it went, so later commands find it instead of asking for
+	## --copy-self on a host that is perfectly well installed -- but ONLY when
+	## it really installed. The recorded directory is a CLAIM that my-tm is set
+	## up there, and every later command acts on it.
+	if [ "$_ir_ok" = "1" ] && [ -n "${_loc:-}" ] && [ "$(loc_install_dir "$_loc")" != "$_idir" ]; then
 		locations_writable "--install $_h"
 		loc_set_field "$_loc" 3 "$_idir" &&
 			minor "recorded $_idir for '$_loc' in $(locations_file)"
 	fi
+	[ "$_ir_ok" = "1" ] || return 1
 	return 0
 }
 
@@ -8020,6 +8044,47 @@ t_test_every_default_is_offered() {
 	t_eq "no default is missing from the template" "${_ed_miss:-none}" "none"
 }
 
+## Registering and installing a location that lives on ANOTHER host.
+## Adversarial, and both seen for real on 2026-09-16: a probe must not test a
+## path of the form `ada:/Volumes/...` against THIS machine's filesystem, where
+## it can never exist -- that reported "it does not look like a sparsebundle"
+## about a bundle nothing had looked at; and a remote --install that FAILED
+## must not record itself as installed, because every later command reads that
+## record as "my-tm is set up there".
+t_test_remote_add_and_install() {
+	printf '\nAdding and installing on another host\n'
+	_ra_save=$(cat "$T_ROOT/cache/locations.tsv")
+
+	## the ssh stub refuses to connect, so the host is simply unreachable: the
+	## honest answer is "unchecked", never a verdict on the bundle
+	_ra_o=$( ( cmd_add "ada:/Volumes/backup/timeMachine/horse.sparsebundle" horse@ada ) 2>&1 )
+	t_eq "an unreachable host is registered unchecked, with no verdict invented" \
+		"$(printf '%s\n' "$_ra_o" | count_match 'not reachable right now') $(printf '%s\n' "$_ra_o" | count_match 'does not look like a sparsebundle')" \
+		"1 0"
+	t_eq "and it IS registered" \
+		"$(locations_registered | awk -F'\t' '$1 == "horse@ada"' | count_lines)" "1"
+	t_eq "the local path is still probed the local way" \
+		"$( ( cmd_add "$T_ROOT/store" probed ) 2>&1 | count_match 'volumes:')" "1"
+
+	## A remote install that failed leaves no claim that it succeeded. The COPY
+	## has to work and the remote --install fail -- that is the real case, and a
+	## failing scp returns long before the recording is even reached, so a test
+	## built on one proves nothing at all.
+	printf '%s\n' "$_ra_save" | cache_write_locations
+	printf 'inst\tada:/Volumes/backup/tm\t\n' >>"$T_ROOT/cache/locations.tsv"
+	# shellcheck disable=SC2329  # deliberate overrides: the copy works, the install does not
+	_ra_rc=$( ( scp() { return 0; }; ssh() { return 1; }
+	            install_remote ada 1 ) >/dev/null 2>&1; printf '%s' "$?" )
+	t_eq "a failed remote --install records nothing, and says so" \
+		"[$(loc_install_dir inst)] rc=$_ra_rc" "[] rc=1"
+	# shellcheck disable=SC2329  # this time both work
+	( scp() { return 0; }; ssh() { return 0; }; install_remote ada 1 ) >/dev/null 2>&1
+	t_eq "and one that worked does record where it put my-tm" \
+		"[$(loc_install_dir inst)]" "[/usr/local/sbin]"
+
+	printf '%s\n' "$_ra_save" | cache_write_locations
+}
+
 ## REGRESSION: the design promised an "exclusive size" column from tmutil
 ## uniquesize. That tool refuses on an APFS Time Machine store
 ## ("pathInAPFSBackup"), and nothing else on macOS reports per-snapshot space,
@@ -9473,6 +9538,7 @@ run_tests() {
 	t_test_ssh_locations
 	t_test_health_scope
 	t_test_every_default_is_offered
+	t_test_remote_add_and_install
 	t_test_launcher
 	t_test_install_launcher
 	t_test_job_guidance
