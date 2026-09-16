@@ -5808,8 +5808,24 @@ install_remote() {
 	_h="$1"; _go="$2"
 	_loc=$(locations_all | awk -F'\t' -v h="$_h" '$2 ~ ("^" h ":") && !f {print $1; f = 1}')
 	_idir=$(loc_install_dir "${_loc:-}")
-	[ -n "$_idir" ] || _idir="${REMOTE_INSTALL_DIR_DEFAULT:-/usr/local/sbin}"
-	msg "remote install on $_h -> $_idir/my-tm"
+	## A directory recorded for the location wins, which is right -- it is where
+	## my-tm actually IS on that host. But then REMOTE_INSTALL_DIR_DEFAULT has no
+	## effect, and someone who has just set it is owed that fact: otherwise the
+	## setting looks ignored and the reason is invisible, in a file they have no
+	## command to edit.
+	if [ -n "$_idir" ]; then
+		if [ -n "${REMOTE_INSTALL_DIR_DEFAULT:-}" ] &&
+		   [ "$_idir" != "$REMOTE_INSTALL_DIR_DEFAULT" ]; then
+			msg "remote install on $_h -> $_idir/my-tm"
+			minor "recorded for '${_loc:-}' in $(locations_file), so REMOTE_INSTALL_DIR_DEFAULT ($REMOTE_INSTALL_DIR_DEFAULT) does not apply"
+			why "$US --uninstall $_h clears the recorded directory"
+		else
+			msg "remote install on $_h -> $_idir/my-tm"
+		fi
+	else
+		_idir="${REMOTE_INSTALL_DIR_DEFAULT:-/usr/local/sbin}"
+		msg "remote install on $_h -> $_idir/my-tm"
+	fi
 	if [ "$_go" != "1" ]; then
 		minor "dry run -- add the word go"
 		return 0
@@ -8291,9 +8307,15 @@ t_test_remote_install_dir() {
 		      install_remote ada 0 ) 2>&1 )" "/opt/root-only/sbin/my-tm"
 	printf '%s\n' "$_ri_save" | cache_write_locations
 	printf 'ri\tada:/Volumes/tm\t/srv/rootbin\n' >>"$T_ROOT/cache/locations.tsv"
-	t_match "and a directory recorded for the location wins over it" \
-		"$( ( REMOTE_INSTALL_DIR_DEFAULT="/opt/root-only/sbin"; install_remote ada 0 ) 2>&1 )" \
-		"/srv/rootbin/my-tm"
+	_ri_o=$( ( REMOTE_INSTALL_DIR_DEFAULT="/opt/root-only/sbin"; install_remote ada 0 ) 2>&1 )
+	t_match "and a directory recorded for the location wins over it" "$_ri_o" "/srv/rootbin/my-tm"
+	## the precedence must be VISIBLE: a setting that looks ignored, in a file
+	## with no command to edit it, is where the last hour went
+	t_match "and says so, since the setting then has no effect" "$_ri_o" \
+		"REMOTE_INSTALL_DIR_DEFAULT (/opt/root-only/sbin) does not apply"
+	t_eq "but says nothing when the two agree" \
+		"$( ( REMOTE_INSTALL_DIR_DEFAULT="/srv/rootbin"; install_remote ada 0 ) 2>&1 |
+		    count_match 'does not apply')" "0"
 
 	## the refusal must name the directory to FIX, never the path asked about
 	_ri_bad="$T_ROOT/looseparent"
