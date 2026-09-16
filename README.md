@@ -99,10 +99,14 @@ USE
 
 MAINTAIN
   --index   [<LOCATION>|<ID>...] [--all]
-                                 build the name index --find uses.
-                                 Without arguments: the baselines of every
-                                 location. With --all: every snapshot -- an
-                                 overnight job, warns first
+                                 build the name index --find uses. NOTHING is
+                                 indexed until you say so: naming a <LOCATION>
+                                 opts it in for good (needs root), and without
+                                 arguments it indexes what is already opted in.
+                                 With --all: every snapshot -- an overnight
+                                 job, warns first
+  --no-index <LOCATION>...       stop indexing it; its index is kept
+  --rm-index <LOCATION>...       stop indexing it and delete its index
   --verify  <ID> [<PATH>...]     re-check the checksums stored at backup time;
                                  the whole snapshot if no <PATH> given
   --local-snap[shot]             take an APFS local snapshot now.
@@ -347,6 +351,18 @@ $CACHE_DIR/index/<loc>.versions/ -> the version store: per-snapshot delta rows
                                   (path, inode, size, mtime; add/del/mod), §6
 ```
 
+* **Nothing is indexed until you say so.** `--index <LOCATION>` opts a
+  location in for good *and* indexes it now; `--no-index <LOCATION>` stops,
+  keeping what was built, and `--rm-index <LOCATION>` stops and deletes it.
+  The choice is the `INDEX` column of the shared `locations.tsv`, so the
+  daemons read the same answer — which is why writing it needs root.
+  `AUTO_INDEX_TM_BACKUP_DISKS=1` opts in this Mac's own backup disks instead
+  (a sparsebundle stored on one included); never `local`, whose snapshots are
+  a decision rather than a default, and never an ssh location, which its own
+  host's config decides for. A per-location choice always wins over the
+  setting, in both directions. `--status` reports the result in its `INDEXED`
+  column — `no`, or how many of that location's snapshots the index covers —
+  and its footer names the command to change it.
 * **Tier 1, free**: every path that exists *now* is already in the system
   `locate` database, refreshed by macOS. Costs nothing, covers most searches.
 * **Tier 2, `--index`**: walks snapshots to catch paths that no longer exist
@@ -1161,6 +1177,8 @@ INDEX_INC_MAX=16                # consolidate the increments once there are
                                 # this many
 INDEX_REMOTE_COPY=1             # also keep a local copy of a remote index, so
                                 # --find works while that host is offline
+AUTO_INDEX_TM_BACKUP_DISKS=0    # 1: this Mac's backup disks are indexed without
+                                # --index. Never local snapshots, never ssh
 ID_LEN=6
 # --- retention ---
 THIN_POLICY_TO_KEEP_DEFAULT="24h:hourly 7d:daily 4w:weekly 2y:monthly"

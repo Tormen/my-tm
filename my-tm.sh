@@ -66,6 +66,7 @@ IMAGE_SCAN_TTL=300
 INDEX_BASELINES="newest oldest"
 INDEX_INC_MAX=16
 INDEX_REMOTE_COPY=1
+AUTO_INDEX_TM_BACKUP_DISKS=0
 ID_LEN=6
 ## per-location parameters: NAME_DEFAULT here; NAME for one location in a
 ## config's set_location_parameters() (see loc_param)
@@ -241,6 +242,12 @@ INDEX_INC_MAX=16                # consolidate the increments once there are
                                 # this many
 INDEX_REMOTE_COPY=1             # also keep a local copy of a remote index, so
                                 # --find works while that host is offline
+AUTO_INDEX_TM_BACKUP_DISKS=0    # 1: Time Machine backups on a disk connected to
+                                # this Mac (internal or external, a sparsebundle
+                                # stored on one included) are indexed without
+                                # --index. Never local snapshots, never ssh
+                                # locations -- their host's own config decides.
+                                # --index / --no-index per location win over it
 IMAGE_GRACE=600                 # s an attached sparsebundle stays attached after
                                 # its last use; attaching one over a share costs
                                 # minutes, so back-to-back commands reuse it
@@ -940,6 +947,46 @@ loc_line() {
 
 loc_target() { loc_line "$1" | awk -F'\t' '{print $2}'; }
 loc_install_dir() { loc_line "$1" | awk -F'\t' '{print $3}'; }
+
+## The INDEX column of locations.tsv: 1 opted in, 0 opted out, empty means the
+## setting decides. A location that has only been DETECTED has no row at all,
+## so it reads empty until something is written for it.
+loc_index_pref() { loc_line "$1" | awk -F'\t' '{print $4}'; }
+
+## Is this location indexed without being named? An explicit choice wins;
+## otherwise AUTO_INDEX_TM_BACKUP_DISKS covers the Time Machine stores on a disk
+## attached to this Mac. Never `local` -- indexing the boot volume's own
+## snapshots is a decision, not a default -- and never an ssh location, which
+## its own host's config decides for. Call it in a subshell: loc_target sets the
+## same scratch variables its callers use.
+loc_indexes() {
+	case "$(loc_index_pref "$1")" in
+		1) return 0 ;;
+		0) return 1 ;;
+	esac
+	[ "${AUTO_INDEX_TM_BACKUP_DISKS:-0}" = "1" ] || return 1
+	case "$(loc_kind "$1")" in disk | image) return 0 ;; esac
+	return 1
+}
+
+## Write the INDEX column. A detected location has no row yet, so this CREATES
+## one -- which is also what makes --forget work for it afterwards. The caller
+## has already checked that the list is writable.
+loc_set_index() {               # <handle> <0|1>
+	_sx_h="$1"; _sx_v="$2"
+	_sx_l=$(loc_line "$_sx_h") || return 1
+	_sx_t=$(printf '%s' "$_sx_l" | awk -F'\t' '{print $2}')
+	_sx_i=$(printf '%s' "$_sx_l" | awk -F'\t' '{print $3}')
+	_sx_f=$(locations_file)
+	[ -f "$_sx_f" ] || : >"$_sx_f" 2>/dev/null || return 1
+	## rewritten in place, so the row keeps its position in the file
+	awk -F'\t' -v h="$_sx_h" -v t="$_sx_t" -v i="$_sx_i" -v v="$_sx_v" '
+		$1 == h { printf "%s\t%s\t%s\t%s\n", h, t, i, v; seen = 1; next }
+		{ print }
+		END { if (!seen) printf "%s\t%s\t%s\t%s\n", h, t, i, v }
+	' "$_sx_f" | cache_write_locations
+	return 0
+}
 
 ## A sparsebundle is a Time Machine store inside a disk image: the store is
 ## only readable once the image is attached, but its identity is readable
@@ -2687,6 +2734,23 @@ index_dbs() {
 
 index_covered_file() { printf '%s/%s.covered\n' "$(index_dir)" "$1"; }
 
+## Everything indexed FOR one location: the consolidated db, the increments not
+## folded in yet, the record of which snapshots are covered, and the version
+## store built on the same walk. Only this location's -- never the directory.
+index_rm() {
+	_ir_d=$(index_dir)
+	_ir_n=0
+	for _ir_f in "$_ir_d/$1.db" "$_ir_d/$1".inc.*.db "$_ir_d/$1.covered"; do
+		[ -f "$_ir_f" ] || continue
+		rm -f "$_ir_f" 2>/dev/null && _ir_n=$(( _ir_n + 1 ))
+	done
+	if [ -d "$(vs_dir "$1")" ]; then
+		rm -rf "$(vs_dir "$1")" 2>/dev/null && _ir_n=$(( _ir_n + 1 ))
+	fi
+	printf '%s\n' "$_ir_n"
+	return 0
+}
+
 ## every snapshot of a location the index already covers
 unique_cache_dump() {
 	for _d in $(cache_read_dirs); do
@@ -2740,8 +2804,8 @@ _EOF
 	## the LOC column is as wide as the widest handle: truncating a handle would
 	## make the one word the reader has to type back unusable
 	_w=$(printf '%s\n' "$_locs" | awk -F'\t' '{if (length($1) > m) m = length($1)} END {print (m < 3 ? 3 : m)}')
-	printf " %-${_w}s %-30s %6s  %-24s %6s  %s\n" \
-		LOC DESTINATION SNAPS SPAN LAST USED/FREE
+	printf " %-${_w}s %-30s %6s  %-24s %6s  %-11s %s\n" \
+		LOC DESTINATION SNAPS SPAN LAST USED/FREE INDEXED
 	_now=$(now_epoch)
 	while IFS="$(printf '\t')" read -r _h _t _idir; do
 		[ -n "${_h:-}" ] || continue
@@ -2781,9 +2845,17 @@ _EOF
 			_free=$(human_bytes "${_space##*/}")
 			_space="$_used/$_free"
 		fi
-		printf " %-${_w}s %-30s %6s  %-24s %5s%1s  %s\n" \
+		## INDEXED answers two questions at once: whether this location is
+		## indexed at all, and -- when it is -- how far behind the index has
+		## fallen. "no" and "0/74" are different problems with different fixes.
+		if ( loc_indexes "$_h" ); then
+			_ixd="$(index_covered_count "$_h")/$_snaps"
+		else
+			_ixd="no"
+		fi
+		printf " %-${_w}s %-30s %6s  %-24s %5s%1s  %-11s %s\n" \
 			"$_h" "$(printf '%s' "$_dest" | cut -c1-30)" \
-			"$_snaps" "$_span" "$_last" "$_mark" "$_space"
+			"$_snaps" "$_span" "$_last" "$_mark" "$_space" "$_ixd"
 	done <<_EOF
 $_locs
 _EOF
@@ -2818,14 +2890,21 @@ _EOF
 	for _uh in $(printf '%s\n' "$_locs" | awk -F'\t' '{print $1}'); do
 		usage_sample "$_uh"
 	done
-	_note="cache $_csize · index $_isize"
-	_first_loc=$(printf '%s\n' "$_locs" | awk -F'\t' '$2 != "local" && !f {print $1; f = 1}')
-	if [ -n "$_first_loc" ]; then
-		_cov=$(index_covered_count "$_first_loc")
-		_tot=$(snapshots_get "$_first_loc" | count_lines)
-		[ "$_tot" -gt 0 ] && _note="$_note ($_cov/$_tot snaps, $US --index $_first_loc)"
-	fi
-	note "$_note$_scanned"
+	note "cache $_csize · index $_isize$_scanned"
+
+	## how to change the INDEXED column -- each half only where it applies, so a
+	## setup with everything already indexed is not told how to opt in
+	_ix_on=""; _ix_off=""
+	for _ixh in $(printf '%s\n' "$_locs" | awk -F'\t' '{print $1}'); do
+		[ -n "$_only" ] && [ "$_ixh" != "$_only" ] && continue
+		if ( loc_indexes "$_ixh" ); then
+			_ix_on="$_ix_on $_ixh"
+		else
+			_ix_off="$_ix_off $_ixh"
+		fi
+	done
+	[ -n "$_ix_off" ] && note "not indexed:${_ix_off} -- index one: $US --index <LOCATION>"
+	[ -n "$_ix_on" ] && note "indexed:${_ix_on} -- $US --no-index <LOCATION> stops, --rm-index <LOCATION> also deletes"
 
 	## growth, only once the series says something
 	printf '%s\n' "$_locs" | awk -F'\t' '{print $1}' | while IFS= read -r _th; do
@@ -3664,7 +3743,15 @@ cmd_index() {
 	_locs=""
 	_snaps=""
 	if [ -z "$_targets" ]; then
-		_locs=$(locations_all | awk -F'\t' '$2 != "local" {print $1}')
+		## the opted-in ones only -- indexing is never something my-tm starts
+		## doing to a location nobody asked it to
+		for _t in $(locations_all | awk -F'\t' '$2 != "local" {print $1}'); do
+			( loc_indexes "$_t" ) && _locs="$_locs $_t"
+		done
+		if [ -z "$_locs" ]; then
+			note "nothing is indexed -- $US --index <LOCATION> opts one in"
+			return 0
+		fi
 	else
 		for _t in $_targets; do
 			if loc_line "$_t" >/dev/null 2>&1; then
@@ -3673,6 +3760,17 @@ cmd_index() {
 				_snaps="$_snaps $_t"
 			fi
 		done
+		## naming a location OPTS IT IN, so the daemons keep it current from now
+		## on -- that is a change to the shared list, and root's to make
+		if [ -n "$_locs" ]; then
+			## _locs is built as " h1 h2", so it already reads as arguments
+			locations_writable "--index$_locs"
+			for _t in $_locs; do
+				( loc_indexes "$_t" ) && continue
+				loc_set_index "$_t" 1 &&
+					msg "$_t: indexed from now on ($US --no-index $_t stops it)"
+			done
+		fi
 	fi
 
 	if [ -n "$_snaps" ]; then
@@ -3712,6 +3810,44 @@ $(printf '%s\n' "$_rows" | head -n 1 | awk -F'\t' '{print $2}')" ;;
 $_list
 _EOF
 		index_consolidate "$_h"
+	done
+	return 0
+}
+
+## Stop indexing a location, keeping what it has. Separate from --rm-index
+## because the two answers to "stop" are different: an index that is no longer
+## updated still answers --find for the snapshots it covers.
+cmd_no_index() {
+	[ "$#" -ge 1 ] || err "--no-index needs a <LOCATION>"
+	for _nx in "$@"; do
+		loc_line "$_nx" >/dev/null 2>&1 || err "no such location: $_nx ($US --status lists them)"
+	done
+	locations_writable "--no-index$(printf ' %s' "$@")"
+	for _nx in "$@"; do
+		loc_set_index "$_nx" 0 || err "$_nx: could not write the location list"
+		_nx_c=$(index_covered_count "$_nx")
+		if [ "$_nx_c" -gt 0 ]; then
+			msg "$_nx: no longer indexed -- the $_nx_c snapshot(s) it covers still answer $US --find"
+			why "$US --rm-index $_nx deletes them too"
+		else
+			msg "$_nx: no longer indexed"
+		fi
+	done
+	return 0
+}
+
+## Stop indexing a location AND delete what it has.
+cmd_rm_index() {
+	[ "$#" -ge 1 ] || err "--rm-index needs a <LOCATION>"
+	for _rx in "$@"; do
+		loc_line "$_rx" >/dev/null 2>&1 || err "no such location: $_rx ($US --status lists them)"
+	done
+	locations_writable "--rm-index$(printf ' %s' "$@")"
+	for _rx in "$@"; do
+		_rx_c=$(index_covered_count "$_rx")
+		loc_set_index "$_rx" 0 || err "$_rx: could not write the location list"
+		_rx_n=$(index_rm "$_rx")
+		msg "$_rx: index deleted [$_rx_n file(s), $_rx_c snapshot(s) covered] -- no longer indexed"
 	done
 	return 0
 }
@@ -5317,6 +5453,8 @@ $_rem
 _EOF
 	fi
 	msg "installed"
+	note "nothing is indexed by default -- the table below says which locations are"
+	cmd_status
 	return 0
 }
 
@@ -5484,6 +5622,8 @@ _my-tm() {
     '--cp:copy a version out'
     '--diff:what changed since then'
     '--index:build the name index'
+    '--no-index:stop indexing a location, keep its index'
+    '--rm-index:stop indexing a location and delete its index'
     '--verify:re-check stored checksums'
     '--local-snapshot:take an APFS local snapshot'
     '--health:run the health checks'
@@ -5518,7 +5658,8 @@ completion_bash() {
 _my_tm() {
   local cur="${COMP_WORDS[COMP_CWORD]}"
   local cmds="--status --ls --lookup --find --show --mount --umount --open --cat
-    --cp --diff --index --verify --local-snapshot --health --rm --thin
+    --cp --diff --index --no-index --rm-index --verify --local-snapshot
+    --health --rm --thin
     --backup --install --uninstall --setup --add --forget --refresh
     --create-config --config --completion --run-tests --help"
   if [[ "$cur" == -* ]]; then
@@ -5624,9 +5765,17 @@ MAINTAIN
   --index   [<LOCATION>|<ID>...] [--all]
                                  build the name index --find uses, and record
                                  each snapshot's exclusive size* on the same
-                                 pass. Without arguments: the baselines of every
-                                 location. With --all: every snapshot -- an
-                                 overnight job, warns first
+                                 pass. NOTHING is indexed until you say so:
+                                 naming a <LOCATION> opts it in for good (needs
+                                 root -- the location list is shared), and
+                                 without arguments it indexes the locations
+                                 already opted in. AUTO_INDEX_TM_BACKUP_DISKS=1
+                                 opts in this Mac's backup disks instead.
+                                 With --all: every snapshot -- an overnight
+                                 job, warns first
+  --no-index <LOCATION>...       stop indexing it; the index it has is kept and
+                                 still answers --find
+  --rm-index <LOCATION>...       stop indexing it and delete its index
   --verify  <ID> [<PATH>...]     re-check the checksums stored at backup time;
                                  the whole snapshot if no <PATH> given
   --local-snap[shot]             take an APFS local snapshot now.
@@ -5926,6 +6075,8 @@ main() {
 		--cp)           [ "$#" -ge 2 ] || err "--cp needs <ID> <PATH> [<DEST>]"; cmd_cp "$@" ;;
 		--diff)         [ "$#" -ge 1 ] || err "--diff needs an <ID>"; cmd_diff "$@" ;;
 		--index)        cmd_index "$@" ;;
+		--no-index)     cmd_no_index "$@" ;;
+		--rm-index)     cmd_rm_index "$@" ;;
 		--verify)       [ "$#" -ge 1 ] || err "--verify needs an <ID>"; cmd_verify "$@" ;;
 		--local-snap|--local-snapshot) cmd_local_snap ;;
 		--health)       cmd_health "$@" ;;
@@ -7179,6 +7330,95 @@ t_test_snapshot_set_is_validated() {
 
 	## --status says how old its picture is, rather than implying it is current
 	t_match "the footer dates the scan" "$(cmd_status 2>&1)" "scanned .* ago"
+}
+
+## Opt-in indexing. Adversarial where it counts: AUTO_INDEX_TM_BACKUP_DISKS
+## must never override an explicit --no-index (or the opt-out silently undoes
+## itself on the next run); --rm-index must take ONLY its own location's files,
+## never a neighbour's; --no-index must delete nothing at all; and opting in a
+## location that DETECTION found must leave a row behind, or the choice is
+## forgotten the moment the command ends.
+t_test_opt_in_indexing() {
+	printf '\nIndexing is opted into, never assumed\n'
+	_oi_a="${AUTO_INDEX_TM_BACKUP_DISKS:-0}"
+	_oi_save=$(cat "$T_ROOT/cache/locations.tsv")
+	_oi_d=$(index_dir); mkdir -p "$_oi_d"
+
+	_oi_three() {
+		printf '%s %s %s' \
+			"$( ( loc_indexes store ) && echo yes || echo no)" \
+			"$( ( loc_indexes local ) && echo yes || echo no)" \
+			"$( ( loc_indexes remote ) && echo yes || echo no)"
+	}
+	AUTO_INDEX_TM_BACKUP_DISKS=0
+	t_eq "nothing is indexed by default" "$(_oi_three)" "no no no"
+	AUTO_INDEX_TM_BACKUP_DISKS=1
+	t_eq "the setting covers this Mac's backup disks, and only those" \
+		"$(_oi_three)" "yes no no"
+
+	## an explicit choice beats the setting, in BOTH directions
+	loc_set_index store 0
+	t_eq "--no-index wins over the setting being on" \
+		"$( ( loc_indexes store ) && echo yes || echo no)" "no"
+	AUTO_INDEX_TM_BACKUP_DISKS=0
+	loc_set_index store 1
+	t_eq "and --index wins over it being off" \
+		"$( ( loc_indexes store ) && echo yes || echo no)" "yes"
+	t_eq "the rewritten row keeps its target, and no row is lost" \
+		"$(loc_line store) [$(locations_registered | count_lines)]" \
+		"$(printf 'store\t%s\t\t1' "$T_ROOT/store") [2]"
+
+	## a location only DETECTION knows about has no row at all until now
+	_oi_det=$(locations_all | awk -F'\t' \
+		'$1 != "store" && $1 != "remote" && $1 != "local" && !f {print $1; f = 1}')
+	if [ -n "$_oi_det" ]; then
+		_oi_n=$(locations_registered | count_lines)
+		loc_set_index "$_oi_det" 1
+		t_eq "opting a DETECTED location in leaves a row behind" \
+			"$(locations_registered | awk -F'\t' -v h="$_oi_det" '$1 == h' | count_lines) of $(locations_registered | count_lines)" \
+			"1 of $(( _oi_n + 1 ))"
+		loc_set_index "$_oi_det" 0
+	else
+		t_skip "a detected location gains a row" "none detected in the fixture"
+	fi
+
+	## the table and its footer
+	_oi_st=$(cmd_status 2>/dev/null)
+	t_eq "the table has an INDEXED column, covered/total for the opted-in one and no for the rest" \
+		"$(printf '%s\n' "$_oi_st" | awk '$1 == "store" || $1 == "local" {print $NF}' | tr '\n' '|')" \
+		"0/$(snapshots_get store | count_lines)|no|"
+	t_eq "the footer says how to opt in AND how to opt out" \
+		"$(printf '%s\n' "$_oi_st" | count_match 'not indexed:') $(printf '%s\n' "$_oi_st" | count_match 'no-index <LOCATION> stops')" \
+		"1 1"
+
+	## fake index artefacts for two locations: one to remove, one that must survive
+	: >"$_oi_d/store.db"; : >"$_oi_d/store.inc.00.db"
+	printf '2026-01-01-000000\n' >"$_oi_d/store.covered"
+	mkdir -p "$(vs_dir store)"; : >"$(vs_dir store)/rows.tsv"
+	: >"$_oi_d/remote.db"; printf '2026-01-01-000000\n' >"$_oi_d/remote.covered"
+
+	cmd_no_index store >/dev/null 2>&1
+	t_eq "--no-index stops it and deletes nothing" \
+		"$( ( loc_indexes store ) && echo yes || echo no) $([ -f "$_oi_d/store.db" ] && echo kept || echo gone)" \
+		"no kept"
+
+	loc_set_index store 1
+	cmd_rm_index store >/dev/null 2>&1
+	t_eq "--rm-index stops it and deletes ITS files, not the neighbour's" \
+		"$( ( loc_indexes store ) && echo yes || echo no) store:$(find "$_oi_d" -maxdepth 1 -name 'store.*' 2>/dev/null | count_lines) remote:$(find "$_oi_d" -maxdepth 1 -name 'remote.*' 2>/dev/null | count_lines)" \
+		"no store:0 remote:2"
+
+	## with nothing opted in, neither the footer nor --index offers to keep going
+	_oi_st2=$(cmd_status 2>/dev/null)
+	t_eq "the footer then offers only the way in" \
+		"$(printf '%s\n' "$_oi_st2" | count_match 'not indexed:') $(printf '%s\n' "$_oi_st2" | count_match 'no-index <LOCATION> stops')" \
+		"1 0"
+	t_eq "and --index with no argument indexes nothing, saying why" \
+		"$( ( cmd_index ) 2>&1 | count_match 'nothing is indexed')" "1"
+
+	rm -f "$_oi_d/remote.db" "$_oi_d/remote.covered"
+	printf '%s\n' "$_oi_save" | cache_write_locations
+	AUTO_INDEX_TM_BACKUP_DISKS="$_oi_a"
 }
 
 ## REGRESSION: the design promised an "exclusive size" column from tmutil
@@ -8628,6 +8868,7 @@ run_tests() {
 	t_test_install_logs
 	t_test_job_plist_streams
 	t_test_network_volume_of
+	t_test_opt_in_indexing
 	t_test_launcher
 	t_test_install_launcher
 	t_test_job_guidance
