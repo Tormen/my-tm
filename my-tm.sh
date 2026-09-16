@@ -796,6 +796,13 @@ cache_read_dirs() {
 ## root and read this file.
 locations_file() { printf '%s/locations.tsv\n' "$CACHE_DIR"; }
 
+## write the location list from stdin (the tests restore it this way)
+cache_write_locations() {
+	_cwl=$(locations_file)
+	grep -v '^[[:space:]]*$' | atomic_write "$_cwl" 2>/dev/null || true
+	return 0
+}
+
 ## The shared list is root's to write. Refuse in one line that names the very
 ## command to run again, rather than writing a private copy nobody's daemon
 ## reads.
@@ -916,6 +923,18 @@ _EOF
 	case " $_seen " in
 		*" local "*) : ;;
 		*) printf 'local\tlocal\t\n' ;;
+	esac
+	return 0
+}
+
+## A handle ends up in half a dozen file names -- $MOUNT_ROOT/<handle>,
+## usage.<handle>.tsv, .manifest.<handle>, <handle>.db, <handle>.covered -- and
+## in a TAB-separated row. So: letters, digits, - . @ only, and never leading
+## with - or . (an option, or a dotfile). `horse@ada' is exactly why @ is in.
+handle_is_sane() {
+	case "${1:-}" in
+		"" | -* | .*) return 1 ;;
+		*[!A-Za-z0-9.@-]*) return 1 ;;
 	esac
 	return 0
 }
@@ -4795,6 +4814,8 @@ add_one() {
 			_handle=$(slug "$(basename "$_folder")")
 		fi
 	fi
+	handle_is_sane "$_handle" ||
+		err "'$_handle' cannot be a handle: letters, digits, '-', '.' and '@' only, and not starting with '-' or '.'. It names a directory under $FIRMLINK and several cache files."
 	is_id_word "$_handle" &&
 		err "'$_handle' reads like a snapshot ID (6-8 characters, all from the ID alphabet), so my-tm could never tell them apart. Try '$_handle-tm'."
 	## awk's `exit` still runs END, so END's status would win -- use a flag
@@ -6437,6 +6458,30 @@ t_test_one_shared_location_list() {
 	t_eq "and wrote nothing" "$(count_match 'newloc' < "$_sl_ro/locations.tsv")" "0"
 	chmod 0644 "$_sl_ro/locations.tsv"; rm -rf "$_sl_ro"
 	CACHE_DIR="$_sl_cd"; CACHE_DIR_USER="$_sl_cu"
+	return 0
+}
+
+## A handle is a file name and a TAB-separated field, not free text.
+## Adversarial: --add took ANY handle, so "a/b" would have written outside
+## $FIRMLINK, a tab would have split the row into different columns, and "-f"
+## would have read as an option wherever the handle is passed on.
+t_test_handle_characters() {
+	printf '\nHandles are file names, and checked as such\n'
+	_hc_f=$(locations_file)
+	_hc_before=$(cat "$_hc_f" 2>/dev/null)
+	for _hc_bad in "a/b" "with space" "-dash" ".dot" "tab$(printf '\t')ped" 'semi;colon' 'star*'; do
+		_hc_out=$( ( cmd_add "$T_ROOT/store" "$_hc_bad" ) 2>&1 >/dev/null )
+		t_match "refused: '$_hc_bad'" "$_hc_out" "cannot be a handle"
+	done
+	t_eq "and none of them was written" "$(cat "$_hc_f" 2>/dev/null)" "$_hc_before"
+
+	## the one the design needs
+	cmd_add "$T_ROOT/store" "horse@ada" >/dev/null 2>&1
+	t_eq "horse@ada is a handle" \
+		"$(locations_registered | awk -F'\t' '$1 == "horse@ada"' | count_lines)" "1"
+	## ... and it works as a location, file names and all
+	t_eq "and resolves to its target" "$(loc_target 'horse@ada')" "$T_ROOT/store"
+	printf '%s\n' "$_hc_before" | cache_write_locations
 	return 0
 }
 
@@ -8608,6 +8653,7 @@ run_tests() {
 	t_test_config
 	t_test_location_parameters
 	t_test_locations
+	t_test_handle_characters
 	t_test_one_shared_location_list
 	t_test_ladder
 	t_test_mount_records

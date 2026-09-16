@@ -1222,7 +1222,11 @@ Handle defaults to a slug of the volume name.
 
 A handle that could be mistaken for a snapshot ID — 6 to 8 chars, all from the
 ID alphabet (`0-9a-z` minus `ilou`, §5) — is **refused at `--add` time**, with
-a suggestion; `backup` is fine (it contains a `u`), `k7f2q9x` would not be. Rejecting it
+a suggestion. So is a handle that is not a usable file name: it becomes
+`$FIRMLINK/<handle>`, `usage.<handle>.tsv`, `.manifest.<handle>`,
+`<handle>.db`, `<handle>.covered` and one TAB-separated field, so only letters,
+digits, `-`, `.` and `@` are allowed, never leading with `-` or `.`
+(`horse@ada` is fine; `a/b`, `with space` and a tab are not). `backup` is fine (it contains a `u`), `k7f2q9x` would not be. Rejecting it
 once, at the only moment a human chose the name, is far better than making every
 later `--rm`/`--ls`/`--mount` disambiguate an ambiguity that never needed to
 exist. (Rung 1 of the ladder would win anyway, so such a handle would be
