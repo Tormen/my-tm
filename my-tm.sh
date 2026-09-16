@@ -1318,7 +1318,22 @@ loc_store_path() {
 loc_volume() { loc_store_path "$1"; }
 
 ## device node of a mounted volume (disk5s2)
+## The device a volume is mounted from (disk5s2). The mount table already says
+## it, in about 10 ms and without asking anything: diskutil info goes through
+## diskarbitrationd, which usually answers in 0.1 s but blocked for 11 s while
+## an index walk was reading the same disk -- and that call alone made a
+## --status take 12 s. diskutil stays as the fallback for anything the table
+## does not name. Only a real device line counts: a mounted SNAPSHOT of the same
+## disk reads "com.apple.TimeMachine....@/dev/disk5s2 on ...".
 vol_device() {
+	_vd=$(mount_table | awk -v p="$1" '
+		$1 ~ /^\/dev\// && index($0, " on " p " (") && !f {
+			d = $1; sub(/^\/dev\//, "", d); print d; f = 1
+		}')
+	if [ -n "$_vd" ]; then
+		printf '%s\n' "$_vd"
+		return 0
+	fi
 	_plist=$(mktemp /tmp/my-tm.disk.XXXXXX) || return 1
 	if diskutil info -plist "$1" >"$_plist" 2>/dev/null; then
 		plutil -extract DeviceIdentifier raw -o - "$_plist" 2>/dev/null
@@ -8984,6 +8999,33 @@ t_test_loc_resolve() {
 	printf '%s\n' "$_lr_save" | cache_write_locations
 }
 
+## A volume's device, from the mount table. Adversarial: diskutil info blocked
+## for 11 s on a busy disk and made --status take 12 s, so the answer must come
+## without it; but a mounted SNAPSHOT of the same disk must not be taken for the
+## volume, and /Volumes/TM must not match /Volumes/TM2.
+t_test_vol_device() {
+	printf '\nA volume device comes from the mount table\n'
+	_vd_save="$MOUNT_TABLE_FILE"
+	MOUNT_TABLE_FILE="$T_ROOT/vd.table"
+	{
+		printf 'com.apple.TimeMachine.2026-09-16-234954.backup@/dev/disk5s2 on /Volumes/TM (apfs, local, read-only)\n'
+		printf '/dev/disk7s1 on /Volumes/TM2 (apfs, local, journaled)\n'
+		printf '/dev/disk5s2 on /Volumes/TM (apfs, local, nodev, nosuid, journaled)\n'
+	} >"$MOUNT_TABLE_FILE"
+	: >"$(t_calls)"
+	t_eq "the device is read from the table" "$(vol_device /Volumes/TM)" "disk5s2"
+	t_eq "without asking diskutil" "$(count_match 'diskutil info' <"$(t_calls)")" "0"
+	## the longer name FIRST, so a prefix match would take it for /Volumes/TM
+	{
+		printf '/dev/disk7s1 on /Volumes/TM2 (apfs, local, journaled)\n'
+		printf '/dev/disk5s2 on /Volumes/TM (apfs, local, journaled)\n'
+	} >"$MOUNT_TABLE_FILE"
+	t_eq "a volume whose name only starts the same is a different volume" \
+		"$(vol_device /Volumes/TM)" "disk5s2"
+	rm -f "$MOUNT_TABLE_FILE"
+	MOUNT_TABLE_FILE="$_vd_save"
+}
+
 ## REGRESSION: the design promised an "exclusive size" column from tmutil
 ## uniquesize. That tool refuses on an APFS Time Machine store
 ## ("pathInAPFSBackup"), and nothing else on macOS reports per-snapshot space,
@@ -10449,6 +10491,7 @@ run_tests() {
 	t_test_status_index_size
 	t_test_run_cache
 	t_test_loc_resolve
+	t_test_vol_device
 	t_test_launcher
 	t_test_install_launcher
 	t_test_job_guidance
