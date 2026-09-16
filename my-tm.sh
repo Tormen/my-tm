@@ -67,6 +67,7 @@ INDEX_BASELINES="newest oldest"
 INDEX_INC_MAX=16
 SHADOW_SSH_INDEX_FILES=1
 SSH_CONNECT_TIMEOUT=3
+REMOTE_INSTALL_DIR_DEFAULT="/usr/local/sbin"
 AUTO_INDEX_TM_BACKUP_DISKS=0
 # shellcheck disable=SC2034  # read through loc_param, which builds its name
 INDEX_INTERVAL_DEFAULT="1d"
@@ -259,6 +260,14 @@ SHADOW_SSH_INDEX_FILES=1        # keep a shadow copy of an ssh location's index
 SSH_CONNECT_TIMEOUT=3           # s to wait for an ssh host before calling it
                                 # unreachable; a host that is off must not make
                                 # a command hang
+REMOTE_INSTALL_DIR_DEFAULT="/usr/local/sbin"   # where --install <HOST> puts
+                                # my-tm on a host that has no directory recorded
+                                # for it yet. It must be writable by ROOT ONLY:
+                                # a LaunchDaemon runs it as root, so anyone who
+                                # can write there can run anything as root.
+                                # /usr/local/sbin is group-writable on many Macs
+                                # (Homebrew), and --install refuses it when so.
+                                # locations.tsv's 3rd field wins per location
 AUTO_INDEX_TM_BACKUP_DISKS=0    # 1: Time Machine backups on a disk connected to
                                 # this Mac (internal or external, a sparsebundle
                                 # stored on one included) are indexed without
@@ -577,6 +586,22 @@ atomic_write() {
 ## true when any component of <path> is writable by group or other -- the test
 ## --install uses to refuse installing a job that runs a binary someone else
 ## could rewrite.
+## WHICH directory in the chain anyone but root can write -- the one to fix.
+## Naming the path that was asked about is no help: it is almost never the one
+## with the loose mode, and a message that repeats the question as its own
+## answer sends the reader in a circle.
+path_user_writable_at() {
+	_pw="$1"
+	while :; do
+		_pws=$(stat -f '%Sp' "$_pw" 2>/dev/null) || return 1
+		case "$_pws" in
+			?????w???? | ????????w?) printf '%s is %s\n' "$_pw" "$_pws"; return 0 ;;
+		esac
+		case "$_pw" in /|"") return 1 ;; esac
+		_pw=$(dirname "$_pw")
+	done
+}
+
 path_is_user_writable() {
 	_p="$1"
 	[ -e "$_p" ] || return 1
@@ -5684,7 +5709,7 @@ cmd_install() {
 
 	## a job must not run a binary anyone but root can rewrite
 	if path_is_user_writable "$MY_TM_BIN"; then
-		err "$MY_TM_BIN is inside a group- or world-writable tree, so a LaunchDaemon running it as root would execute whatever someone puts there. Install a root-owned copy (e.g. /usr/local/sbin/my-tm, root:wheel 0755) and run --install from that."
+		err "$MY_TM_BIN is inside a group- or world-writable tree ($(path_user_writable_at "$MY_TM_BIN")), so a LaunchDaemon running it as root would execute whatever someone puts there. Put my-tm somewhere only root can write and run --install from there; for a remote host, REMOTE_INSTALL_DIR_DEFAULT or the 3rd field of locations.tsv chooses where."
 	fi
 	## the same for the launcher, which runs as root AND holds Full Disk Access
 	if [ "$JOBS_RUN_WITH_FULL_DISK_ACCESS" = "1" ] && path_is_user_writable "$(dirname "$JOBS_LAUNCHER")"; then
@@ -5783,7 +5808,7 @@ install_remote() {
 	_h="$1"; _go="$2"
 	_loc=$(locations_all | awk -F'\t' -v h="$_h" '$2 ~ ("^" h ":") && !f {print $1; f = 1}')
 	_idir=$(loc_install_dir "${_loc:-}")
-	[ -n "$_idir" ] || _idir="/usr/local/sbin"
+	[ -n "$_idir" ] || _idir="${REMOTE_INSTALL_DIR_DEFAULT:-/usr/local/sbin}"
 	msg "remote install on $_h -> $_idir/my-tm"
 	if [ "$_go" != "1" ]; then
 		minor "dry run -- add the word go"
@@ -5814,7 +5839,7 @@ uninstall_remote() {
 	_ur_h="$1"; _ur_go="$2"
 	_ur_loc=$(locations_all | awk -F'\t' -v h="$_ur_h" '$2 ~ ("^" h ":") && !f {print $1; f = 1}')
 	_ur_dir=$(loc_install_dir "${_ur_loc:-}")
-	[ -n "$_ur_dir" ] || _ur_dir="/usr/local/sbin"
+	[ -n "$_ur_dir" ] || _ur_dir="${REMOTE_INSTALL_DIR_DEFAULT:-/usr/local/sbin}"
 	msg "remote uninstall on $_ur_h -> $_ur_dir/my-tm"
 	if [ "$_ur_go" != "1" ]; then
 		minor "dry run -- add the word go"
@@ -8232,6 +8257,47 @@ t_test_private_var_is_var() {
 	MOUNT_TABLE_FILE="$_pv_save"
 }
 
+## Where --install puts my-tm on a remote host. Seen on ada on 2026-09-16:
+## /usr/local/sbin is drwxrwxr-x root:admin on a Mac with Homebrew, so a
+## LaunchDaemon running my-tm as root would execute whatever any admin user
+## put there -- refused, correctly. What was wrong was the WAY OUT: the message
+## offered the very path it was refusing, and the directory was a literal in
+## the code, so there was no way to choose another one.
+t_test_remote_install_dir() {
+	printf '\nWhere my-tm goes on a remote host\n'
+	_ri_d="${REMOTE_INSTALL_DIR_DEFAULT:-}"
+	_ri_save=$(cat "$T_ROOT/cache/locations.tsv")
+
+	t_eq "the default is a setting, not a literal in install_remote" \
+		"$(sed -n '/^install_remote() {$/,/^}$/p' "$T_MYTM" | count_match '"/usr/local/sbin"')" "0"
+	t_match "and --create-config offers it" "$(cmd_create_config)" "REMOTE_INSTALL_DIR_DEFAULT"
+
+	## a site can move it, and a location can override the site
+	printf 'ri\tada:/Volumes/tm\t\n' >>"$T_ROOT/cache/locations.tsv"
+	# shellcheck disable=SC2329  # the copy works so the plan is reached; the install need not
+	t_match "the setting decides where it goes" \
+		"$( ( REMOTE_INSTALL_DIR_DEFAULT="/opt/root-only/sbin"; scp() { return 0; }; ssh() { return 0; }
+		      install_remote ada 0 ) 2>&1 )" "/opt/root-only/sbin/my-tm"
+	printf '%s\n' "$_ri_save" | cache_write_locations
+	printf 'ri\tada:/Volumes/tm\t/srv/rootbin\n' >>"$T_ROOT/cache/locations.tsv"
+	t_match "and a directory recorded for the location wins over it" \
+		"$( ( REMOTE_INSTALL_DIR_DEFAULT="/opt/root-only/sbin"; install_remote ada 0 ) 2>&1 )" \
+		"/srv/rootbin/my-tm"
+
+	## the refusal must name the directory to FIX, never the path asked about
+	_ri_bad="$T_ROOT/looseparent"
+	mkdir -p "$_ri_bad/sbin"; chmod 0775 "$_ri_bad"
+	: >"$_ri_bad/sbin/my-tm"
+	t_match "the refusal names which directory is loose, and its mode" \
+		"$(path_user_writable_at "$_ri_bad/sbin/my-tm")" "looseparent is drwxrwxr-x"
+	t_eq "a path only root can write has no such directory to name" \
+		"$(path_user_writable_at /usr/bin/true >/dev/null 2>&1 && echo found || echo none)" "none"
+	chmod 0755 "$_ri_bad"; rm -rf "$_ri_bad"
+
+	printf '%s\n' "$_ri_save" | cache_write_locations
+	REMOTE_INSTALL_DIR_DEFAULT="$_ri_d"
+}
+
 ## REGRESSION: the design promised an "exclusive size" column from tmutil
 ## uniquesize. That tool refuses on an APFS Time Machine store
 ## ("pathInAPFSBackup"), and nothing else on macOS reports per-snapshot space,
@@ -9688,6 +9754,7 @@ run_tests() {
 	t_test_remote_add_and_install
 	t_test_unrecorded_mounts
 	t_test_private_var_is_var
+	t_test_remote_install_dir
 	t_test_launcher
 	t_test_install_launcher
 	t_test_job_guidance
