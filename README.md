@@ -1138,7 +1138,6 @@ the plain `my-tm.conf`. It never overwrites a different file there (it offers
 # --add and --forget refuse when that file is not theirs to write, naming the
 # command to run again as root. A per-user copy from before this rule is no
 # longer read; --status names it and prints an --add line per location in it.
-AUTODETECT_LOCAL_TM_BACKUPS=1   # also pick up destinations tmutil reports
 DEFAULT_CMD="--status"          # what a bare `my-tm` runs; params allowed
 TM_GROUP=""                     # group with read access to the shared cache;
                                 # "" = the invoking user's primary group
@@ -1229,10 +1228,14 @@ later `--rm`/`--ls`/`--mount` disambiguate an ambiguity that never needed to
 exist. (Rung 1 of the ladder would win anyway, so such a handle would be
 unusable in practice.)
 
-`AUTODETECT_LOCAL_TM_BACKUPS=1` costs one `tmutil destinationinfo` (~30 ms, no
-disk walk) plus a `stat` per cached mountpoint — cheap enough to stay **on by
-default**. Snapshot enumeration is cache-backed and `CACHE_TTL`-gated, never
-implicit for a location you did not ask about. Network destinations are never
+**Detection is always on**, with no setting: what this Mac is set up to back up
+to is not a matter of taste. It costs one `tmutil destinationinfo` (14 ms
+measured) plus a scan for this Mac's own sparsebundles, cached for
+`IMAGE_SCAN_TTL`. A detected disk whose **target** is already registered is
+skipped, so the same disk never appears twice — once under the name you gave it
+and once under its volume name, which would make every snapshot ID ambiguous.
+Snapshot enumeration stays cache-backed and `CACHE_TTL`-gated, never implicit
+for a location you did not ask about. Network destinations are never
 auto-mounted; they show their last known state with `?`.
 
 ## 14. Backup control — replacing `my-tm.sh` *(spec)*

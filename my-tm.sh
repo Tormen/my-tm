@@ -33,7 +33,6 @@ MY_TM_VERSION="0.9.2"
 ## DEFAULTS -- all neutral.  Site values belong in the config file, never here.
 #############################################################################
 
-AUTODETECT_LOCAL_TM_BACKUPS=1
 AUTO_MOUNT_DESTINATIONS=1
 DEFAULT_CMD="--status"
 TM_GROUP=""
@@ -229,7 +228,6 @@ _default_config_content() {
 
 # Locations live in $CACHE_DIR/locations.tsv, maintained by --add / --forget --
 # not in this file.
-AUTODETECT_LOCAL_TM_BACKUPS=1   # also pick up destinations tmutil reports
 AUTO_MOUNT_DESTINATIONS=1       # a destination that is attached but not
                                 # mounted is invisible to every read; mount
                                 # it, use it, and put it back as it was
@@ -457,11 +455,16 @@ config_refuse_old_names() {
 		THIN_POLICY_PER_LOCATION:set_location_parameters \
 		POST_BACKUP:POST_BACKUP_DEFAULT \
 		POST_BACKUP_PER_LOCATION:set_location_parameters \
-		HEALTH_MAX_AGE_H:HEALTH_MAX_AGE_DEFAULT; do
+		HEALTH_MAX_AGE_H:HEALTH_MAX_AGE_DEFAULT \
+		AUTODETECT_LOCAL_TM_BACKUPS:REMOVED; do
 		_on_old=${_on%%:*}
 		eval "_on_set=\${$_on_old+set}"
 		[ -n "$_on_set" ] || continue
-		err "$_on_old is no longer read (config:$CONFIG_SOURCED) -- use ${_on#*:} instead; $US --create-config shows the current names"
+		case "${_on#*:}" in
+			## removed outright: there is nothing to use instead
+			REMOVED) err "$_on_old is no longer read (config:$CONFIG_SOURCED) -- detection is always on now; remove the line" ;;
+			*) err "$_on_old is no longer read (config:$CONFIG_SOURCED) -- use ${_on#*:} instead; $US --create-config shows the current names" ;;
+		esac
 	done
 	return 0
 }
@@ -872,40 +875,43 @@ locations_all() {
 $_reg
 _EOF
 	fi
-	if [ "$AUTODETECT_LOCAL_TM_BACKUPS" = "1" ]; then
-		_dst=$(destinations_scan)
-		if [ -n "$_dst" ]; then
-			while IFS="$(printf '\t')" read -r _name _mp _id _kind; do
-				[ -n "${_mp:-}" ] || continue
-				_h=$(slug "$_name")
-				case " $_seen " in *" $_h "*) continue ;; esac
-				## a handle that could read as an ID is unusable (rung 1 wins)
-				is_id_word "$_h" && _h="${_h}-tm"
-				_seen="$_seen $_h"
-				printf '%s\t%s\t\n' "$_h" "$_mp"
-			done <<_EOF
+	## Time Machine's own destinations, always: what this Mac is set up to back
+	## up to is not a matter of taste. A disk already registered is skipped by
+	## its TARGET, not just by its handle -- otherwise the same disk appears
+	## twice, once under the name you gave it and once under its volume name.
+	_dst=$(destinations_scan)
+	if [ -n "$_dst" ]; then
+		while IFS="$(printf '\t')" read -r _name _mp _id _kind; do
+			[ -n "${_mp:-}" ] || continue
+			case " $_seenpaths " in *" $_mp "*) continue ;; esac
+			_h=$(slug "$_name")
+			case " $_seen " in *" $_h "*) continue ;; esac
+			## a handle that could read as an ID is unusable (rung 1 wins)
+			is_id_word "$_h" && _h="${_h}-tm"
+			_seen="$_seen $_h"
+			_seenpaths="$_seenpaths $_mp"
+			printf '%s\t%s\t\n' "$_h" "$_mp"
+		done <<_EOF
 $_dst
 _EOF
-		fi
 	fi
 	## this Mac's own backups inside a sparsebundle on a mounted volume -- a
 	## destination it may have stopped using, whose history is still there
-	if [ "$AUTODETECT_LOCAL_TM_BACKUPS" = "1" ]; then
-		_imgs=$(autodetect_images)
-		if [ -n "$_imgs" ]; then
-			while IFS= read -r _b; do
-				[ -n "$_b" ] || continue
-				case " $_seenpaths " in *" $_b "*) continue ;; esac
-				_h=$(slug "$(basename "$_b" .sparsebundle)")
-				is_id_word "$_h" && _h="${_h}-tm"
-				case " $_seen " in *" $_h "*) _h="${_h}-img" ;; esac
-				case " $_seen " in *" $_h "*) continue ;; esac
-				_seen="$_seen $_h"
-				printf '%s\t%s\t\n' "$_h" "$_b"
-			done <<_EOF
+	_imgs=$(autodetect_images)
+	if [ -n "$_imgs" ]; then
+		while IFS= read -r _b; do
+			[ -n "$_b" ] || continue
+			case " $_seenpaths " in *" $_b "*) continue ;; esac
+			_h=$(slug "$(basename "$_b" .sparsebundle)")
+			is_id_word "$_h" && _h="${_h}-tm"
+			case " $_seen " in *" $_h "*) _h="${_h}-img" ;; esac
+			case " $_seen " in *" $_h "*) continue ;; esac
+			_seen="$_seen $_h"
+			_seenpaths="$_seenpaths $_b"
+			printf '%s\t%s\t\n' "$_h" "$_b"
+		done <<_EOF
 $_imgs
 _EOF
-		fi
 	fi
 	case " $_seen " in
 		*" local "*) : ;;
@@ -6164,7 +6170,6 @@ t_setup() {
 	LOG_DIR="$T_ROOT/log"
 	FIRMLINK="$T_ROOT/mount"
 	CACHE_TTL=3600
-	AUTODETECT_LOCAL_TM_BACKUPS=0
 	## hermetic: loc_param re-reads the loaded config files
 	CONFIG_SOURCED=""
 	HOME="$T_ROOT/home"
@@ -6700,11 +6705,31 @@ t_test_local_snapshots() {
 ## backup disk silently VANISHED from --status -- hiding the one failure the
 ## tool exists to report. It must be listed, marked "?", with its last known
 ## snapshot table intact.
+## Detection is not a matter of taste, and it must not double-list a disk.
+## Adversarial: the stub reports TestStore at the very path registered as
+## "store", so a dedup that only compares handles lists the same disk twice --
+## once as store, once as teststore -- and every count, sweep and health row
+## then treats one disk as two.
+t_test_detection_dedup() {
+	printf '\nDetection, deduplicated by target\n'
+	_dd=$(locations_all)
+	t_eq "the registered handle is listed once" "$(printf '%s\n' "$_dd" | awk -F'\t' '$1 == "store"' | count_lines)" "1"
+	t_eq "and the same disk is not listed again under its volume name" \
+		"$(printf '%s\n' "$_dd" | awk -F'\t' -v t="$T_ROOT/store" '$2 == t' | count_lines)" "1"
+	t_eq "a destination that is not registered still shows up" \
+		"$(printf '%s\n' "$_dd" | awk -F'\t' '$1 == "ejectedstore"' | count_lines)" "1"
+	## and no config knob decides any of this
+	if [ -r "$T_MYTM" ]; then
+		t_eq "no setting gates detection any more" \
+			"$(awk '/AUTODETECT_LOCAL_TM_BACKUPS/ { n++ } END { print n + 0 }' "$T_MYTM")" "2"
+	else
+		t_skip "no setting gates detection" "not a readable checkout"
+	fi
+	return 0
+}
+
 t_test_ejected_destination() {
 	printf '\nEjected / unattached destinations\n'
-	_old_auto="$AUTODETECT_LOCAL_TM_BACKUPS"
-	AUTODETECT_LOCAL_TM_BACKUPS=1
-
 	_d=$(destinations_scan)
 	t_eq "both destinations are reported, mounted or not" \
 		"$(printf '%s\n' "$_d" | count_lines)" "2"
@@ -6754,7 +6779,6 @@ t_test_ejected_destination() {
 	t_match "it says the disk is away" "$_empty" "not attached"
 	t_match "and what to do about it" "$_empty" "refresh"
 
-	AUTODETECT_LOCAL_TM_BACKUPS="$_old_auto"
 }
 
 ## REGRESSION: a local snapshot IS the volume root. my-tm used to mount it one
@@ -8468,12 +8492,16 @@ t_test_post_backup() {
 
 	POST_BACKUP_DEFAULT="none"; unset BACKUP_VOLUME_RESOLVED
 	_b=$(_pb_n); do_post_backup >/dev/null 2>&1
-	t_eq "POST_BACKUP=none runs no command at all" "$(( $(_pb_n) - _b ))" "0"
+	_new=$(sed -n "$(( _b + 1 )),\$p" "$(t_calls)")
+	t_eq "POST_BACKUP=none touches the disk with nothing" \
+		"$(printf '%s\n' "$_new" | count_match 'diskutil')" "0"
 
 	POST_BACKUP_DEFAULT="eject"; unset BACKUP_VOLUME_RESOLVED
 	: >"$NO_EJECT_FLAGFILE"
 	_b=$(_pb_n); do_post_backup >/dev/null 2>&1
-	t_eq "the flag file suppresses the policy entirely" "$(( $(_pb_n) - _b ))" "0"
+	_new=$(sed -n "$(( _b + 1 )),\$p" "$(t_calls)")
+	t_eq "the flag file suppresses the policy entirely" \
+		"$(printf '%s\n' "$_new" | count_match 'diskutil')" "0"
 	rm -f "$NO_EJECT_FLAGFILE"
 
 	POST_BACKUP_DEFAULT="eject"
@@ -8609,6 +8637,7 @@ run_tests() {
 	t_test_launcher
 	t_test_install_launcher
 	t_test_job_guidance
+	t_test_detection_dedup
 	t_test_ejected_destination
 	t_test_auto_mount_destinations
 	t_test_verify_reports
