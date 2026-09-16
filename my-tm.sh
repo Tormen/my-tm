@@ -244,6 +244,11 @@ MOUNT_ROOT="/var/lib/my-tm/mount"
 SITE_CONF_DIR="/usr/local/etc"  # where --install puts my-tm.conf
 NOTIFY_MOUNT_WARN=1             # also notify when a --mount TTL looks unsafe
 CACHE_TTL=3600                  # s; older -> rescan mounted locations
+USAGE_SAMPLE_INTERVAL=21600     # s; a slow heartbeat for store-size drift that
+                                # no snapshot change explains. Samples are taken
+                                # on backup EVENTS, not on this clock
+IMAGE_SCAN_TTL=300              # s to cache the scan for this Mac's own
+                                # sparsebundles on attached disks
 INDEX_BASELINES="newest oldest" # snapshots --index walks when none are named
 INDEX_INC_MAX=16                # consolidate the increments once there are
                                 # this many
@@ -7981,6 +7986,39 @@ t_test_health_scope() {
 	HEALTH_LOCATIONS="$_h8_l"; LOCAL_SNAP_MAX="$_h8_m"
 }
 
+## Every default my-tm carries must be in the config --create-config emits.
+## Adversarial: a setting added to the defaults and forgotten in the template
+## is invisible -- --create-config writes a config that silently lacks it, and
+## the value stays whatever the script says, which is the one place the config
+## convention says it must not live.
+t_test_every_default_is_offered() {
+	printf '\nEvery default is in the config --create-config writes\n'
+	## both sides pack more than one setting on a line (EJECT_RETRIES=10;
+	## EJECT_WAIT=5), so every assignment on a line counts, not just the first
+	_ed_names='{ n = split($0, p, ";")
+	             for (i = 1; i <= n; i++)
+	                 if (match(p[i], /^[ \t]*[A-Z][A-Z0-9_]*=/)) {
+	                     v = substr(p[i], RSTART, RLENGTH - 1); gsub(/[ \t]/, "", v)
+	                     print v } }'
+	_ed_d=$(awk -v names="x" '/^## DEFAULTS -- all neutral/ {d = 1; next}
+	             /^## RUNTIME STATE \(never in the config\)/ {d = 0}
+	             d' "$T_MYTM" | awk "$_ed_names" | sort -u)
+	t_ne "the defaults block was found at all" "$_ed_d" ""
+	_ed_c=$(cmd_create_config | awk "$_ed_names" | sort -u)
+	## Deliberately not settings, each for a reason that is in the source next
+	## to it: the first two are HOW the config is found, so they cannot come
+	## from one; the last three are mechanism, not policy -- a leak reaper, a
+	## mount bound, and a cache generation that only a code change may bump.
+	_ed_skip=" CONFIG_SITE_DIR SITE_CONF_DIR_SEARCH TRANSIENT_TTL LOOKUP_CHUNK VS_GENERATION "
+	_ed_miss=""
+	for _ed_v in $_ed_d; do
+		case "$_ed_skip" in *" $_ed_v "*) continue ;; esac
+		printf '%s\n' "$_ed_c" | awk -v v="$_ed_v" '$0 == v {f = 1} END {exit(f ? 0 : 1)}' ||
+			_ed_miss="$_ed_miss $_ed_v"
+	done
+	t_eq "no default is missing from the template" "${_ed_miss:-none}" "none"
+}
+
 ## REGRESSION: the design promised an "exclusive size" column from tmutil
 ## uniquesize. That tool refuses on an APFS Time Machine store
 ## ("pathInAPFSBackup"), and nothing else on macOS reports per-snapshot space,
@@ -9433,6 +9471,7 @@ run_tests() {
 	t_test_headless_health_notifies
 	t_test_ssh_locations
 	t_test_health_scope
+	t_test_every_default_is_offered
 	t_test_launcher
 	t_test_install_launcher
 	t_test_job_guidance
