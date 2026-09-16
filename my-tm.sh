@@ -2969,6 +2969,21 @@ _EOF
 	return 1
 }
 
+## bytes of ONE location's index on disk -- its database, the increments not
+## folded in yet, the coverage record and the version store -- across every
+## directory it is read from
+index_loc_bytes() {
+	_ilb=0
+	for _ilb_d in $(cache_read_dirs); do
+		for _ilb_p in "$_ilb_d/index/$1.db" "$_ilb_d/index/$1".inc.*.db \
+		              "$_ilb_d/index/$1.covered" "$_ilb_d/index/$1.versions"; do
+			[ -e "$_ilb_p" ] || continue
+			_ilb=$(( _ilb + $(du -sk "$_ilb_p" 2>/dev/null | awk '{print $1 * 1024}') ))
+		done
+	done
+	printf '%s\n' "$_ilb"
+}
+
 ## bytes of index on disk, across every directory it is read from
 index_size_bytes() {
 	_is_b=0
@@ -3082,8 +3097,10 @@ _EOF
 	## the LOC column is as wide as the widest handle: truncating a handle would
 	## make the one word the reader has to type back unusable
 	_w=$(printf '%s\n' "$_locs" | awk -F'\t' '{if (length($1) > m) m = length($1)} END {print (m < 3 ? 3 : m)}')
-	printf " %-${_w}s %-30s %6s  %-24s %6s  %-11s %s\n" \
-		LOC DESTINATION SNAPS SPAN LAST USED/FREE INDEXED
+	## rows are collected and aligned at the end: a column sized to its widest
+	## value, not guessed. Collected in a variable, not piped, because this loop
+	## also gathers the per-location index lines printed below the table.
+	_tbl="LOC	DESTINATION	SNAPS	SPAN	LAST	USED/FREE	INDEXED	INDEX	PER SNAP"
 	_now=$(now_epoch)
 	while IFS="$(printf '\t')" read -r _h _t _idir; do
 		[ -n "${_h:-}" ] || continue
@@ -3162,12 +3179,21 @@ $_h index: $_ixs"
 		else
 			_ixd="no"
 		fi
-		printf " %-${_w}s %-30s %6s  %-24s %5s%1s  %-11s %s\n" \
-			"$_h" "$(printf '%s' "$_dest" | cut -c1-30)" \
-			"$_snaps" "$_span" "$_last" "$_mark" "$_space" "$_ixd"
+		## what the index costs here, whatever INDEXED says: a location that was
+		## --no-index'ed keeps its index, and still takes the space
+		_ixb=$(index_loc_bytes "$_h")
+		_ixsz="-"; _ixper="-"
+		if [ "$_ixb" -gt 0 ]; then
+			_ixsz=$(human_bytes "$_ixb")
+			_ixn=$(index_covered_count "$_h")
+			[ "$_ixn" -gt 0 ] && _ixper=$(human_bytes $(( _ixb / _ixn )))
+		fi
+		_tbl="$_tbl
+$_h	$(printf '%s' "$_dest" | cut -c1-30)	$_snaps	$_span	$_last$_mark	$_space	$_ixd	$_ixsz	$_ixper"
 	done <<_EOF
 $_locs
 _EOF
+	printf '%s\n' "$_tbl" | table_align "llrlrrlrr"
 
 	## locations the jobs cannot see into, each named once with the setting that
 	## would change it -- nothing for any other location
@@ -7995,7 +8021,7 @@ t_test_opt_in_indexing() {
 	## the table and its footer
 	_oi_st=$(cmd_status 2>/dev/null)
 	t_eq "the table has an INDEXED column, covered/total for the opted-in one and no for the rest" \
-		"$(printf '%s\n' "$_oi_st" | awk '$1 == "store" || $1 == "local" {print $NF}' | tr '\n' '|')" \
+		"$(printf '%s\n' "$_oi_st" | awk '$1 == "store" || $1 == "local" {print $(NF-2)}' | tr '\n' '|')" \
 		"0/$(snapshots_get store | count_lines)|no|"
 	t_eq "the footer says how to opt in AND how to opt out" \
 		"$(printf '%s\n' "$_oi_st" | count_match 'not indexed:') $(printf '%s\n' "$_oi_st" | count_match 'no-index <LOCATION> stops')" \
@@ -8663,6 +8689,35 @@ t_test_index_progress_visible() {
 	t_eq "a dead indexer is not reported as walking" \
 		"$(index_in_progress store >/dev/null && echo found || echo none)" "none"
 	printf '%s\n' "$_ipv_save" | grep -v '^$' >"$_ipv_mc"
+}
+
+## Index size per location, and per indexed snapshot. Adversarial: the size
+## must be THIS location's files only -- a neighbour's index in the same
+## directory must not be counted -- and the average must divide by what the
+## index covers, not by how many snapshots the store has.
+t_test_status_index_size() {
+	printf '\n--status shows what each index costs\n'
+	_sz_d="$(cache_write_dir)/index"; mkdir -p "$_sz_d"
+	_sz_save=$(cat "$T_ROOT/cache/locations.tsv")
+	loc_set_index store 1
+	## 2 snapshots covered, 1 MiB of database; a neighbour's 4 MiB alongside
+	dd if=/dev/zero of="$_sz_d/store.db" bs=1024 count=1024 2>/dev/null
+	snap_names store | head -n 2 >"$_sz_d/store.covered"
+	dd if=/dev/zero of="$_sz_d/remote.db" bs=1024 count=4096 2>/dev/null
+
+	_sz_b=$(index_loc_bytes store)
+	t_eq "the size is this location's files, not its neighbour's" \
+		"$([ "$_sz_b" -ge 1048576 ] && [ "$_sz_b" -lt 2097152 ] && echo own || echo "wrong:$_sz_b")" "own"
+	_sz_row=$(cmd_status 2>/dev/null | awk '$1 == "store"')
+	t_eq "the row carries INDEX and PER SNAP" \
+		"$(printf '%s' "$_sz_row" | awk '{print ($(NF-1) != "-" && $NF != "-") ? "both" : "missing"}')" "both"
+	t_eq "and the header names them" \
+		"$(cmd_status 2>/dev/null | head -n 1 | count_match 'INDEX  PER SNAP')" "1"
+	t_eq "a location with no index shows -" \
+		"$(cmd_status 2>/dev/null | awk '$1 == "local" {print $(NF-1) $NF}')" "--"
+
+	rm -f "$_sz_d/store.db" "$_sz_d/store.covered" "$_sz_d/remote.db"
+	printf '%s\n' "$_sz_save" | cache_write_locations
 }
 
 ## REGRESSION: the design promised an "exclusive size" column from tmutil
@@ -10127,6 +10182,7 @@ run_tests() {
 	t_test_install_uses_existing_my_tm
 	t_test_ls_columns_align
 	t_test_index_progress_visible
+	t_test_status_index_size
 	t_test_launcher
 	t_test_install_launcher
 	t_test_job_guidance
