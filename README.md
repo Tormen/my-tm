@@ -969,30 +969,27 @@ with the loose mode rather than the path you asked about. `--install
 <SSH-HOST>` copies my-tm there, creates its cache and log dirs, installs the
 jobs, and **records the directory it used** in the third field, so later
 commands find it instead of asking. `--uninstall <SSH-HOST>` is the mirror: it
-runs my-tm's own `--uninstall` there, removes the binary, and clears the field.
+runs my-tm's own `--uninstall` there, removes the binary only if `--install`
+copied it in, and clears the field.
 
-**`--copy-self` is the way out when it is not.** It ships my-tm to the host for
-*that one call* and removes it again in the same `ssh` invocation — so a run
-interrupted here cannot leave a copy of my-tm on someone else's machine. It is
-a global option accepted anywhere on the line, which is what makes
-`alias my-tm='my-tm --copy-self'` work. Without an install and without the
-flag, a command says which of the two to reach for:
+**An ssh location works only where my-tm is installed**, and that host's my-tm
+reads that host's own config — nothing is shipped from here, and nothing runs
+from a temporary copy. On a host without it, a command says so:
 
 ```text
-!!! my-tm is not installed on ada -- run: my-tm --install ada   (or add --copy-self to this call)
+!!! my-tm is not installed on ada -- run: my-tm --install ada
 ```
+
+`--install` needs no config on the host beforehand: with none, it writes the
+defaults and ends with a red `ATTENTION TODO` to review them; with one already
+there it leaves it alone and says so in a yellow warning.
 
 **The index lives where the disk is.** `--index` on an ssh location runs on that
 host and stays there, because the walk has to be next to the disk.
 `SHADOW_SSH_INDEX_FILES=1` (the default) additionally copies the finished
 database here, so `--find` answers for that location while the host is offline;
 the remote copy is the one that keeps getting extended, and the shadow is a
-read-only mirror. `--index --copy-self` therefore needs it — nothing persists on
-the host, so here is the only place an index could live:
-
-```text
-!!! --index --copy-self leaves nothing on ada, so the index can only live here -- set SHADOW_SSH_INDEX_FILES=1, or: my-tm --install ada
-```
+read-only mirror.
 
 **A location is named to the remote by its PATH.** Handles are this Mac's
 private names and the far side has its own, so machine to machine my-tm sends

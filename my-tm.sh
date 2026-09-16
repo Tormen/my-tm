@@ -129,9 +129,6 @@ VS_GENERATION=2
 
 VRB=0; DBG=0; DEEPDBG=0; DBG_PATH=""
 JSON=0; OPT_ALL=0; LIMIT=""; FORCE=0; SRC=""
-## --copy-self: ship my-tm to the ssh host for THIS call instead of using an
-## installed copy. A global option, so `alias my-tm='my-tm --copy-self'` works.
-COPY_SELF=0
 CONFIG_FILE=""; CONFIG_SOURCED=""
 EXIT_RC=0
 ## set by the daemons only.  A background job may read what is already
@@ -4202,13 +4199,6 @@ index_remote() {
 	_h="$1"
 	_t=$(loc_target "$_h")
 	_rhost=$(remote_host "$_t")
-	## An index has to LIVE somewhere. --copy-self removes my-tm from the host
-	## when the call ends, so the only place left is here -- and that is exactly
-	## what SHADOW_SSH_INDEX_FILES provides. Without it there would be nowhere.
-	if [ -z "$(loc_install_dir "$_h")" ] && [ "$COPY_SELF" = "1" ] &&
-	   [ "${SHADOW_SSH_INDEX_FILES:-1}" != "1" ]; then
-		err "--index --copy-self leaves nothing on $_rhost, so the index can only live here -- set SHADOW_SSH_INDEX_FILES=1, or: $US --install $_rhost"
-	fi
 	msg "indexing '$_h' on $_rhost (the walk stays where the disk is)"
 	remote_run "$_h" --index "$(remote_path "$_t")" || return 1
 	if [ "${SHADOW_SSH_INDEX_FILES:-1}" = "1" ]; then
@@ -4223,28 +4213,19 @@ index_remote() {
 ## what it printed. The disk is there, so the reading and the indexing happen
 ## there too; only results cross the network.
 ##
-## Normally that is the copy `--install <host>` put on the host, whose directory
-## locations.tsv records. With --copy-self my-tm is shipped over for this one
-## call and removed again in the SAME ssh invocation -- so a run killed here
-## cannot leave a copy of my-tm lying about on someone else's machine.
+## ssh locations are supported ONLY where my-tm is installed -- the copy
+## `--install <host>` found or put there, whose directory locations.tsv
+## records. That host's my-tm reads that host's own config; nothing is shipped
+## from here, and nothing is ever run from a temporary copy.
 remote_run() {                  # <handle> <args...>
 	_rr_h="$1"; shift
 	_rr_t=$(loc_target "$_rr_h")
 	_rr_host=$(remote_host "$_rr_t")
 	_rr_dir=$(loc_install_dir "$_rr_h")
-	if [ -n "$_rr_dir" ]; then
-		# shellcheck disable=SC2029  # building the remote command line here is the point
-		ssh "$_rr_host" "$_rr_dir/my-tm $*"
-		return $?
-	fi
-	[ "$COPY_SELF" = "1" ] ||
-		err "my-tm is not installed on $_rr_host -- run: $US --install $_rr_host   (or add --copy-self to this call)"
-	_rr_tmp="/tmp/my-tm.copy-self.$$"
-	scp -q "$(abs_path "$0")" "$_rr_host:$_rr_tmp" >/dev/null 2>&1 ||
-		err "could not copy my-tm to $_rr_host:$_rr_tmp"
-	# shellcheck disable=SC2029  # ditto; the rm runs on the remote, whatever happens here
-	ssh "$_rr_host" "chmod 0755 $_rr_tmp && $_rr_tmp $*; _rc=\$?; rm -f $_rr_tmp; exit \$_rc"
-	return $?
+	[ -n "$_rr_dir" ] ||
+		err "my-tm is not installed on $_rr_host -- run: $US --install $_rr_host"
+	# shellcheck disable=SC2029  # building the remote command line here is the point
+	ssh "$_rr_host" "$_rr_dir/my-tm $*"
 }
 
 remote_snap_names() {
@@ -5899,8 +5880,8 @@ install_remote() {
 		warn "$_h: remote --install failed -- any message above it is ${_h}'s my-tm, about ${_h}'s configuration"
 		_ir_ok=0
 	}
-	## Record WHERE it went, so later commands find it instead of asking for
-	## --copy-self on a host that is perfectly well installed -- but ONLY when
+	## Record WHERE it is, so later commands find it instead of reporting a
+	## perfectly well installed host as not installed -- but ONLY when
 	## it really installed. The recorded directory is a CLAIM that my-tm is set
 	## up there, and every later command acts on it.
 	if [ "$_ir_ok" = "1" ] && [ -n "${_loc:-}" ] && [ "$(loc_install_dir "$_loc")" != "$_idir" ]; then
@@ -5948,7 +5929,7 @@ uninstall_remote() {
 	if [ -n "${_ur_loc:-}" ] && [ -n "$(loc_install_dir "$_ur_loc")" ]; then
 		locations_writable "--uninstall $_ur_h"
 		loc_set_field "$_ur_loc" 3 "" &&
-			minor "'$_ur_loc' no longer has my-tm on $_ur_h -- later calls need --copy-self"
+			minor "'$_ur_loc' no longer has my-tm on $_ur_h -- $US --install $_ur_h sets it up again"
 	fi
 	return 0
 }
@@ -6154,7 +6135,6 @@ completion_bash() {
 _my_tm() {
   local cur="${COMP_WORDS[COMP_CWORD]}"
   local cmds="--status --ls --lookup --find --show --mount --umount --open --cat
-    --copy-self
     --cp --diff --index --no-index --rm-index --verify --local-snapshot
     --health --rm --thin
     --backup --install --uninstall --setup --add --forget --refresh
@@ -6311,10 +6291,6 @@ INSTALL & SET UP
                                  destinations, exclusions, quota.
                                  See \`--setup --help\` for the flags to do it
                                  from a script instead
-  --copy-self                    (anywhere on the line) ship my-tm to the ssh
-                                 host for THIS call instead of using the copy
-                                 --install put there, and remove it again.
-                                 Handy as: alias my-tm='my-tm --copy-self'
   --add <FOLDER> [<HANDLE>]      register a location; <HANDLE> defaults to a
                                  slug of the volume name
   --forget <HANDLE>              forget a location; no backup is touched
@@ -6495,7 +6471,6 @@ main() {
 			-A|--all) OPT_ALL=1 ;;
 			-J|--json) JSON=1 ;;
 			-f|--force) FORCE=1 ;;
-			--copy-self) COPY_SELF=1 ;;
 			-L|--limit) LIMIT="${1:-}"; shift; _i=$(( _i + 1 )) ;;
 			--limit=*) LIMIT="${_a#*=}" ;;
 			-S|--source) SRC="${1:-}"; shift; _i=$(( _i + 1 )) ;;
@@ -8126,21 +8101,12 @@ t_test_ssh_locations() {
 	t_eq "and --thin does too" \
 		"$(sed -n '/^cmd_thin() {$/,/^}$/p' "$T_MYTM" | count_match 'refuse_remote_delete')" "1"
 
-	## a host with no my-tm on it: two ways out, both named
-	_r7_e=$( ( COPY_SELF=0; remote_run noinst --ls /x ) 2>&1 >/dev/null )
-	t_match "a host without my-tm says how to install it" "$_r7_e" "not installed on host2"
-	## the OFFER, not the /tmp/my-tm.copy-self.<pid> path in a later message
-	t_match "and offers the flag for this one call" "$_r7_e" "or add --copy-self to this call"
-	_r7_c=$( ( COPY_SELF=1; remote_run noinst --ls /x ) 2>&1 >/dev/null )
-	t_match "with --copy-self it ships my-tm over instead" "$_r7_c" "could not copy my-tm to host2"
-
-	## an index has to live somewhere: --copy-self leaves nothing on the host
-	_r7_i=$( ( COPY_SELF=1; SHADOW_SSH_INDEX_FILES=0; index_remote noinst ) 2>&1 >/dev/null )
-	t_match "--index --copy-self needs somewhere for the index to live" \
-		"$_r7_i" "SHADOW_SSH_INDEX_FILES=1"
-	t_eq "with the shadow on, it goes ahead" \
-		"$( ( COPY_SELF=1; SHADOW_SSH_INDEX_FILES=1; index_remote noinst ) 2>&1 >/dev/null |
-		    count_match 'SHADOW_SSH_INDEX_FILES=1, or')" "0"
+	## a host with no my-tm on it: one way out, and nothing is copied over
+	: >"$(t_calls)"
+	_r7_e=$( ( remote_run noinst --ls /x ) 2>&1 >/dev/null )
+	t_match "a host without my-tm says how to install it" "$_r7_e" "not installed on host2 -- run: .* --install host2"
+	t_eq "and neither copies my-tm over nor runs anything there" \
+		"$(count_match 'scp' <"$(t_calls)") $(count_match 'ssh' <"$(t_calls)")" "0 0"
 
 	## the retired name
 	# shellcheck disable=SC2034  # config_refuse_old_names reads it through eval
@@ -8151,10 +8117,9 @@ t_test_ssh_locations() {
 		      INDEX_REMOTE_COPY=1; config_refuse_old_names ) 2>&1 |
 		    count_match 'use SHADOW_SSH_INDEX_FILES instead')" "1"
 
-	## --copy-self is a global option, so an alias can carry it
-	t_eq "--copy-self is accepted before and after the command" \
-		"$("$T_MYTM" --copy-self --version >/dev/null 2>&1 && echo ok || echo no) $("$T_MYTM" --version --copy-self >/dev/null 2>&1 && echo ok || echo no)" \
-		"ok ok"
+	## there is no way to use a host my-tm is not installed on
+	t_eq "no --copy-self option exists any more" \
+		"$(usage | count_match 'copy-self') $(grep -c '^[[:space:]]*--copy-self)' "$T_MYTM")" "0 0"
 
 	## --uninstall takes a host, like --install
 	## a remote error streams through as if it were local: say whose it is
