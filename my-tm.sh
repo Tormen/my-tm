@@ -5934,7 +5934,9 @@ cmd_install() {
 		CONFIG_SOURCED="$_ic_new"
 		todo "review $_ic_new -- job labels, directories and the group are site-specific, and these defaults are neutral"
 	else
-		warn "a config is already in place, so the defaults were NOT written: ${CONFIG_SOURCED# }"
+		## the normal case on every install after the first: said, not warned --
+		## a yellow line on a routine run teaches the reader to skip yellow lines
+		minor "config:     ${CONFIG_SOURCED# } -- already in place, the defaults were not written"
 	fi
 	## the pair, which is how one config serves a site and a machine at once
 	note "a shared config may sit beside a host's own: <file>.GLOBAL is read first, <file> on top"
@@ -8645,7 +8647,10 @@ t_test_install_writes_a_config() {
 	t_eq "and the run says to review them, in red" \
 		"$(printf '%s\n' "$_iw_body" | count_match 'todo "review')" "1"
 	t_eq "an existing config is reported, not overwritten" \
-		"$(printf '%s\n' "$_iw_body" | count_match 'defaults were NOT written')" "1"
+		"$(printf '%s\n' "$_iw_body" | count_match 'the defaults were not written')" "1"
+	## anchored on the call with its leading tabs, so this line cannot match itself
+	t_eq "and as a plain line, not a warning -- it is the routine case" \
+		"$(printf '%s\n' "$_iw_body" | grep -c '^		warn "a config is already in place')" "0"
 	t_eq "and the GLOBAL/host pair is explained either way" \
 		"$(printf '%s\n' "$_iw_body" | count_match 'GLOBAL is read first')" "1"
 

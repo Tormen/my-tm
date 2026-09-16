@@ -999,7 +999,7 @@ from a temporary copy. On a host without it, a command says so:
 
 `--install` needs no config on the host beforehand: with none, it writes the
 defaults and ends with a red `ATTENTION TODO` to review them; with one already
-there it leaves it alone and says so in a yellow warning.
+there it leaves it alone and says so in one plain line.
 
 **The index lives where the disk is.** `--index` on an ssh location runs on that
 host and stays there, because the walk has to be next to the disk.
