@@ -83,6 +83,7 @@ HEALTH_MAX_AGE_DEFAULT="48h"
 HEALTH_MIN_FREE_PCT=10
 HEALTH_MAX_INTERRUPTED=2
 HEALTH_DRIFT_FACTOR=5
+HEADLESS_NOTIFY_HEALTH_WARNINGS=1
 MAINT_JOB="local.my-tm.maintenance"
 MAINT_INTERVAL=120
 LOCAL_SNAP_INTERVAL=""
@@ -272,6 +273,10 @@ HEALTH_MAX_AGE_DEFAULT="48h"    # a newer backup is expected within this: <N>s|m
                                 # 0 = no age expected (the age is only shown)
 HEALTH_MIN_FREE_PCT=10
 HEALTH_MAX_INTERRUPTED=2; HEALTH_DRIFT_FACTOR=5
+HEADLESS_NOTIFY_HEALTH_WARNINGS=1   # a --health nobody is watching notifies on
+                                    # warnings too, not only on failures. 0:
+                                    # failures only. A run in a terminal never
+                                    # notifies -- you are already reading it
 # --- jobs installed by --install ---
 MAINT_JOB="local.my-tm.maintenance"   # mount sweep + /tm refresh + local snaps
 MAINT_INTERVAL=120              # s between maintenance runs
@@ -1651,17 +1656,21 @@ image_attach() {
 	_att_pid=$!
 	_att_t0=$(now_epoch)
 	_att_said=0
+	_att_n=0
 	while kill -0 "$_att_pid" 2>/dev/null; do
 		sleep 2
 		_att_el=$(( $(now_epoch) - _att_t0 ))
 		[ "$_att_el" -lt 6 ] && continue
 		if [ "$_att_said" = "0" ]; then
 			msg "attaching $(basename "$_img") -- this can take minutes over a share"
-			_att_said=1
-			_att_next=$(( _att_el + 15 ))
+			_att_said=1; _att_n=1
+			_att_next=$(( _att_el + $(attach_gap "$_att_n") ))
 		elif [ "$_att_el" -ge "$_att_next" ]; then
-			minor "still attaching, ${_att_el}s so far"
-			_att_next=$(( _att_el + 15 ))
+			if attach_says_more "$_att_n"; then
+				minor "still attaching, ${_att_el}s so far"
+				_att_n=$(( _att_n + 1 ))
+			fi
+			_att_next=$(( _att_el + $(attach_gap "$_att_n") ))
 		fi
 	done
 	_att_rc=0
@@ -1681,6 +1690,25 @@ image_attach() {
 	image_touch "$_img" "$_mp"
 	printf '%s\n' "$_mp"
 	return 0
+}
+
+## The gap before the next "still attaching" line, given how many have been
+## printed: 15 s for the first four, then 30, then 60, then 120 -- doubling
+## every four, so a ten-minute attach stays audible without filling the screen.
+attach_gap() {
+	_ag_g=15; _ag_i=4
+	while [ "${1:-0}" -ge "$_ag_i" ]; do
+		_ag_g=$(( _ag_g * 2 )); _ag_i=$(( _ag_i + 4 ))
+	done
+	printf '%s\n' "$_ag_g"
+}
+
+## A daemon's progress goes to a log nobody is watching while it waits, so it
+## says this three times and then gets on with it. A person watching gets the
+## whole series -- they are the one deciding whether to keep waiting.
+attach_says_more() {
+	[ "$BACKGROUND_JOB" = "1" ] || return 0
+	[ "${1:-0}" -lt 3 ]
 }
 
 ## Record the attach, or push its grace period out again because it was just
@@ -4135,19 +4163,58 @@ _EOF
 #############################################################################
 
 HEALTH_RC=0
+## what a headless run has to put in a notification: how many problems, and the
+## first of each kind verbatim -- a count alone says nothing actionable
+HEALTH_PROBLEMS=0
+HEALTH_FIRST_FAIL=""
+HEALTH_FIRST_WARN=""
 health_say() {
 	_lvl="$1"; shift
 	case "$_lvl" in
-		fail) printf ' !!! %s\n' "$*"; [ "$HEALTH_RC" -lt 2 ] && HEALTH_RC=2 ;;
-		warn) printf '  >> %s\n' "$*"; [ "$HEALTH_RC" -lt 1 ] && HEALTH_RC=1 ;;
+		fail) printf ' !!! %s\n' "$*"; [ "$HEALTH_RC" -lt 2 ] && HEALTH_RC=2
+		      HEALTH_PROBLEMS=$(( HEALTH_PROBLEMS + 1 ))
+		      [ -n "$HEALTH_FIRST_FAIL" ] || HEALTH_FIRST_FAIL="$*" ;;
+		warn) printf '  >> %s\n' "$*"; [ "$HEALTH_RC" -lt 1 ] && HEALTH_RC=1
+		      HEALTH_PROBLEMS=$(( HEALTH_PROBLEMS + 1 ))
+		      [ -n "$HEALTH_FIRST_WARN" ] || HEALTH_FIRST_WARN="$*" ;;
 		hint) printf '  >> %s\n' "$*" ;;
 		*)    printf '    > %s\n' "$*" ;;
 	esac
 	return 0
 }
 
+## Is anyone reading this run's output? A LaunchDaemon's stdout is a log file,
+## so what it finds reaches a person only as a notification; a terminal has
+## already shown it. A function, so the suite can say which case it is testing
+## -- and deliberately NOT BACKGROUND_JOB, which cmd_health sets on itself.
+health_is_headless() {
+	[ -t 1 ] && return 1
+	return 0
+}
+
+## " (+3 more)" when the run found more than the one problem being named
+health_more() {
+	_hm=$(( HEALTH_PROBLEMS - 1 ))
+	[ "$_hm" -gt 0 ] && printf ' (+%s more)' "$_hm"
+	return 0
+}
+
+## A silent failure is what --health exists to catch, so a run whose output
+## nobody will read says it where a person will see it. The first problem goes
+## in VERBATIM: "1 problem" is not something anyone can act on.
+health_notify_headless() {
+	health_is_headless || return 0
+	if [ "$HEALTH_RC" -ge 2 ]; then
+		notify "health: $HEALTH_FIRST_FAIL$(health_more)"
+	elif [ "$HEALTH_RC" = "1" ] && [ "${HEADLESS_NOTIFY_HEALTH_WARNINGS:-1}" = "1" ]; then
+		notify "health: $HEALTH_FIRST_WARN$(health_more)"
+	fi
+	return 0
+}
+
 cmd_health() {
 	BACKGROUND_JOB=1
+	HEALTH_PROBLEMS=0; HEALTH_FIRST_FAIL=""; HEALTH_FIRST_WARN=""
 	_only="${1:-}"
 	if [ -n "$_only" ]; then
 		_locs="$_only"
@@ -4324,6 +4391,8 @@ _EOF
 		1) note "warnings above" ;;
 		*) note "FAILURES above" ;;
 	esac
+
+	health_notify_headless
 	return "$HEALTH_RC"
 }
 
@@ -7571,6 +7640,87 @@ t_test_index_timing() {
 	AUTO_INDEX_TM_BACKUP_DISKS="$_it_a"
 }
 
+## A --health nobody is watching, and how long an attach talks for.
+## Adversarial: the notification must NAME the problem, since a count is
+## nothing anyone can act on; a failure must get through even with warnings
+## switched off; a run in a terminal must notify nothing, because the person
+## is already reading it; and a clean run must not be an event at all.
+t_test_headless_health_notifies() {
+	printf '\nA health run nobody is watching says so where it will be seen\n'
+	_hn_nc="$NOTIFY_CMD"; _hn_w="${HEADLESS_NOTIFY_HEALTH_WARNINGS:-1}"
+	_hn_log="$T_ROOT/notify.log"
+	NOTIFY_CMD="$T_ROOT/notify.sh"
+	# shellcheck disable=SC2016  # writing a script: $2 is the STUB's argument
+	{ printf '#!/bin/sh\n'; printf 'printf "%%s\\n" "$2" >>"%s"\n' "$_hn_log"; } >"$NOTIFY_CMD"
+	chmod 0755 "$NOTIFY_CMD"
+
+	: >"$_hn_log"
+	# shellcheck disable=SC2329  # overrides my-tm's own, for this one call
+	( health_is_headless() { return 0; }
+	  HEALTH_RC=2; HEALTH_PROBLEMS=3
+	  HEALTH_FIRST_FAIL="store: newest backup is 9d old"
+	  health_notify_headless )
+	t_eq "a failure is notified, named, with the rest counted" \
+		"$(count_match 'store: newest backup is 9d old (+2 more)' <"$_hn_log") of $(count_lines <"$_hn_log")" \
+		"1 of 1"
+
+	: >"$_hn_log"
+	# shellcheck disable=SC2329  # ditto
+	( health_is_headless() { return 0; }
+	  HEALTH_RC=1; HEALTH_PROBLEMS=1; HEALTH_FIRST_WARN="store: 4% free"
+	  HEADLESS_NOTIFY_HEALTH_WARNINGS=1; health_notify_headless )
+	t_eq "a lone warning is notified by default, with nothing to add" \
+		"$(count_match 'store: 4% free' <"$_hn_log") $(count_match 'more)' <"$_hn_log")" "1 0"
+
+	: >"$_hn_log"
+	# shellcheck disable=SC2329  # ditto
+	( health_is_headless() { return 0; }
+	  HEALTH_RC=1; HEALTH_PROBLEMS=1; HEALTH_FIRST_WARN="store: 4% free"
+	  HEADLESS_NOTIFY_HEALTH_WARNINGS=0; health_notify_headless )
+	t_eq "and not when HEADLESS_NOTIFY_HEALTH_WARNINGS=0" "$(count_lines <"$_hn_log")" "0"
+
+	: >"$_hn_log"
+	# shellcheck disable=SC2329  # ditto
+	( health_is_headless() { return 0; }
+	  HEALTH_RC=2; HEALTH_PROBLEMS=1; HEALTH_FIRST_FAIL="store: unreadable"
+	  HEADLESS_NOTIFY_HEALTH_WARNINGS=0; health_notify_headless )
+	t_eq "a FAILURE gets through even then" "$(count_match 'store: unreadable' <"$_hn_log")" "1"
+
+	: >"$_hn_log"
+	# shellcheck disable=SC2329  # ditto -- this one says a person IS watching
+	( health_is_headless() { return 1; }
+	  HEALTH_RC=2; HEALTH_PROBLEMS=1; HEALTH_FIRST_FAIL="store: unreadable"
+	  health_notify_headless )
+	t_eq "a run in a terminal notifies nothing -- it is already on screen" \
+		"$(count_lines <"$_hn_log")" "0"
+
+	: >"$_hn_log"
+	# shellcheck disable=SC2329  # ditto
+	( health_is_headless() { return 0; }; HEALTH_RC=0; HEALTH_PROBLEMS=0
+	  health_notify_headless )
+	t_eq "and a clean run is not an event" "$(count_lines <"$_hn_log")" "0"
+
+	t_eq "--health ends by doing this" \
+		"$(sed -n '/^cmd_health() {$/,/^}$/p' "$T_MYTM" | count_match 'health_notify_headless')" "1"
+
+	## how long an attach keeps talking
+	t_eq "the gap doubles every four lines" \
+		"$(attach_gap 0) $(attach_gap 3) $(attach_gap 4) $(attach_gap 7) $(attach_gap 8) $(attach_gap 12)" \
+		"15 15 30 30 60 120"
+	_hn_bg="$BACKGROUND_JOB"
+	BACKGROUND_JOB=1
+	t_eq "a daemon says it three times and then gets on with it" \
+		"$(attach_says_more 0 && echo y || echo n)$(attach_says_more 2 && echo y || echo n)$(attach_says_more 3 && echo y || echo n)" \
+		"yyn"
+	BACKGROUND_JOB=0
+	t_eq "a person watching is never cut off" \
+		"$(attach_says_more 3 && echo y || echo n)$(attach_says_more 99 && echo y || echo n)" "yy"
+	BACKGROUND_JOB="$_hn_bg"
+
+	rm -f "$NOTIFY_CMD" "$_hn_log"
+	NOTIFY_CMD="$_hn_nc"; HEADLESS_NOTIFY_HEALTH_WARNINGS="$_hn_w"
+}
+
 ## REGRESSION: the design promised an "exclusive size" column from tmutil
 ## uniquesize. That tool refuses on an APFS Time Machine store
 ## ("pathInAPFSBackup"), and nothing else on macOS reports per-snapshot space,
@@ -9020,6 +9170,7 @@ run_tests() {
 	t_test_network_volume_of
 	t_test_opt_in_indexing
 	t_test_index_timing
+	t_test_headless_health_notifies
 	t_test_launcher
 	t_test_install_launcher
 	t_test_job_guidance

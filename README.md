@@ -894,8 +894,18 @@ non-zero on the worst — suitable for cron and for a LaunchDaemon.
 | Full Disk Access | missing — reported once, as a pointer (to the launcher when the jobs use one), not a stack of errors |
 | checksums | only when `HEALTH_VERIFY` names a path (below) |
 
-Hints about the two job settings (§9) are printed beside the checks and never
+Hints about the job access setting (§9) are printed beside the checks and never
 change the exit code.
+
+**A run nobody is watching notifies.** `--health` exists to catch failures that
+happen *silently*, so a run whose stdout is not a terminal — a LaunchDaemon,
+whose output goes to a log file — raises a notification as well as writing the
+report. It names the first problem verbatim and counts the rest
+(`health: store: newest backup is 9d old (+2 more)`); a bare count would be
+nothing anyone could act on. Failures always notify;
+`HEADLESS_NOTIFY_HEALTH_WARNINGS=1` (the default) does the same for warnings,
+`0` restricts it to failures. A run in a terminal never notifies — you are
+already reading it.
 
 Scheduling: `HEALTH_INTERVAL` (e.g. `4h`, `1d`) — empty / `0` / `false` means
 never, and no daemon is installed. `--install` writes
@@ -988,6 +998,13 @@ A bundle on a **locally attached** disk is an ordinary location:
 my-tm --add /Volumes/<disk>/<host>.sparsebundle usbtm
 ```
 
+* **It says how long it has been waiting.** `hdiutil` reports nothing at all
+  for an attach, so there is no percentage to show and inventing one would be
+  a made-up number; what is true is the elapsed time. The first line comes
+  once the attach is slow enough to worry about, then every 15 s — with the
+  gap doubling every four lines (15, 30, 60, 120 …), so a ten-minute attach
+  stays audible without filling the screen. A **daemon** says it three times
+  and then gets on with it: nobody is watching its log while it waits.
 * **Attached read-only, always** (`hdiutil attach -readonly -nobrowse -noverify`):
   the bundle belongs to the Mac that backs up into it, and a writable attach
   could collide with it. Read-only also means no `fsck` and no risk to a backup.
@@ -1211,6 +1228,8 @@ HEALTH_WATCH_PATHS=""           # paths that MUST be covered by a backup; the
                                 # exclusion-drift check fails when one is
                                 # excluded or on an uncovered volume
 HEALTH_MAX_AGE_DEFAULT="48h"; HEALTH_MIN_FREE_PCT=10  # 0 = no age expected
+HEADLESS_NOTIFY_HEALTH_WARNINGS=1   # a --health nobody is watching notifies on
+                                    # warnings too; 0 = failures only
 HEALTH_MAX_INTERRUPTED=2; HEALTH_DRIFT_FACTOR=5
 # --- jobs installed by --install ---
 MAINT_JOB="local.my-tm.maintenance"   # mount sweep + /tm refresh + local snaps
