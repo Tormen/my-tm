@@ -171,6 +171,24 @@ minor() { printf '    > %s\n' "$*" >&2; }
 warn()  { printf ' !!! %s\n' "$*" >&2; }
 note()  { printf ' --> %s\n' "$*"; }
 
+## Colour, and ONLY where something will render it. A LaunchDaemon's stdout is
+## a log file and its stderr another, so escape codes written there are noise
+## every later reader has to strip -- and --install is mostly run from a job.
+## Both streams are checked because todo() writes to stdout and warn() to
+## stderr; NO_COLOR is honoured (no-color.org).
+if [ -t 1 ] && [ -t 2 ] && [ -z "${NO_COLOR:-}" ]; then
+	C_RED=$(printf '\033[1;31m'); C_OFF=$(printf '\033[0m')
+else
+	C_RED=""; C_OFF=""
+fi
+
+## A step no command can take for you: it needs a human, at a GUI, on THIS
+## machine. Red because it arrives at the end of a wall of confirmations that
+## all say something went right, and prefixed because that is what makes it
+## findable afterwards -- in a log with no colour left, `grep "ATTENTION TODO"`
+## still finds every one.
+todo()  { printf ' --> %sATTENTION TODO: %s%s\n' "$C_RED" "$*" "$C_OFF"; }
+
 dbg() {
 	[ "$DBG" = "1" ] || return 0
 	printf ' ~~~ %s\n' "$*" >&2
@@ -5562,7 +5580,7 @@ launcher_install() {
 		return 1
 	fi
 	msg "built the launcher $_li_path"
-	note "grant it Full Disk Access: System Settings > Privacy & Security > Full Disk Access > add $_li_path"
+	todo "grant it Full Disk Access: System Settings > Privacy & Security > Full Disk Access > add $_li_path"
 	why "a rebuilt launcher is a new program to macOS -- an earlier grant does not carry over"
 	return 0
 }
@@ -8331,6 +8349,27 @@ t_test_remote_install_dir() {
 	REMOTE_INSTALL_DIR_DEFAULT="$_ri_d"
 }
 
+## A step that needs a human, at a GUI, on that machine. Adversarial: the
+## colour must NOT reach a file. --install is mostly run from a job, whose
+## stdout is a log, and escape codes written there are noise every later reader
+## has to strip -- so the prefix has to carry the meaning on its own.
+t_test_attention_todo() {
+	printf '\nA step only a human can take says so\n'
+	_at_o=$(todo "grant it Full Disk Access" 2>&1)
+	t_match "the line is prefixed so a log stays greppable" "$_at_o" "ATTENTION TODO: grant it"
+	t_eq "and carries no escape codes when nothing will render them" \
+		"$(printf '%s' "$_at_o" | LC_ALL=C tr -d '\040-\176' | wc -c | tr -d ' ')" "0"
+	t_eq "the colour variables are empty when output is captured" \
+		"[$C_RED][$C_OFF]" "[][]"
+
+	## and --install uses it for the one step ssh can never take. Anchored on
+	## the CALL -- a leading tab -- so these very lines cannot match themselves.
+	t_eq "the Full Disk Access grant is a TODO, not a note" \
+		"$(grep -c '^	todo "grant it Full Disk Access' "$T_MYTM")" "1"
+	t_eq "and no longer a plain note" \
+		"$(grep -c '^	note "grant it Full Disk Access' "$T_MYTM")" "0"
+}
+
 ## REGRESSION: the design promised an "exclusive size" column from tmutil
 ## uniquesize. That tool refuses on an APFS Time Machine store
 ## ("pathInAPFSBackup"), and nothing else on macOS reports per-snapshot space,
@@ -9788,6 +9827,7 @@ run_tests() {
 	t_test_unrecorded_mounts
 	t_test_private_var_is_var
 	t_test_remote_install_dir
+	t_test_attention_todo
 	t_test_launcher
 	t_test_install_launcher
 	t_test_job_guidance
