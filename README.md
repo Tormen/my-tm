@@ -415,8 +415,11 @@ $CACHE_DIR/index/<loc>.versions/ -> the version store: per-snapshot delta rows
   run marks its mount `indexer` in the mount record (§8) and it is exempt while
   it works. In exchange it **cleans up behind itself** — it holds exactly the one
   snapshot it is walking and releases it before opening the next, so at any
-  instant at most one snapshot is pinned, not four hundred. On exit, including
-  Ctrl-C, it releases that one and drops the exemption.
+  instant at most one snapshot is pinned, not four hundred. Interrupt it and
+  that last mount is left for the **sweep**, which releases it on its next
+  round (within `MAINT_INTERVAL`) once it sees the indexing process is gone.
+  So Ctrl-C is safe, but the release is the sweep's job a moment later, not
+  something the dying run does for itself.
 * **Sensible default**: `INDEX_BASELINES="newest oldest"` — two walks catch
   everything that exists now plus everything that existed at the start.
   `--index <ID>...` adds specific snapshots; `--index --all` does the lot.

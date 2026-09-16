@@ -1851,8 +1851,30 @@ mount_table_find_snapshot() {
 		}'
 }
 
+## macOS mounts /var through a symlink to /private/var, and mount(8) prints the
+## /private form while my-tm's own paths are the /var one. The same place, two
+## spellings -- so a plain string compare answers "not mounted" about a mount
+## that is plainly there. That is not a near miss: snap_umount takes the
+## not-mounted branch, DROPS THE RECORD for a snapshot it never released, and
+## returns success. The mount then leaks with nothing left to say it exists,
+## pinned against Time Machine's thinning. Seen on horse 2026-09-16.
+## Both spellings are compared, everywhere a mountpoint is looked up.
+mount_table_alt() {
+	case "$1" in
+		/private/*) printf '%s\n' "${1#/private}" ;;
+		*) printf '/private%s\n' "$1" ;;
+	esac
+}
+
+## mount(8), or the table the suite points at
+mount_table() {
+	if [ -n "$MOUNT_TABLE_FILE" ]; then cat "$MOUNT_TABLE_FILE"; else mount 2>/dev/null; fi
+}
+
 mount_table_has() {
-	mount | awk -v p="$1" 'index($0, " on " p " (") > 0 { f = 1 } END { exit(f ? 0 : 1) }'
+	mount_table | awk -v p="$1" -v q="$(mount_table_alt "$1")" '
+		index($0, " on " p " (") > 0 || index($0, " on " q " (") > 0 { f = 1 }
+		END { exit(f ? 0 : 1) }'
 }
 
 ## mounted | unmounted | absent -- the three states a destination volume can
@@ -2050,8 +2072,8 @@ usage_trend() {
 ## the sweep never acts on a record alone: the live mount table must confirm a
 ## read-only Time Machine snapshot mount at exactly that path.
 mount_table_is_snapshot() {
-	mount | awk -v p="$1" '
-		index($0, " on " p " (") > 0 &&
+	mount_table | awk -v p="$1" -v q="$(mount_table_alt "$1")" '
+		(index($0, " on " p " (") > 0 || index($0, " on " q " (") > 0) &&
 		index($0, "com.apple.TimeMachine.") == 1 &&
 		index($0, "read-only") > 0 { f = 1 }
 		END { exit(f ? 0 : 1) }
@@ -2059,6 +2081,35 @@ mount_table_is_snapshot() {
 }
 
 mounts_file() { printf '%s/mounts.cache\n' "$(cache_write_dir)"; }
+
+## Snapshot mounts under MOUNT_ROOT that NO record knows about.
+##
+## The sweep reconciles records against reality -- a record with nothing behind
+## it is dropped. This is the other direction, and it is the one that leaks: a
+## run killed between mounting a snapshot and recording it, or one whose record
+## went while the umount failed, leaves that snapshot mounted for ever. Nothing
+## says it is there, so nothing ever releases it, and a mounted snapshot is
+## exactly what blocks Time Machine's thinning. Seen on horse on 2026-09-16
+## after an --index run died: one snapshot pinned, mounts.cache empty.
+##
+## MOUNT_ROOT is my-tm's own directory, so a snapshot mounted under it that no
+## record claims is my-tm's to release.
+mounts_orphans() {
+	_mo_k=$(mounts_read_all | awk -F'\t' 'NF { print $3 }')
+	mount_table |
+		awk -v root="$MOUNT_ROOT/" -v known="$_mo_k" '
+		BEGIN { n = split(known, k, "\n"); for (i = 1; i <= n; i++) if (k[i] != "") seen[k[i]] = 1 }
+		# only snapshot mounts my-tm made, never anything else on this Mac
+		index($0, "com.apple.TimeMachine.") != 1 { next }
+		!match($0, / on .* \(/) { next }
+		{ mp = substr($0, RSTART + 4, RLENGTH - 6)
+		  # /private/var/... and /var/... are the same place
+		  bare = mp; sub(/^\/private/, "", bare)
+		  if (index(mp, root) != 1 && index(bare, root) != 1) next
+		  if (mp in seen || bare in seen) next
+		  print mp }'
+	return 0
+}
 
 mounts_read_all() {
 	for _d in $(cache_read_dirs); do
@@ -2273,6 +2324,17 @@ indexer_still_running() {
 
 sweep() {
 	_now=$(now_epoch)
+	## first the mounts nothing remembers: they have no TTL to wait for and no
+	## record to consult, so the only question is whether anything is using them
+	for _so in $(mounts_orphans); do
+		if printf '%s\n' "$_so" | busy_mounts | grep -qxF "$_so"; then
+			dbg "sweep: unrecorded mount is in use, left alone ($_so)"
+			continue
+		fi
+		msg "releasing a mount nothing recorded: $_so"
+		why "a snapshot left mounted blocks Time Machine's thinning"
+		snap_umount "$_so" || warn "could not release $_so"
+	done
 	_records=$(mounts_read_all)
 	[ -n "$_records" ] || return 0
 	_urgent=0
@@ -8085,6 +8147,91 @@ t_test_remote_add_and_install() {
 	printf '%s\n' "$_ra_save" | cache_write_locations
 }
 
+## Mounts nothing recorded. Seen on horse on 2026-09-16: an --index run died,
+## mounts.cache was empty, and one snapshot stayed mounted -- pinned against
+## Time Machine's thinning with nothing left to say it was there. The sweep
+## reconciled records against reality but never the other way round, so it
+## returned immediately on an empty record file and the mount leaked for ever.
+## Adversarial: the scan must not reach outside MOUNT_ROOT, must not claim a
+## mount that IS recorded, and must not touch a non-snapshot mount.
+t_test_unrecorded_mounts() {
+	printf '\nA mount nothing recorded is still my-tm mount\n'
+	_um_save="$MOUNT_TABLE_FILE"; _um_mr="$MOUNT_ROOT"
+	MOUNT_ROOT="$T_ROOT/mount"
+	MOUNT_TABLE_FILE="$T_ROOT/um.table"
+	{
+		## the leak: a snapshot under MOUNT_ROOT that no record claims
+		printf 'com.apple.TimeMachine.2026-09-16-040349.backup@/dev/disk5s2 on %s/.mnt/horse/2026-09-16-040349 (apfs, local, read-only, journaled)\n' "$MOUNT_ROOT"
+		## the same shape, but RECORDED -- the sweep owns it by its record
+		printf 'com.apple.TimeMachine.2026-09-15-010101.backup@/dev/disk5s2 on %s/.mnt/horse/2026-09-15-010101 (apfs, local, read-only, journaled)\n' "$MOUNT_ROOT"
+		## a snapshot mount OUTSIDE my-tm's tree: macOS's own, none of our business
+		printf 'com.apple.TimeMachine.2026-09-16-010440.local@/dev/disk3s5 on /Volumes/com.apple.TimeMachine.localsnapshots/Backups.backupdb/horse/x (apfs, local, read-only)\n'
+		## and an ordinary volume under MOUNT_ROOT, which is not a snapshot
+		printf '/dev/disk9s1 on %s/.mnt/plain (apfs, local, journaled)\n' "$MOUNT_ROOT"
+	} >"$MOUNT_TABLE_FILE"
+	printf 'aaaaaa\thorse\t%s/.mnt/horse/2026-09-15-010101\t1\t900\t1\t\n' "$MOUNT_ROOT" \
+		>"$(cache_write_dir)/mounts.cache"
+
+	_um=$(mounts_orphans)
+	t_eq "the unrecorded snapshot is found" \
+		"$(printf '%s\n' "$_um" | count_match '2026-09-16-040349')" "1"
+	t_eq "the recorded one is left to its record" \
+		"$(printf '%s\n' "$_um" | count_match '2026-09-15-010101')" "0"
+	t_eq "a snapshot outside MOUNT_ROOT is none of my-tm's business" \
+		"$(printf '%s\n' "$_um" | count_match 'localsnapshots')" "0"
+	t_eq "and an ordinary volume under it is not a snapshot mount" \
+		"$(printf '%s\n' "$_um" | count_match 'plain')" "0"
+	t_eq "so exactly one is claimed" "$(printf '%s\n' "$_um" | count_lines)" "1"
+
+	## /private/var/... and /var/... are the same place, and mount says the first
+	MOUNT_ROOT="/var/lib/mine/my-tm/mount"
+	printf 'com.apple.TimeMachine.2026-09-16-040349.backup@/dev/disk5s2 on /private/var/lib/mine/my-tm/mount/.mnt/horse/2026-09-16-040349 (apfs, local, read-only)\n' \
+		>"$MOUNT_TABLE_FILE"
+	: >"$(cache_write_dir)/mounts.cache"
+	t_eq "a /private-prefixed mountpoint still counts as inside MOUNT_ROOT" \
+		"$(mounts_orphans | count_lines)" "1"
+
+	## and the sweep no longer gives up before it looks
+	t_eq "the sweep looks for them before it reads its records" \
+		"$(sed -n '/^sweep() {$/,/^}$/p' "$T_MYTM" | awk '/mounts_orphans/ {o = NR} /_records=\$\(mounts_read_all\)/ {r = NR}
+			END {print (o && r && o < r) ? "first" : "after"}')" "first"
+
+	: >"$(cache_write_dir)/mounts.cache"
+	rm -f "$MOUNT_TABLE_FILE"
+	MOUNT_TABLE_FILE="$_um_save"; MOUNT_ROOT="$_um_mr"
+}
+
+## /var and /private/var are the same place, and mount(8) prints the second
+## while my-tm's own paths are the first. Adversarial, and this one cost a
+## leaked mount on horse on 2026-09-16: a mountpoint lookup that misses the
+## spelling answers "not mounted" about a mount that is plainly there -- and
+## snap_umount believes it, drops the record for a snapshot it never released,
+## and returns SUCCESS. The mount is then invisible and pinned for ever.
+t_test_private_var_is_var() {
+	printf '\nA mountpoint is the same place under either spelling\n'
+	_pv_save="$MOUNT_TABLE_FILE"
+	MOUNT_TABLE_FILE="$T_ROOT/pv.table"
+	_pv_mp="/var/lib/mine/my-tm/mount/.mnt/horse/2026-09-16-040349"
+	printf 'com.apple.TimeMachine.2026-09-16-040349.backup@/dev/disk5s2 on /private%s (apfs, local, nodev, nosuid, read-only, journaled)\n' \
+		"$_pv_mp" >"$MOUNT_TABLE_FILE"
+
+	t_eq "mount(8) says /private/var, my-tm asks about /var -- and is answered yes" \
+		"$(mount_table_has "$_pv_mp" && echo mounted || echo no)" "mounted"
+	t_eq "and asking with the /private spelling works too" \
+		"$(mount_table_has "/private$_pv_mp" && echo mounted || echo no)" "mounted"
+	t_eq "it is recognised as a snapshot mount either way" \
+		"$(mount_table_is_snapshot "$_pv_mp" && echo snap || echo no) $(mount_table_is_snapshot "/private$_pv_mp" && echo snap || echo no)" \
+		"snap snap"
+	t_eq "a mountpoint that really is absent still reads as absent" \
+		"$(mount_table_has /var/lib/mine/my-tm/mount/.mnt/horse/1999-01-01-000000 && echo mounted || echo no)" "no"
+	## the whole point: snap_umount must NOT drop the record for a live mount
+	t_eq "so a live mount is never mistaken for one already gone" \
+		"$(sed -n '/^snap_umount() {$/,/^}$/p' "$T_MYTM" | count_match 'mount_table_has')" "1"
+
+	rm -f "$MOUNT_TABLE_FILE"
+	MOUNT_TABLE_FILE="$_pv_save"
+}
+
 ## REGRESSION: the design promised an "exclusive size" column from tmutil
 ## uniquesize. That tool refuses on an APFS Time Machine store
 ## ("pathInAPFSBackup"), and nothing else on macOS reports per-snapshot space,
@@ -9539,6 +9686,8 @@ run_tests() {
 	t_test_health_scope
 	t_test_every_default_is_offered
 	t_test_remote_add_and_install
+	t_test_unrecorded_mounts
+	t_test_private_var_is_var
 	t_test_launcher
 	t_test_install_launcher
 	t_test_job_guidance
