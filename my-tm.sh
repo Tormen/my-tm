@@ -3187,6 +3187,15 @@ $_h index: $_ixs"
 			_ixsz=$(human_bytes "$_ixb")
 			_ixn=$(index_covered_count "$_h")
 			[ "$_ixn" -gt 0 ] && _ixper=$(human_bytes $(( _ixb / _ixn )))
+			## while the index covers only part of the store, say roughly what the
+			## whole would take: the per-snapshot average times every snapshot.
+			## Marked ~ -- it is linear, and the index is a union that shares
+			## unchanged paths between snapshots, so it tends to run high
+			case "$_snaps" in
+				''|*[!0-9]*) : ;;
+				*) [ "$_ixn" -gt 0 ] && [ "$_ixn" -lt "$_snaps" ] &&
+					_ixsz="$_ixsz / ~$(human_bytes $(( _ixb * _snaps / _ixn )))" ;;
+			esac
 		fi
 		_tbl="$_tbl
 $_h	$(printf '%s' "$_dest" | cut -c1-30)	$_snaps	$_span	$_last$_mark	$_space	$_ixd	$_ixsz	$_ixper"
@@ -8713,6 +8722,13 @@ t_test_status_index_size() {
 		"$(printf '%s' "$_sz_row" | awk '{print ($(NF-1) != "-" && $NF != "-") ? "both" : "missing"}')" "both"
 	t_eq "and the header names them" \
 		"$(cmd_status 2>/dev/null | head -n 1 | count_match 'INDEX  PER SNAP')" "1"
+	## half covered: the size gains an estimate for the whole store
+	snap_names store | head -n 1 >"$_sz_d/store.covered"
+	_sz_est=$(cmd_status 2>/dev/null | awk '$1 == "store"')
+	t_match "while only part is indexed, INDEX estimates the whole" "$_sz_est" "/ ~"
+	snap_names store | head -n 2 >"$_sz_d/store.covered"
+	t_eq "and says nothing more once everything is covered" \
+		"$(cmd_status 2>/dev/null | awk '$1 == "store"' | count_match '/ ~')" "0"
 	t_eq "a location with no index shows -" \
 		"$(cmd_status 2>/dev/null | awk '$1 == "local" {print $(NF-1) $NF}')" "--"
 
