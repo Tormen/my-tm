@@ -145,12 +145,32 @@ JOB_PROGRAM=""
 ## caller reaches transient_snapshot through $(...), which is a subshell, and a
 ## variable set there dies with it -- leaving the snapshot mounted, which is
 ## exactly what blocks Time Machine's thinning.
-TRANSIENT_LIST="${TMPDIR:-/tmp}/.my-tm.transient.$$"
+## Every per-run file lives in ONE private directory, made by mktemp -d so its
+## name cannot be guessed and nothing can have been planted there. These files
+## used to sit at /tmp/.my-tm.<what>.$$ -- a name anyone can predict -- and a
+## root run both appends to them AND acts on what they list at exit (unmount,
+## detach). A symlink or a pre-filled file at that name let any local user
+## point a root run at a write, an unmount or a detach of their choosing.
+RUN_DIR=$(mktemp -d "${TMPDIR:-/tmp}/my-tm.run.XXXXXX" 2>/dev/null) || {
+	printf ' !!! cannot create a private directory for this run under %s\n' "${TMPDIR:-/tmp}" >&2
+	exit 1
+}
+## per-run caches of answers that do not change during a run (the location
+## list, whether a host answers). The suite turns them off, because its tests
+## rewrite locations.tsv directly between calls; one test turns them back on.
+RUN_CACHE=1
+## The process that made RUN_DIR, and the only one allowed to remove it. $$ is
+## the same in every subshell, so it cannot tell them apart: a subshell that
+## sets its own EXIT trap -- cmd_backup does -- would delete the directory out
+## from under the run that is still using it. This yields the pid of the shell
+## actually running, subshell or not.
+RUN_DIR_OWNER=$(exec sh -c 'echo $PPID')
+TRANSIENT_LIST="$RUN_DIR/transient"
 ## Volumes WE mounted, to be put back exactly as they were. A file for the
 ## same reason as above: every caller reaches this through a subshell.
-TRANSIENT_VOLUMES="${TMPDIR:-/tmp}/.my-tm.volumes.$$"
+TRANSIENT_VOLUMES="$RUN_DIR/volumes"
 ## Disk images WE attached, to be detached again on the way out.
-TRANSIENT_IMAGES="${TMPDIR:-/tmp}/.my-tm.images.$$"
+TRANSIENT_IMAGES="$RUN_DIR/images"
 
 #############################################################################
 ## OUTPUT
@@ -875,6 +895,7 @@ locations_file() { printf '%s/locations.tsv\n' "$CACHE_DIR"; }
 cache_write_locations() {
 	_cwl=$(locations_file)
 	grep -v '^[[:space:]]*$' | atomic_write "$_cwl" 2>/dev/null || true
+	locations_run_cache_drop
 	return 0
 }
 
@@ -941,7 +962,31 @@ destinations_scan() {
 
 ## all locations: registered + (optionally) autodetected + the `local` pseudo
 ## emits: handle <TAB> target <TAB> installdir
+##
+## Built ONCE per run. A single --status used to rebuild it 35 times -- every
+## handle lookup starts here -- at ~20 ms each (tmutil, the image-scan cache's
+## age check, a pass of awk per row): 0.7 s of a 1.8 s run. Kept in a FILE in the
+## run directory, since nearly every caller reaches it through $(...), where a
+## variable would die with the subshell. Every write to locations.tsv drops it.
 locations_all() {
+	if [ "$RUN_CACHE" = "1" ]; then
+		[ -f "$RUN_DIR/locations" ] && { cat "$RUN_DIR/locations"; return 0; }
+		if locations_all_build >"$RUN_DIR/locations.new" 2>/dev/null &&
+		   mv -f "$RUN_DIR/locations.new" "$RUN_DIR/locations"; then
+			cat "$RUN_DIR/locations"
+			return 0
+		fi
+	fi
+	locations_all_build
+}
+
+## the run's location list is stale the moment locations.tsv changes
+locations_run_cache_drop() {
+	rm -f "$RUN_DIR/locations" 2>/dev/null
+	return 0
+}
+
+locations_all_build() {
 	_seen=""
 	_seenpaths=""
 	_reg=$(locations_registered)
@@ -1171,9 +1216,25 @@ loc_is_remote() { is_remote_target "$(loc_target "$1")"; }
 ## attempt, no password prompt, short timeout. Answering "yes" without asking
 ## is what made --health report "no snapshots found" for a host that was merely
 ## switched off -- a wrong answer dressed up as a real one.
+##
+## Asked ONCE per run per host: a --status asked twice for the same host, at
+## ~150 ms an ssh login. The answer is kept for the run -- a host that comes up
+## mid-run is seen by the next one, which for a status is seconds away.
 remote_reachable() {
-	ssh -o BatchMode=yes -o ConnectTimeout="${SSH_CONNECT_TIMEOUT:-3}" \
-		"$1" true >/dev/null 2>&1
+	if [ "$RUN_CACHE" = "1" ]; then
+		case "$(awk -F'\t' -v h="$1" '$1 == h {a = $2} END {print a}' "$RUN_DIR/reach" 2>/dev/null)" in
+			yes) return 0 ;;
+			no)  return 1 ;;
+		esac
+	fi
+	if ssh -o BatchMode=yes -o ConnectTimeout="${SSH_CONNECT_TIMEOUT:-3}" \
+		"$1" true >/dev/null 2>&1; then
+		_rr_a=yes
+	else
+		_rr_a=no
+	fi
+	[ "$RUN_CACHE" = "1" ] && printf '%s\t%s\n' "$1" "$_rr_a" >>"$RUN_DIR/reach"
+	[ "$_rr_a" = "yes" ]
 }
 
 remote_host() { printf '%s\n' "${1%%:*}"; }
@@ -2282,7 +2343,20 @@ cleanup_transient() {
 	return $_rc
 }
 
-cleanup_all() { cleanup_transient; cleanup_images; cleanup_volumes; }
+## the private run directory goes last, after everything listed in it is undone
+cleanup_run_dir() {
+	[ "$(exec sh -c 'echo $PPID')" = "${RUN_DIR_OWNER:-}" ] || return 0
+	case "${RUN_DIR:-}" in
+		*/my-tm.run.*) rm -rf "$RUN_DIR" ;;
+	esac
+	return 0
+}
+
+cleanup_all() {
+	_ca_rc=$?
+	cleanup_transient; cleanup_images; cleanup_volumes; cleanup_run_dir
+	return $_ca_rc
+}
 trap 'cleanup_all' EXIT
 trap 'cleanup_all; exit 130' INT
 trap 'cleanup_all; exit 143' TERM
@@ -4997,6 +5071,7 @@ backup_cleanup() {
 	_rc=$?
 	[ -n "${BACKUP_LOCK_HELD:-}" ] && rm -f "$LOCKFILE"
 	cleanup_transient
+	cleanup_run_dir
 	exit $_rc
 }
 
@@ -5438,6 +5513,7 @@ add_one() {
 		[ -f "$_f" ] && cat "$_f"
 		printf '%s\t%s\t\n' "$_handle" "$_folder"
 	} | atomic_write "$_f" || err "cannot write $_f"
+	locations_run_cache_drop
 	msg "added location '$_handle' -> $_folder"
 
 	if ! is_remote_target "$_folder"; then
@@ -5456,6 +5532,7 @@ cmd_forget() {
 		err "$_handle: not a registered location"
 	locations_writable "--forget $_handle"
 	awk -F'\t' -v h="$_handle" '$1 != h' "$_f" | atomic_write "$_f" || err "cannot write $_f"
+	locations_run_cache_drop
 	msg "forgot location '$_handle' -- no backup was touched"
 	why "deleting snapshots is a different verb: $US --rm <ID> go"
 	return 0
@@ -6907,6 +6984,7 @@ _EOF
 }
 
 t_setup() {
+	RUN_CACHE=0
 	T_ROOT=$(mktemp -d /tmp/my-tm.test.XXXXXX) || err "cannot create a test dir"
 	T_MYTM=$(abs_path "$0")
 	mkdir -p "$T_ROOT/store" "$T_ROOT/cache" "$T_ROOT/ucache" "$T_ROOT/mount" "$T_ROOT/home"
@@ -8736,6 +8814,59 @@ t_test_status_index_size() {
 	printf '%s\n' "$_sz_save" | cache_write_locations
 }
 
+## Per-run caching and the private run directory. Adversarial: a cached
+## location list must not HIDE a location added or forgotten during the same
+## run -- --add then reading it back is exactly that; a host must be asked once,
+## but its "no" must be remembered too, or an unreachable host costs a timeout
+## per lookup; and nothing per-run may sit at a name another user can predict.
+t_test_run_cache() {
+	printf '\nOne run builds the location list once and asks each host once\n'
+	## the private directory
+	t_eq "per-run files live in a private mktemp directory" \
+		"$(printf '%s\n' "$RUN_DIR" | grep -Ec '/my-tm\.run\.[A-Za-z0-9]{6}$') $(stat -f '%Lp' "$RUN_DIR")" \
+		"1 700"
+	t_eq "all three transient lists are inside it" \
+		"$(printf '%s\n' "$TRANSIENT_LIST" "$TRANSIENT_VOLUMES" "$TRANSIENT_IMAGES" | grep -cF "$RUN_DIR/")" "3"
+	## a subshell with its own EXIT trap must not take the directory with it
+	( cleanup_run_dir )
+	t_eq "a subshell cannot remove the run's directory" \
+		"$([ -d "$RUN_DIR" ] && echo kept || echo removed)" "kept"
+	## built in two pieces so this line cannot match itself
+	_rc_old='TMPDIR:-/tmp}/'"\.my-tm\."
+	t_eq "no per-run name under a guessable /tmp path remains" \
+		"$(grep -c "$_rc_old" "$T_MYTM")" "0"
+	_rc_td="$T_ROOT/rt"; mkdir -p "$_rc_td"
+	TMPDIR="$_rc_td" "$T_MYTM" --version >/dev/null 2>&1
+	t_eq "and the directory is gone when the run ends" \
+		"$(find "$_rc_td" -name 'my-tm.run.*' 2>/dev/null | count_lines)" "0"
+
+	_rc_log="$T_ROOT/rc.calls"; : >"$_rc_log"
+	_rc_save=$(cat "$T_ROOT/cache/locations.tsv")
+	# shellcheck disable=SC2329  # deliberate overrides, in a subshell with the cache ON
+	_rc_out=$( (
+		RUN_CACHE=1; RUN_DIR=$(mktemp -d "$T_ROOT/my-tm.run.XXXXXX")
+		destinations_scan() { printf 'scan\n' >>"$_rc_log"; }
+		locations_all >/dev/null; locations_all >/dev/null; locations_all >/dev/null
+		printf 'builds=%s ' "$(count_match scan <"$_rc_log")"
+		## a write during the run must be seen straight away
+		printf 'added\t%s/store\t\n' "$T_ROOT" | { cat "$T_ROOT/cache/locations.tsv"; cat; } | cache_write_locations
+		printf 'sees_add=%s ' "$(locations_all | awk -F'\t' '$1 == "added"' | count_lines)"
+		cmd_forget added >/dev/null 2>&1
+		printf 'sees_forget=%s ' "$(locations_all | awk -F'\t' '$1 == "added"' | count_lines)"
+		ssh() { printf 'ssh %s\n' "$*" >>"$_rc_log"; printf '%s\n' "$*" | grep -q ' up true$'; }
+		remote_reachable up; remote_reachable up; remote_reachable down; remote_reachable down
+		printf 'ssh_up=%s ssh_down=%s ' "$(count_match ' up true' <"$_rc_log")" "$(count_match ' down true' <"$_rc_log")"
+		remote_reachable up && printf 'up=yes ' || printf 'up=no '
+		remote_reachable down && printf 'down=yes' || printf 'down=no'
+	) 2>/dev/null )
+	t_eq "the list is built once however often it is asked for" "${_rc_out%% *}" "builds=1"
+	t_match "a location added during the run is seen at once" "$_rc_out" "sees_add=1"
+	t_match "and one forgotten is gone at once" "$_rc_out" "sees_forget=0"
+	t_match "each host is asked once, whatever the answer" "$_rc_out" "ssh_up=1 ssh_down=1"
+	t_match "and the remembered answers are the real ones" "$_rc_out" "up=yes down=no"
+	printf '%s\n' "$_rc_save" | cache_write_locations
+}
+
 ## REGRESSION: the design promised an "exclusive size" column from tmutil
 ## uniquesize. That tool refuses on an APFS Time Machine store
 ## ("pathInAPFSBackup"), and nothing else on macOS reports per-snapshot space,
@@ -10199,6 +10330,7 @@ run_tests() {
 	t_test_ls_columns_align
 	t_test_index_progress_visible
 	t_test_status_index_size
+	t_test_run_cache
 	t_test_launcher
 	t_test_install_launcher
 	t_test_job_guidance
