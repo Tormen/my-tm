@@ -199,22 +199,28 @@ error names the location the ID actually belongs to.
 
 ## 4. Output *(spec)*
 
-Every row **starts with its key**. Fixed-width, no boxes, no colour.
+Every row **starts with its key**. No boxes. Columns are sized to their widest
+value in that listing, so an outlier (`1011.5M`, `202.8x!`) cannot push the rest
+of a row out of line. Colour appears only on a terminal: warnings yellow, a step
+only a person can take red and prefixed `ATTENTION TODO:` so it stays greppable
+in a log.
 
 ```text
 $ my-tm                                            # = --status
- LOC     DESTINATION                   SNAPS  SPAN                     LAST   USED/FREE
- backup  /Volumes/TimeMachine.Backup     412  2025-10-07..2026-08-22     14m  2.4T/1.2T
- host1   host1:/Volumes/TimeMachine.Ext   ~380  2024-11-02..2025-09-28   329d?  -
- local   / + /System/Volumes/Data            3  2026-08-22 13:35..15:56    14m  -
- --> cache 1.4M · index 212M (12/412 snaps, my-tm --index backup) · scanned 3m ago
+ LOC     DESTINATION                  SNAPS  SPAN                    LAST  USED/FREE  INDEXED    INDEX           PER SNAP
+ backup  /Volumes/TimeMachine.Backup     67  2025-09-28..2026-09-16   17m  3.59T/1.87T 11/67 now  1.60G / ~9.72G   148.5M
+ host1   host1:/Volumes/TM.Ext            -  -                          -           -  no                      -         -
+ local   / + /System/Volumes/Data        15  2026-09-15..2026-09-16   14m           -  no                      -         -
+ --> cache 13.6K · index 1.60G · scanned 3m ago
+ --> backup index: walking 2026-09-16_2249.27 now, 7m in · new backups follow automatically · 55 more only with: my-tm --index backup --all
+ --> not indexed: host1 local -- index one: my-tm --index <LOCATION>
 
 $ my-tm backup                                     # = --ls backup
- ID      SNAPSHOT             AGE  FILES  ADDED  DRIFT  TOTAL  VOL
- k7f2q9  2026-08-22_1456.25   14m  17.9k   5.3G   1.4x  1.59T   Data
- m3x8b1  2026-08-20_1558.05    2d  12.1k   3.9G   1.0x  1.58T   Data
- q4d7h2  2026-07-30_1558.05   23d  91.2k  84.7G  22.0x! 1.51T  Data
- ...409 more (--all) · ADDED avg 3.8G
+ ID      SNAPSHOT             AGE  FILES   ADDED   DRIFT  TOTAL  INDEXED  VOL
+ k7f2q9  2026-08-22_1456.25   14m  17.9k    5.3G   1.4x   1.59T  now      Data
+ m3x8b1  2026-08-20_1558.05    2d  12.1k    3.9G   1.0x   1.58T  yes      Data
+ q4d7h2  2026-07-30_1558.05   23d  91.2k   84.7G  22.0x!  1.51T  no       Data
+ --> 409 more (--all) · ADDED median 3.8G · indexed 11/412, walking 2026-08-22_1456.25 now
 
 $ my-tm ~/Documents/report.odt                     # = --lookup
  ID      SNAPSHOT             AGE   SIZE  STATE
@@ -230,7 +236,18 @@ $ my-tm 'invoice*.pdf'                             # = --find
  --> my-tm <path> for the version table · --all to expand every version here
 ```
 
-Rows from cache for an unmounted location are marked `?`. Anything longer than
+Rows from cache for an unmounted location are marked `?`.
+
+**The index columns of `--status`.** `INDEXED` counts the snapshots the index
+covers that still exist, `no` for a location not opted in, and adds `now` while
+a walk is running. `INDEX` is that location's index on disk (database,
+increments, coverage record, version store); while coverage is partial it adds
+`/ ~<size>`, the per-snapshot average times every snapshot — linear, so it runs
+high. `PER SNAP` is `INDEX` over the snapshots covered. Below the table, one
+line per indexed location says what is being walked or when it last ran,
+whether new backups follow automatically, and how many older snapshots only
+`--index <LOC> --all` will cover: the automatic runs take each new backup, never
+the history in between. `--ls` marks every snapshot `yes`, `no` or `now`. Anything longer than
 ~2 lines of prose belongs in `--help`, not in runtime output.
 
 ### The size columns, precisely

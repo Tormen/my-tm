@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/dash
 #
 # my-tm -- swiss-army knife for Time Machine.
 #
