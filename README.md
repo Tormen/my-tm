@@ -364,8 +364,8 @@ $CACHE_DIR/index/system.db     -> the live volume: reuse /var/db/locate.database
 $CACHE_DIR/index/<loc>.db      -> consolidated union of paths seen in that history
 $CACHE_DIR/index/<loc>.inc.NN.db -> per-run increments, folded in on consolidation
 $CACHE_DIR/index/<loc>.covered -> snapshot IDs already indexed
-$CACHE_DIR/index/<loc>.versions/ -> the version store: per-snapshot delta rows
-                                  (path, inode, size, mtime; add/del/mod), §6
+$CACHE_DIR/index/<loc>.versions/ -> the version store: a baseline plus one
+                                  compressed delta per snapshot (path, size, mtime), §6
 ```
 
 * **Nothing is indexed until you say so.** `--index <LOCATION>` opts a
@@ -406,11 +406,18 @@ $CACHE_DIR/index/<loc>.versions/ -> the version store: per-snapshot delta rows
   *"which versions of this file do I have?"* — the question a restore starts
   with — without mounting anything. The walk already visits every entry, so it
   stats them in the same pass (`find -print0 | xargs -0 stat`, batched), and:
-  * the **first** indexed snapshot of a location is stored whole, as
+  * the **earliest** indexed snapshot of a location is stored whole, as
     `<loc>.versions/base.<XX>.gz` — bucketed by the last two characters of the
     path, so a single-path query decompresses ~140 KB instead of the lot;
-  * every later snapshot is stored as a **delta** against the previous walk
-    (`comm` of the two sorted lists), `<loc>.versions/d.<ts>.tsv`.
+  * every later one is stored as a gzipped **delta** against the indexed
+    snapshot just before it **in time**, `<loc>.versions/d.<ts>.tsv.gz`.
+    Walks do not come in time order — `INDEX_BASELINES` walks the newest, then
+    the oldest, and `--index --all` fills in the gaps afterwards — so a snapshot
+    walked before an indexed one also rewrites that one's delta (or becomes the
+    new baseline). The rewrite is done in a hard-linked copy of the store and
+    swapped in whole, so an interrupted run leaves the store as it was.
+    A store written by an earlier my-tm (uncompressed deltas against the
+    previous *walk*) is converted once, by the first `--index` run that meets it.
 
   Measured on a real 4.4 M-file snapshot: the full listing is 722 MB raw and
   **35 MB gzipped**, and a delta at the observed churn is a few hundred KB. So

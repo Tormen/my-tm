@@ -2750,17 +2750,25 @@ _EOF
 ##   inode "-" means: verified absent from that snapshot.
 #############################################################################
 
-## The version store proper.
+## The version store proper, kept in TIME order whatever order the walks came in.
 ##
-##   <loc>.versions/base.<XX>.gz   the first indexed snapshot, in 256 buckets
-##   <loc>.versions/d.<ts>.tsv     what changed in each later snapshot
-##   <loc>.versions/base.ts        which snapshot the baseline is
+##   <loc>.versions/base.<XX>.gz      the earliest indexed snapshot, in 256 buckets
+##   <loc>.versions/base.ts           which snapshot that is
+##   <loc>.versions/d.<ts>.tsv.gz     what changed since the indexed snapshot before it
+##   <loc>.versions/.prev.<ts>.gz     the newest one whole, so the next backup's
+##                                    delta needs nothing reconstructed
 ##
 ## A full snapshot is ~4.4M rows of path+size+mtime: 722 MB raw, 35 MB gzipped
 ## (measured). Keeping one per snapshot would be gigabytes, so only the first is
 ## stored whole and the rest as deltas -- at the measured 0.4 % churn that is a
 ## couple of hundred KB each. The baseline is bucketed by a hash of the path so
 ## a single-path query decompresses ~140 KB instead of 35 MB.
+##
+## Each delta is taken against its neighbour IN TIME, never against the walk
+## before it: --index --all fills in older snapshots after newer ones are
+## indexed, and a lookup replays the deltas by name. A snapshot walked out of
+## order therefore rewrites the delta of the one after it (or becomes the new
+## baseline), in a hard-linked copy of the store that is swapped in whole.
 vs_dir() { printf '%s/index/%s.versions\n' "$(cache_write_dir)" "$1"; }
 
 ## Which baseline bucket a path lives in. Must match vs_write_baseline exactly:
@@ -2775,6 +2783,23 @@ vs_bucket() {
 	printf '\n'
 }
 
+## The delta files of a store in time order. A store written before the deltas
+## were compressed holds d.<ts>.tsv; gzip -cdf reads both alike.
+vs_delta_files() {
+	for _df_f in "$1"/d.*.tsv.gz "$1"/d.*.tsv; do
+		[ -f "$_df_f" ] || continue
+		case "$_df_f" in *.tsv) [ -f "$_df_f.gz" ] && continue ;; esac
+		printf '%s\n' "$_df_f"
+	done | LC_ALL=C sort
+}
+vs_delta_ts() { vs_delta_files "$1" | sed 's|.*/d\.||; s|\.gz$||; s|\.tsv$||'; }
+vs_delta_file() {
+	if [ -f "$1/d.$2.tsv.gz" ]; then printf '%s\n' "$1/d.$2.tsv.gz"
+	else printf '%s\n' "$1/d.$2.tsv"; fi
+}
+## every snapshot the store holds, baseline included, in time order
+vs_chain_ts() { { cat "$1/base.ts" 2>/dev/null; vs_delta_ts "$1"; } | awk 'length > 0' | LC_ALL=C sort -u; }
+
 ## Every version of PATH the index knows about, with no mount at all.
 ## Emits: ts <TAB> size <TAB> mtime   ("-" for a snapshot that lacks the file)
 vs_versions_for() {
@@ -2788,70 +2813,229 @@ vs_versions_for() {
 		awk -F'\t' -v p="$_p" '$1 == p {printf "%s\t%s", $2, $3; exit}')
 	[ -n "$_cur" ] || _cur=$(printf -- '-\t-')
 	printf '%s\t%s\n' "$_bts" "$_cur"
-	## then replay the deltas in time order, carrying the last known state
-	for _df in "$_d"/d.*.tsv; do
-		[ -f "$_df" ] || continue
-		_dts=$(basename "$_df"); _dts=${_dts#d.}; _dts=${_dts%.tsv}
-		## if a delta somehow holds both, the file being THERE is the truth
-		_row=$(awk -F'\t' -v p="$_p" '
-			$1 == p { if ($2 != "-") { printf "%s\t%s", $2, $3; found = 1; exit }
-			          else keep = $2 "\t" $3 }
-			END { if (!found && keep != "") printf "%s", keep }' "$_df")
-		[ -n "$_row" ] && _cur="$_row"
-		printf '%s\t%s\n' "$_dts" "$_cur"
+	## then replay the deltas in time order, carrying the last known state; if
+	## a delta somehow holds both, the file being THERE is the truth
+	vs_delta_files "$_d" | LC_ALL=C awk -v p="$_p" -v cur="$_cur" '{
+		ts = $0; sub(/.*\/d\./, "", ts); sub(/\.gz$/, "", ts); sub(/\.tsv$/, "", ts)
+		c = "gzip -cdf < \"" $0 "\" 2>/dev/null"; hit = ""; keep = ""
+		while ((c | getline row) > 0) {
+			split(row, f, "\t")
+			if (f[1] != p) continue
+			if (f[2] != "-") { hit = f[2] "\t" f[3]; break }
+			keep = f[2] "\t" f[3]
+		}
+		close(c)
+		if (hit != "") cur = hit; else if (keep != "") cur = keep
+		printf "%s\t%s\n", ts, cur
+	}'
+	return 0
+}
+
+## rows tagged with how late in the chain they come, for vs_fold
+vs_ranked() { LC_ALL=C awk -v r="$1" 'length > 0 {print r "\t" $0}'; }
+
+## Ranked rows in, one whole snapshot out, sorted like a walk's stats: per path
+## the latest row wins, a real row beats an absent one of the same rank, and
+## what ends up absent is left out.
+vs_fold() {
+	LC_ALL=C awk -F'\t' -v OFS='\t' '{print $2, $1 * 2 + ($3 != "-"), $3, $4}' |
+	LC_ALL=C sort -t "$(printf '\t')" -k1,1 -k2,2nr |
+	LC_ALL=C awk -F'\t' -v OFS='\t' '$1 != last {last = $1; if ($3 != "-") print $1, $3, $4}' |
+	LC_ALL=C sort
+}
+
+## the whole of snapshot TS, rebuilt from the baseline and the deltas up to it
+vs_state() {                    # <dir> <ts> <out>
+	{
+		for _vs_b in "$1"/base.*.gz; do
+			[ -f "$_vs_b" ] || continue
+			gzip -cd "$_vs_b" 2>/dev/null
+		done | vs_ranked 0
+		_vs_r=0
+		for _vs_t in $(vs_delta_ts "$1" | LC_ALL=C awk -v t="$2" '$0 <= t'); do
+			_vs_r=$(( _vs_r + 1 ))
+			gzip -cdf <"$(vs_delta_file "$1" "$_vs_t")" 2>/dev/null | vs_ranked "$_vs_r"
+		done
+	} | vs_fold >"$3"
+}
+
+## what changed from snapshot OLD to snapshot NEW, both whole and sorted.
+## Removals are a difference of PATHS, never of whole lines. Comparing lines
+## calls every CHANGED file removed as well -- its old line is gone -- so each
+## delta carried both "here it is" and "it is gone" for the same path, and an
+## absent row sorts before a real one (ASCII 45 before 48), so the phantom won
+## every lookup. That is a backup reported as not holding a file it plainly holds.
+vs_diff() {                     # <old> <new>
+	_vf_o=$(mktemp /tmp/my-tm.op.XXXXXX) || return 1
+	_vf_n=$(mktemp /tmp/my-tm.np.XXXXXX) || { rm -f "$_vf_o"; return 1; }
+	LC_ALL=C cut -f1 "$1" | LC_ALL=C sort -u >"$_vf_o"
+	LC_ALL=C cut -f1 "$2" | LC_ALL=C sort -u >"$_vf_n"
+	{
+		LC_ALL=C comm -13 "$1" "$2" || true
+		LC_ALL=C comm -23 "$_vf_o" "$_vf_n" | LC_ALL=C awk 'length > 0 {printf "%s\t-\t-\n", $0}'
+	} | LC_ALL=C sort -u
+	rm -f "$_vf_o" "$_vf_n"
+}
+
+## Rows on stdin become d.<ts>.tsv.gz, written aside and renamed into place, so
+## a reader never sees half a delta. A new file, never an overwrite: in a
+## hard-linked copy of the store that is what keeps the original intact.
+vs_put_delta() {                # <dir> <ts>
+	if gzip -c >"$1/.d.$2.tmp" && mv -f "$1/.d.$2.tmp" "$1/d.$2.tsv.gz"; then
+		rm -f "$1/d.$2.tsv"
+		return 0
+	fi
+	rm -f "$1/.d.$2.tmp"
+	return 1
+}
+
+## keep the newest snapshot whole, named for which one it is
+vs_put_prev() {                 # <dir> <ts> <stats>
+	gzip -c <"$3" >"$1/.prev.tmp" 2>/dev/null || { rm -f "$1/.prev.tmp"; return 1; }
+	for _pp_f in "$1"/.prev.gz "$1"/.prev.*.gz; do
+		[ -f "$_pp_f" ] && rm -f "$_pp_f"
+	done
+	mv -f "$1/.prev.tmp" "$1/.prev.$2.gz"
+}
+
+## Swap a rewritten copy in for the store. Two renames: if the run dies between
+## them, vs_recover puts the untouched original back.
+vs_swap() {                     # <dir> <copy>
+	mv "$1" "$1.old.$$" 2>/dev/null || { rm -rf "$2"; return 1; }
+	mv "$2" "$1" 2>/dev/null || { mv "$1.old.$$" "$1"; return 1; }
+	rm -rf "$1.old.$$"
+	return 0
+}
+
+## what a run that died mid-rewrite left behind, if its process is gone
+vs_recover() {                  # <dir>
+	for _rc_x in "$1".old.* "$1".new.*; do
+		[ -d "$_rc_x" ] || continue
+		ps -p "${_rc_x##*.}" >/dev/null 2>&1 && continue
+		case "$_rc_x" in
+			"$1".old.*)
+				if [ ! -d "$1" ]; then
+					mv "$_rc_x" "$1" && dbg "version store: put back $1 after an interrupted rewrite"
+					continue
+				fi ;;
+		esac
+		rm -rf "$_rc_x"
 	done
 	return 0
 }
 
-## Write this snapshot's rows: the whole thing if it is the first one indexed
-## for this location, otherwise only what differs from the previous walk.
-vs_record_snapshot() {
-	_loc="$1"; _ts="$2"; _stats="$3"
-	_d=$(vs_dir "$_loc")
-	need_dir "$_d" || return 1
-	_prev="$_d/.prev"
+## Add one walked snapshot to the store in DIR.
+vs_record_into() {              # <dir> <ts> <stats>
+	_ri_d="$1"; _ri_t="$2"; _ri_s="$3"
+	if [ ! -f "$_ri_d/base.ts" ]; then
+		dbg "version store: writing the baseline from $_ri_t"
+		vs_write_baseline "$_ri_d" "$_ri_s" || return 1
+		printf '%s\n' "$_ri_t" >"$_ri_d/base.ts"
+		vs_put_prev "$_ri_d" "$_ri_t" "$_ri_s"
+		return 0
+	fi
+	_ri_chain=$(vs_chain_ts "$_ri_d")
+	if printf '%s\n' "$_ri_chain" | grep -qxF -- "$_ri_t"; then
+		dbg "version store: $_ri_t is recorded already"
+		return 0
+	fi
+	_ri_p=$(printf '%s\n' "$_ri_chain" | LC_ALL=C awk -v t="$_ri_t" '$0 < t {p = $0} END {print p}')
+	_ri_n=$(printf '%s\n' "$_ri_chain" | LC_ALL=C awk -v t="$_ri_t" '$0 > t {print; exit}')
+	_ri_w=$(mktemp -d /tmp/my-tm.vs.XXXXXX) || return 1
 
-	if [ ! -f "$_d/base.ts" ]; then
-		dbg "version store: writing the baseline from $_ts"
-		vs_write_baseline "$_d" "$_stats" || return 1
-		printf '%s\n' "$_ts" >"$_d/base.ts"
-		gzip -c "$_stats" >"$_prev.gz" 2>/dev/null
+	if [ -z "$_ri_n" ]; then
+		## the usual case: newer than anything indexed, one delta appended
+		if [ -f "$_ri_d/.prev.$_ri_p.gz" ]; then
+			gzip -cd <"$_ri_d/.prev.$_ri_p.gz" >"$_ri_w/p" 2>/dev/null
+		else
+			vs_state "$_ri_d" "$_ri_p" "$_ri_w/p"
+		fi
+		vs_diff "$_ri_w/p" "$_ri_s" | vs_put_delta "$_ri_d" "$_ri_t" || { rm -rf "$_ri_w"; return 1; }
+		vs_put_prev "$_ri_d" "$_ri_t" "$_ri_s"
+		rm -rf "$_ri_w"
 		return 0
 	fi
 
-	## a delta: added and changed rows, plus removals marked absent
-	_dl="$_d/d.$_ts.tsv"
-	if [ -f "$_prev.gz" ]; then
-		_pp=$(mktemp /tmp/my-tm.prev.XXXXXX) || return 1
-		gzip -cd "$_prev.gz" >"$_pp" 2>/dev/null
-		## Removals are a difference of PATHS, never of whole lines. Comparing
-		## lines calls every CHANGED file removed as well -- its old line is gone --
-		## so each delta carried both "here it is" and "it is gone" for the same
-		## path, and an absent row sorts before a real one (ASCII 45 before 48), so
-		## the phantom won every lookup. That is a backup reported as not holding a
-		## file it plainly holds.
-		_op=$(mktemp /tmp/my-tm.op.XXXXXX) || return 1
-		_np=$(mktemp /tmp/my-tm.np.XXXXXX) || return 1
-		cut -f1 "$_pp" | LC_ALL=C sort -u >"$_op"
-		cut -f1 "$_stats" | LC_ALL=C sort -u >"$_np"
-		{
-			LC_ALL=C comm -13 "$_pp" "$_stats" || true
-			LC_ALL=C comm -23 "$_op" "$_np" | awk 'length > 0 {printf "%s\t-\t-\n", $0}'
-		} | LC_ALL=C sort -u >"$_dl" 2>/dev/null
-		rm -f "$_op" "$_np"
-		dbg "version store: $_ts delta is $(count_lines <"$_dl") rows"
-		rm -f "$_pp"
+	## Older than something indexed: the snapshot after it (_ri_n) has its delta
+	## against the one before, so both change. Done in a copy, swapped in whole.
+	dbg "version store: $_ri_t goes before $_ri_n -- rewriting in a copy"
+	_ri_c="$_ri_d.new.$$"
+	rm -rf "$_ri_c"
+	mkdir "$_ri_c" || { rm -rf "$_ri_w"; return 1; }
+	for _ri_f in "$_ri_d"/* "$_ri_d"/.prev.*.gz "$_ri_d"/.repaired.*; do
+		[ -f "$_ri_f" ] || continue
+		ln "$_ri_f" "$_ri_c/" || { rm -rf "$_ri_c" "$_ri_w"; return 1; }
+	done
+	vs_state "$_ri_d" "$_ri_n" "$_ri_w/n"
+	if [ -z "$_ri_p" ]; then
+		## the earliest yet: it becomes the baseline
+		rm -f "$_ri_c"/base.*.gz "$_ri_c/base.ts"
+		vs_write_baseline "$_ri_c" "$_ri_s" || { rm -rf "$_ri_c" "$_ri_w"; return 1; }
+		printf '%s\n' "$_ri_t" >"$_ri_c/base.ts"
 	else
-		cp "$_stats" "$_dl" 2>/dev/null
+		vs_state "$_ri_d" "$_ri_p" "$_ri_w/p"
+		vs_diff "$_ri_w/p" "$_ri_s" | vs_put_delta "$_ri_c" "$_ri_t" || { rm -rf "$_ri_c" "$_ri_w"; return 1; }
 	fi
-	gzip -c "$_stats" >"$_prev.gz" 2>/dev/null
-	return 0
+	vs_diff "$_ri_s" "$_ri_w/n" | vs_put_delta "$_ri_c" "$_ri_n" || { rm -rf "$_ri_c" "$_ri_w"; return 1; }
+	rm -rf "$_ri_w"
+	vs_swap "$_ri_d" "$_ri_c"
+}
+
+## Write this snapshot's rows into the location's store.
+vs_record_snapshot() {          # <loc> <ts> <stats>
+	_rs_d=$(vs_dir "$1")
+	vs_recover "$_rs_d"
+	need_dir "$_rs_d" || return 1
+	vs_migrate "$1" || return 1
+	vs_record_into "$_rs_d" "$2" "$3"
+}
+
+## A store written before the deltas were compressed has them against the WALK
+## before, replayed from the baseline in name order -- which is what a lookup
+## answered from, and what --all would have broken. Rebuilt once: each snapshot
+## reconstructed in that old order and recorded afresh, which puts it in time.
+vs_is_legacy() {
+	[ -f "$1/.prev.gz" ] && return 0
+	for _il_f in "$1"/d.*.tsv; do
+		[ -f "$_il_f" ] && return 0
+	done
+	return 1
+}
+vs_migrate() {                  # <loc>
+	_mg_d=$(vs_dir "$1")
+	[ -f "$_mg_d/base.ts" ] || return 0
+	vs_is_legacy "$_mg_d" || return 0
+	vs_repair_deltas "$1"
+	msg "version store of '$1': putting it in time order and compressing it (once)"
+	_mg_c="$_mg_d.new.$$"
+	rm -rf "$_mg_c"
+	mkdir "$_mg_c" || return 1
+	_mg_w=$(mktemp -d /tmp/my-tm.mg.XXXXXX) || { rm -rf "$_mg_c"; return 1; }
+	for _mg_b in "$_mg_d"/base.*.gz; do
+		[ -f "$_mg_b" ] || continue
+		gzip -cd "$_mg_b" 2>/dev/null
+	done | LC_ALL=C sort >"$_mg_w/s"
+	vs_record_into "$_mg_c" "$(cat "$_mg_d/base.ts")" "$_mg_w/s" || { rm -rf "$_mg_c" "$_mg_w"; return 1; }
+	while IFS= read -r _mg_f; do
+		[ -n "$_mg_f" ] || continue
+		_mg_t=${_mg_f##*/d.}; _mg_t=${_mg_t%.gz}; _mg_t=${_mg_t%.tsv}
+		{ vs_ranked 0 <"$_mg_w/s"; gzip -cdf <"$_mg_f" 2>/dev/null | vs_ranked 1; } | vs_fold >"$_mg_w/s2"
+		mv -f "$_mg_w/s2" "$_mg_w/s"
+		vs_record_into "$_mg_c" "$_mg_t" "$_mg_w/s" || { rm -rf "$_mg_c" "$_mg_w"; return 1; }
+	done <<_EOF
+$(vs_delta_files "$_mg_d")
+_EOF
+	for _mg_r in "$_mg_d"/.repaired.*; do
+		[ -f "$_mg_r" ] && cp -p "$_mg_r" "$_mg_c/"
+	done
+	rm -rf "$_mg_w"
+	vs_swap "$_mg_d" "$_mg_c"
 }
 
 ## bucket + compress a full snapshot listing
 vs_write_baseline() {
-	_d="$1"; _stats="$2"
-	_tmp=$(mktemp -d /tmp/my-tm.base.XXXXXX) || return 1
+	_wb_d="$1"; _wb_stats="$2"
+	_wb_tmp=$(mktemp -d /tmp/my-tm.base.XXXXXX) || return 1
 	## Bucket on the last two characters of the path. Written by SORTING on the
 	## bucket and closing each file as the key changes: awk keeps every output
 	## file open otherwise and runs out of descriptors long before 256 buckets,
@@ -2859,7 +3043,7 @@ vs_write_baseline() {
 	## LC_ALL=C throughout: a real backup contains filenames that are not valid
 	## UTF-8, and awk aborts on those in a UTF-8 locale -- which produced an empty
 	## baseline while every command still reported success.
-	_err=$(mktemp /tmp/my-tm.bkerr.XXXXXX) || return 1
+	_wb_err=$(mktemp /tmp/my-tm.bkerr.XXXXXX) || return 1
 	LC_ALL=C awk -F'\t' '{
 		n = length($1);
 		if (n == 0) next;
@@ -2867,30 +3051,30 @@ vs_write_baseline() {
 		gsub(/[^0-9a-zA-Z]/, "_", b);
 		if (b == "") b = "_";
 		print b "\t" $0
-	}' "$_stats" 2>>"$_err" | LC_ALL=C sort -k1,1 -s 2>>"$_err" |
-	LC_ALL=C awk -F'\t' -v t="$_tmp" '
+	}' "$_wb_stats" 2>>"$_wb_err" | LC_ALL=C sort -k1,1 -s 2>>"$_wb_err" |
+	LC_ALL=C awk -F'\t' -v t="$_wb_tmp" '
 		$1 == "" { next }
 		$1 != b { if (b != "") close(f); b = $1; f = t "/" b }
 		f == "" { next }
 		{ sub(/^[^\t]*\t/, ""); print > f }
 		END { if (b != "") close(f) }
-	' 2>>"$_err"
-	for _bf in "$_tmp"/*; do
-		[ -f "$_bf" ] || continue
-		gzip -c "$_bf" >"$_d/base.$(basename "$_bf").gz" 2>/dev/null
+	' 2>>"$_wb_err"
+	for _wb_bf in "$_wb_tmp"/*; do
+		[ -f "$_wb_bf" ] || continue
+		gzip -c "$_wb_bf" >"$_wb_d/base.$(basename "$_wb_bf").gz" 2>/dev/null
 	done
-	_nb=0
-	for _bg in "$_d"/base.*.gz; do
-		[ -f "$_bg" ] && _nb=$(( _nb + 1 ))
+	_wb_nb=0
+	for _wb_bg in "$_wb_d"/base.*.gz; do
+		[ -f "$_wb_bg" ] && _wb_nb=$(( _wb_nb + 1 ))
 	done
-	rm -rf "$_tmp"
-	if [ "$_nb" -le 0 ]; then
-		warn "the version baseline could not be written$([ -s "$_err" ] && printf ': %s' "$(head -n 1 "$_err")")"
-		rm -f "$_err"
+	rm -rf "$_wb_tmp"
+	if [ "$_wb_nb" -le 0 ]; then
+		warn "the version baseline could not be written$([ -s "$_wb_err" ] && printf ': %s' "$(head -n 1 "$_wb_err")")"
+		rm -f "$_wb_err"
 		return 1
 	fi
-	rm -f "$_err"
-	dbg "version baseline: $_nb buckets"
+	rm -f "$_wb_err"
+	dbg "version baseline: $_wb_nb buckets"
 	return 0
 }
 
@@ -2898,15 +3082,16 @@ vs_write_baseline() {
 ## covered by the index and must stop being counted as such.
 ##
 ## Their DELTA cannot simply be deleted, though: each delta records changes
-## against the previous walk, so removing one from the middle would make every
-## later snapshot inherit the version before it. A purged snapshot's delta is
-## squashed FORWARD into the next one instead -- the later row wins for a path
-## both mention, and rows only the older delta had are carried over -- which
-## keeps the chain exact and still reclaims the space.
+## against the snapshot before it, so removing one from the middle would make
+## every later snapshot inherit the version before it. A purged snapshot's delta
+## is squashed FORWARD into the next one instead -- the later row wins for a
+## path both mention, and rows only the older delta had are carried over --
+## which keeps the chain exact and still reclaims the space.
 ## Repair deltas written before removals were computed by path: a changed file
 ## was recorded as changed AND removed. Precise -- an absent row is dropped only
 ## where the SAME delta also has a real row for that path -- and idempotent, so
-## a 25-hour index is mended rather than rebuilt.
+## a 25-hour index is mended rather than rebuilt. Only uncompressed deltas can
+## hold such rows: every compressed one was computed by path.
 VS_REPAIR=1
 vs_repair_deltas() {
 	_d=$(vs_dir "$1")
@@ -2935,7 +3120,9 @@ vs_repair_deltas() {
 
 vs_prune() {
 	_loc="$1"
+	vs_recover "$(vs_dir "$_loc")"
 	vs_repair_deltas "$_loc"
+	vs_migrate "$_loc" || return 0
 	_d=$(vs_dir "$_loc")
 	_cov=$(index_covered_file "$_loc")
 	[ -d "$_d" ] || [ -f "$_cov" ] || return 0
@@ -2949,27 +3136,28 @@ vs_prune() {
 	printf '%s\n' "$_live" | LC_ALL=C sort >"$_lf"
 	_gone=""
 	[ -f "$_cov" ] && _gone=$(LC_ALL=C sort "$_cov" | LC_ALL=C comm -23 - "$_lf")
-	[ -n "$_gone" ] || return 0
+	[ -n "$_gone" ] || { rm -f "$_lf"; return 0; }
 
 	_n=0
 	for _gts in $_gone; do
 		[ -n "$_gts" ] || continue
 		_n=$(( _n + 1 ))
-		_gd="$_d/d.$_gts.tsv"
+		_gd=$(vs_delta_file "$_d" "$_gts")
 		[ -f "$_gd" ] || continue
 		## the next delta in time order, if there is one
-		_next=$(for _dn in "$_d"/d.*.tsv; do
-				[ -f "$_dn" ] || continue
-				_db=$(basename "$_dn"); _db=${_db#d.}; printf '%s\n' "${_db%.tsv}"
-			done | LC_ALL=C sort | awk -v g="$_gts" '$0 > g {print; exit}')
+		_next=$(vs_delta_ts "$_d" | LC_ALL=C awk -v g="$_gts" '$0 > g {print; exit}')
 		if [ -n "$_next" ]; then
-			_nd="$_d/d.$_next.tsv"
-			_merged=$(mktemp /tmp/my-tm.sq.XXXXXX) || continue
-			awk -F'\t' '
+			_nd=$(vs_delta_file "$_d" "$_next")
+			_later=$(mktemp /tmp/my-tm.sqn.XXXXXX) || continue
+			_older=$(mktemp /tmp/my-tm.sqo.XXXXXX) || { rm -f "$_later"; continue; }
+			gzip -cdf <"$_nd" >"$_later" 2>/dev/null
+			gzip -cdf <"$_gd" >"$_older" 2>/dev/null
+			LC_ALL=C awk -F'\t' '
 				FILENAME == later { seen[$1] = 1; print; next }
 				!($1 in seen) { print }
-			' later="$_nd" "$_nd" "$_gd" | LC_ALL=C sort -u >"$_merged"
-			mv -f "$_merged" "$_nd" 2>/dev/null
+			' later="$_later" "$_later" "$_older" | LC_ALL=C sort -u |
+				vs_put_delta "$_d" "$_next"
+			rm -f "$_later" "$_older"
 			dbg "version store: squashed the delta of purged $_gts into $_next"
 		fi
 		rm -f "$_gd"
@@ -9195,24 +9383,25 @@ t_test_version_store_pruning() {
 	printf '%s\n%s\n%s\n' "$_a" "$_gone" "$_b" >"$_cov"
 
 	## the purged snapshot changed two files; the next one changed one of them
-	printf '/keep/only-in-old\t11\t111\n/both/changed\t22\t222\n' >"$_d/d.$_gone.tsv"
-	printf '/both/changed\t99\t999\n' >"$_d/d.$_b.tsv"
+	printf '/keep/only-in-old\t11\t111\n/both/changed\t22\t222\n' | gzip -c >"$_d/d.$_gone.tsv.gz"
+	printf '/both/changed\t99\t999\n' | gzip -c >"$_d/d.$_b.tsv.gz"
 
 	vs_prune store >/dev/null 2>&1
+	_sq=$(gzip -cd <"$_d/d.$_b.tsv.gz" 2>/dev/null)
 
 	t_eq "the purged snapshot is no longer claimed as covered" \
 		"$(count_match "$_gone" < "$_cov")" "0"
 	t_eq "the ones that exist still are" "$(count_lines < "$_cov")" "2"
 	t_eq "its delta file is gone" \
-		"$([ -f "$_d/d.$_gone.tsv" ] && echo left || echo gone)" "gone"
+		"$([ -f "$_d/d.$_gone.tsv.gz" ] && echo left || echo gone)" "gone"
 	## the squash: what only the old delta knew must survive in the next one...
 	t_eq "a row only the purged delta had is carried forward" \
-		"$(awk -F'\t' '$1 == "/keep/only-in-old" {print $2}' "$_d/d.$_b.tsv")" "11"
+		"$(printf '%s\n' "$_sq" | awk -F'\t' '$1 == "/keep/only-in-old" {print $2}')" "11"
 	## ...and where both knew a path, the LATER one must win
 	t_eq "the later version wins for a path both changed" \
-		"$(awk -F'\t' '$1 == "/both/changed" {print $2}' "$_d/d.$_b.tsv")" "99"
+		"$(printf '%s\n' "$_sq" | awk -F'\t' '$1 == "/both/changed" {print $2}')" "99"
 	t_eq "and it is not duplicated" \
-		"$(count_match '/both/changed' < "$_d/d.$_b.tsv")" "1"
+		"$(printf '%s\n' "$_sq" | count_match '/both/changed')" "1"
 	rm -rf "$_d" "$_cov"
 }
 
@@ -9458,7 +9647,11 @@ t_test_delta_removals_by_path() {
 
 	vs_record_snapshot store 2026-01-01-000000 "$_w1" >/dev/null 2>&1
 	vs_record_snapshot store 2026-01-02-000000 "$_w2" >/dev/null 2>&1
+	t_eq "the delta is stored compressed" \
+		"$([ -f "$_d/d.2026-01-02-000000.tsv.gz" ] && echo gz || echo missing)" "gz"
+	## read it back uncompressed, as a store written before compression holds it
 	_dl="$_d/d.2026-01-02-000000.tsv"
+	gzip -cd <"$_dl.gz" >"$_dl" && rm -f "$_dl.gz"
 
 	t_eq "the changed file is recorded with its new size" \
 		"$(awk -F'\t' '$1 == "/a/changed" {print $2}' "$_dl")" "999"
@@ -9487,6 +9680,71 @@ t_test_delta_removals_by_path() {
 	t_eq "and a genuine removal is left alone" \
 		"$(awk -F'\t' '$1 == "/a/deleted" && $2 == "-"' "$_dl" | count_lines)" "1"
 	rm -rf "$_d" "$_w1" "$_w2"
+}
+
+## REGRESSION: every delta was taken against the WALK before it, while a lookup
+## replays them by NAME, i.e. in time. --index --all walks the older snapshots
+## after the newer ones are indexed, and from then on a snapshot inherited what
+## a later walk had seen: a file reported in a backup that never held it.
+## Adversarial: the walk order is newest, oldest, then the gaps -- exactly what
+## INDEX_BASELINES followed by --all produces.
+t_test_versions_any_walk_order() {
+	printf '\nThe version store answers the same whatever order the snapshots were walked in\n'
+	_d=$(vs_dir store); rm -rf "$_d"
+	_wo=$(mktemp -d "$T_ROOT/wo.XXXXXX")
+	## /f grows 1..4, /g exists only in the 2nd, /h never changes
+	for _i in 1 2 3 4; do
+		{ printf '/f\t%s\t%s0\n' "$_i" "$_i"
+		  [ "$_i" = 2 ] && printf '/g\t5\t50\n'
+		  printf '/h\t7\t70\n'; } | LC_ALL=C sort >"$_wo/$_i"
+	done
+	_want="1:/f=1 2:/f=2 3:/f=3 4:/f=4 1:/g=- 2:/g=5 3:/g=- 4:/g=- 1:/h=7 2:/h=7 3:/h=7 4:/h=7 "
+	_wo_got() {
+		for _wp in /f /g /h; do
+			vs_versions_for store "$_wp" | LC_ALL=C sort |
+				awk -F'\t' -v p="$_wp" '{printf "%s:%s=%s ", substr($1, 10, 1), p, $2}'
+		done
+	}
+	for _i in 3 1 4 2; do
+		vs_record_snapshot store "2026-01-0$_i-000000" "$_wo/$_i" >/dev/null 2>&1
+	done
+	t_eq "every snapshot reports what it held" "$(_wo_got)" "$_want"
+	t_eq "the baseline is the earliest snapshot" "$(cat "$_d/base.ts")" "2026-01-01-000000"
+	t_eq "each delta holds only its own change (3 after 2: /f changed, /g gone)" \
+		"$(gzip -cd <"$_d/d.2026-01-03-000000.tsv.gz" | count_lines)" "2"
+	t_eq "no copy of the store is left behind" \
+		"$(for _x in "$_d".*; do [ -e "$_x" ] && echo "$_x"; done | count_lines)" "0"
+
+	## a store from before: uncompressed deltas against the walk, replayed from
+	## the baseline in name order -- walked 3, then 1, then 4
+	rm -rf "$_d"; need_dir "$_d"
+	vs_write_baseline "$_d" "$_wo/3" >/dev/null 2>&1
+	printf '2026-01-03-000000\n' >"$_d/base.ts"
+	vs_diff "$_wo/3" "$_wo/1" >"$_d/d.2026-01-01-000000.tsv"
+	vs_diff "$_wo/1" "$_wo/4" >"$_d/d.2026-01-04-000000.tsv"
+	gzip -c <"$_wo/4" >"$_d/.prev.gz"
+	_want_old="1:/f=1 3:/f=3 4:/f=4 1:/g=- 3:/g=- 4:/g=- 1:/h=7 3:/h=7 4:/h=7 "
+	t_eq "(the old store answers right before conversion)" "$(_wo_got)" "$_want_old"
+	vs_record_snapshot store 2026-01-02-000000 "$_wo/2" >/dev/null 2>&1
+	t_eq "converted, then filled in: every snapshot still reports what it held" \
+		"$(_wo_got)" "$_want"
+	t_eq "nothing uncompressed is left" \
+		"$(for _x in "$_d"/*.tsv; do [ -e "$_x" ] && echo "$_x"; done | count_lines)" "0"
+	t_eq "and the untagged newest copy is gone too" \
+		"$([ -f "$_d/.prev.gz" ] && echo left || echo gone)" "gone"
+
+	## rebuilding a snapshot: a later row wins, and within one delta a real row
+	## beats an absent one for the same path, whichever sorts first
+	t_eq "a rebuilt snapshot keeps a file one delta has both ways" \
+		"$(printf '0\t/k\t1\t10\n1\t/k\t-\t-\n1\t/k\t2\t20\n0\t/x\t3\t30\n1\t/x\t-\t-\n' | vs_fold | tr '\t\n' ', ')" \
+		"/k,2,20 "
+
+	## a rewrite that died between its two renames puts the original back
+	_dead=$(sh -c 'echo $$')
+	mv "$_d" "$_d.old.$_dead"
+	vs_recover "$_d"
+	t_eq "an interrupted swap is undone" "$(_wo_got)" "$_want"
+	rm -rf "$_d" "$_wo"
 }
 
 ## REGRESSION: presence was decided by the INODE field, but the version store
@@ -10524,6 +10782,7 @@ run_tests() {
 	t_test_version_store_pruning
 	t_test_prune_without_version_store
 	t_test_delta_removals_by_path
+	t_test_versions_any_walk_order
 	t_test_presence_by_size_not_inode
 	t_test_full_disk_access
 	t_test_bundle_ownership
