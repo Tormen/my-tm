@@ -4105,6 +4105,11 @@ _EOF
 		[ -n "$_gsa" ] && health_say hint "$_gsa -- JOBS_ACCESS_NETWORK_VOLUMES=0 would skip that"
 	fi
 
+	## my-tm's own tree, which --install excludes
+	if ! tmutil isexcluded "$CACHE_DIR" 2>/dev/null | grep -q '\[Excluded\]'; then
+		health_say warn "$CACHE_DIR is NOT excluded from Time Machine -- it holds mounted snapshots and caches my-tm rebuilds: tmutil addexclusion -p $CACHE_DIR"
+	fi
+
 	## the jobs we installed
 	for _j in "$MAINT_JOB" "$HEALTH_JOB" "$BACKUP_JOB"; do
 		_pl="/Library/LaunchDaemons/$_j.plist"
@@ -5217,6 +5222,7 @@ cmd_install() {
 	minor "jobs:       $MAINT_JOB${HEALTH_INTERVAL:+, $HEALTH_JOB}${BACKUP_SCHEDULE:+, $BACKUP_JOB}"
 	minor "tree:       built by $MAINT_JOB on its first run, not here"
 	minor "logs:       $LOG_DIR_ROOT"
+	minor "exclude:    $CACHE_DIR from Time Machine backups"
 	install_access_plan
 
 	## a job must not run a binary anyone but root can rewrite
@@ -5237,6 +5243,17 @@ cmd_install() {
 	run chown -R "root:$_group" "$CACHE_DIR" || warn "chown failed on $CACHE_DIR"
 	run chmod "$CACHE_MODE" "$CACHE_DIR" "$MOUNT_ROOT" || warn "chmod failed"
 	why "root writes, the group reads, others see nothing -- the daemons act on what is in here"
+
+	## Time Machine must not back up my-tm's own tree: $MOUNT_ROOT holds mounted
+	## snapshots -- a backup inside the backup -- and placeholders $MAINT_JOB
+	## rewrites every MAINT_INTERVAL, while the rest is derived data my-tm
+	## rebuilds. Seen on horse: backupd walking mount/local/... while the entries
+	## vanished under it ("Failed to read sticky exclusion extended attribute").
+	if run tmutil addexclusion -p "$CACHE_DIR"; then
+		msg "excluded $CACHE_DIR from Time Machine backups"
+	else
+		warn "could not exclude $CACHE_DIR from Time Machine -- run: tmutil addexclusion -p $CACHE_DIR"
+	fi
 
 	## 2. the firmlink
 	if [ -f "$_synth" ] && grep -qE "^${_fl}[[:space:]]" "$_synth"; then
@@ -5331,6 +5348,7 @@ cmd_uninstall() {
 	minor "unmounts:  everything under $MOUNT_ROOT"
 	minor "$_synth:   the comment + entry pair for $FIRMLINK"
 	minor "keeps:     $CACHE_DIR (asked about separately -- the index is expensive)"
+	minor "exclusion: $CACHE_DIR goes back into Time Machine's backups"
 	[ -e "$JOBS_LAUNCHER" ] &&
 		minor "launcher:  $JOBS_LAUNCHER (its Full Disk Access entry stays in System Settings -- remove it there)"
 	[ "$_go" = "1" ] || return 0
@@ -5364,6 +5382,9 @@ cmd_uninstall() {
 		' "$_synth" | atomic_write "$_synth" && msg "cleaned $_synth"
 		minor "$FIRMLINK itself disappears at the next reboot"
 	fi
+
+	run tmutil removeexclusion -p "$CACHE_DIR" >/dev/null 2>&1 &&
+		msg "removed the Time Machine exclusion for $CACHE_DIR"
 
 	printf 'delete %s too? the index is expensive to rebuild [y/N] ' "$CACHE_DIR"
 	read -r _ans
@@ -5986,7 +6007,9 @@ case "\$1" in
   listlocalsnapshots) printf 'Snapshots for disk %s:\ncom.apple.TimeMachine.2026-08-23-005931.local\ncom.apple.TimeMachine.2026-08-23-020001.local\n' "\$2" ;;
   verifychecksums) case "\$2" in *BADSUM*) printf '! %s\n' "\$2" ;; esac ;;
   status) printf 'Backup session status:\n{\n    Running = 0;\n}\n' ;;
-  isexcluded) printf '[Included]    %s\n' "\$2" ;;
+  isexcluded) if grep -qxF "\$2" "$T_ROOT/tm.excluded" 2>/dev/null; then printf '[Excluded]  %s\n' "\$2"; else printf '[Included]    %s\n' "\$2"; fi ;;
+  addexclusion) printf '%s\n' "\$3" >>"$T_ROOT/tm.excluded" ;;
+  removeexclusion) grep -vxF "\$3" "$T_ROOT/tm.excluded" >"$T_ROOT/tm.excluded.new" 2>/dev/null; mv -f "$T_ROOT/tm.excluded.new" "$T_ROOT/tm.excluded" 2>/dev/null ;;
   *) : ;;
 esac
 exit 0
@@ -8151,6 +8174,44 @@ t_test_config_search_order() {
 ## `tmutil startbackup --block` exited 0, my-tm printed "backup finished", and
 ## Time Machine had recorded RESULT 704 and written no snapshot -- the run left
 ## .inprogress leftovers that its structure check rejects.
+## my-tm's own tree must stay out of the backups. Adversarial: on horse
+## backupd walked /var/lib/mine/my-tm/mount while the maintenance job rewrote it
+## underneath, and nothing had ever excluded it -- the mount root can also hold a
+## MOUNTED snapshot, which is the whole backup copied back into the backup.
+t_test_cache_excluded() {
+	printf '\nmy-tm'"'"'s own tree is excluded from Time Machine\n'
+	rm -f "$T_ROOT/tm.excluded"
+	_ce=$(cmd_health store 2>&1)
+	t_eq "health warns while the cache dir is included" \
+		"$(printf '%s\n' "$_ce" | count_match 'is NOT excluded from Time Machine')" "1"
+
+	printf '%s\n' "$CACHE_DIR" >"$T_ROOT/tm.excluded"
+	_ce=$(cmd_health store 2>&1)
+	t_eq "and says nothing once it is excluded" \
+		"$(printf '%s\n' "$_ce" | count_match 'is NOT excluded from Time Machine')" "0"
+	rm -f "$T_ROOT/tm.excluded"
+
+	## --install: named in the plan, and done in the run. The suite never runs a
+	## real --install (it writes LaunchDaemons), so the call itself is checked
+	## over the source.
+	## t_setup clears CONFIG_SOURCED (loc_param re-reads it), and --install
+	## refuses without a config -- give it one for this call only
+	: >"$T_ROOT/ce.conf"
+	# shellcheck disable=SC2030  # local to the subshell on purpose: it must not leak
+	_ce_plan=$( ( is_root() { return 0; }; CONFIG_SOURCED=" $T_ROOT/ce.conf"; cmd_install ) 2>&1 )
+	rm -f "$T_ROOT/ce.conf"
+	t_match "the install plan names the exclusion" "$_ce_plan" "exclude:"
+	if [ -r "$T_MYTM" ]; then
+		t_eq "and --install runs tmutil addexclusion" \
+			"$(awk '/^cmd_install\(\) \{/, /^\}/ { if (/tmutil addexclusion -p "\$CACHE_DIR"/) n++ } END { print n + 0 }' "$T_MYTM")" "1"
+		t_eq "while --uninstall removes it again" \
+			"$(awk '/^cmd_uninstall\(\) \{/, /^\}/ { if (/tmutil removeexclusion -p "\$CACHE_DIR"/) n++ } END { print n + 0 }' "$T_MYTM")" "1"
+	else
+		t_skip "--install excludes the cache dir" "not a readable checkout"
+	fi
+	return 0
+}
+
 # shellcheck disable=SC2031  # its own subshells set these on purpose
 t_test_backup_result() {
 	printf '\nThe recorded Time Machine result decides\n'
@@ -8455,6 +8516,7 @@ run_tests() {
 	t_test_backup_already_running
 	t_test_backup_volume_unmounted
 	t_test_backup_result
+	t_test_cache_excluded
 	t_test_config_search_order
 	t_test_attach_progress
 	t_test_lsof_never_answers

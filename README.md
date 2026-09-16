@@ -702,7 +702,14 @@ change before making it.
    Everything a non-root run needs
    to write goes to that user's own overlay and log dirs (§13), created on
    first use.
-2. checks `/etc/synthetic.conf` for the firmlink and adds it if missing, with
+2. **excludes `$CACHE_DIR` from Time Machine** (`tmutil addexclusion -p`).
+   `$MOUNT_ROOT` lives there and holds mounted snapshots — a backup copied back
+   into the backup — plus placeholders `$MAINT_JOB` rewrites every
+   `MAINT_INTERVAL`; everything else under it is derived data my-tm rebuilds.
+   Without this, `backupd` walks that tree while it changes underneath and logs
+   "Failed to read sticky exclusion extended attribute". `--uninstall` removes
+   the exclusion again, and `--health` warns if it ever stops being in place.
+3. checks `/etc/synthetic.conf` for the firmlink and adds it if missing, with
    exactly one comment line above it:
 
    ```text
@@ -714,7 +721,7 @@ change before making it.
    host-independent, since my-tm creates the target everywhere. **Synthetic
    entries only appear after a reboot**; until then my-tm uses `$MOUNT_ROOT`
    directly and says so in one line.
-3. writes `/tm/README` (what the tree is, and how to use it) and installs the
+4. writes `/tm/README` (what the tree is, and how to use it) and installs the
    jobs: `$MAINT_JOB` always (§8), `$HEALTH_JOB` if `HEALTH_INTERVAL` is set
    (§11), and `$BACKUP_JOB` on `$BACKUP_SCHEDULE` (§14). Any stale predecessor
    job found is reported. Each plist executes a **root-owned** copy of my-tm at
@@ -728,14 +735,14 @@ change before making it.
    its first run and that only becomes reachable as `/tm` after the reboot.
    `--install` says so in one line and names `my-tm --refresh` for building it
    at once.
-4. with `JOBS_RUN_WITH_FULL_DISK_ACCESS=1`, builds the launcher the jobs run
+5. with `JOBS_RUN_WITH_FULL_DISK_ACCESS=1`, builds the launcher the jobs run
    through (below) and prints the one manual step, granting it Full Disk Access.
-5. writes the completion file to the **invoking** user's
+6. writes the completion file to the **invoking** user's
    `~/.zsh/completions/_my-tm` (`$SUDO_USER`'s home, owned by them, never
    root's), and only when the content differs — that also happens on every
    ordinary run.
 
-`--uninstall` reverses 1–4: unloads and removes the jobs and the launcher, unmounts everything
+`--uninstall` reverses 1–5: unloads and removes the jobs and the launcher, unmounts everything
 under `$MOUNT_ROOT`, and **deletes** the `/etc/synthetic.conf` comment+entry
 pair — that file is synced line-by-line across your hosts, so leaving a
 commented corpse behind would spread; a diff of the file from before `--install`
@@ -855,6 +862,7 @@ non-zero on the worst — suitable for cron and for a LaunchDaemon.
 | stale mounts | a my-tm mount past its TTL that `lsof` says is idle but could not be released |
 | ownership | destination claimed by another machine (`inheritbackup` needed) |
 | jobs | a my-tm LaunchDaemon/Agent is loaded but failing, or points at a path that no longer exists |
+| my-tm excluded | `$CACHE_DIR` is no longer excluded from Time Machine (mounted snapshots and rebuildable caches would be backed up) |
 | Full Disk Access | missing — reported once, as a pointer (to the launcher when the jobs use one), not a stack of errors |
 | checksums | only when `HEALTH_VERIFY` names a path (below) |
 
