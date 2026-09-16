@@ -5720,7 +5720,7 @@ cmd_install() {
 		CONFIG_SOURCED="$_ic_new"
 		todo "review $_ic_new -- job labels, directories and the group are site-specific, and these defaults are neutral"
 	else
-		warn "a config is already in place, so the defaults were NOT written: $CONFIG_SOURCED"
+		warn "a config is already in place, so the defaults were NOT written: ${CONFIG_SOURCED# }"
 	fi
 	## the pair, which is how one config serves a site and a machine at once
 	note "a shared config may sit beside a host's own: <file>.GLOBAL is read first, <file> on top"
@@ -5849,33 +5849,35 @@ _EOF
 install_remote() {
 	_h="$1"; _go="$2"
 	_loc=$(locations_all | awk -F'\t' -v h="$_h" '$2 ~ ("^" h ":") && !f {print $1; f = 1}')
-	_idir=$(loc_install_dir "${_loc:-}")
-	## A directory recorded for the location wins, which is right -- it is where
-	## my-tm actually IS on that host. But then REMOTE_INSTALL_DIR_DEFAULT has no
-	## effect, and someone who has just set it is owed that fact: otherwise the
-	## setting looks ignored and the reason is invisible, in a file they have no
-	## command to edit.
-	if [ -n "$_idir" ]; then
-		if [ -n "${REMOTE_INSTALL_DIR_DEFAULT:-}" ] &&
-		   [ "$_idir" != "$REMOTE_INSTALL_DIR_DEFAULT" ]; then
-			msg "remote install on $_h -> $_idir/my-tm"
-			minor "recorded for '${_loc:-}' in $(locations_file), so REMOTE_INSTALL_DIR_DEFAULT ($REMOTE_INSTALL_DIR_DEFAULT) does not apply"
-			why "$US --uninstall $_h clears the recorded directory"
-		else
-			msg "remote install on $_h -> $_idir/my-tm"
-		fi
-	else
-		_idir="${REMOTE_INSTALL_DIR_DEFAULT:-/usr/local/sbin}"
-		msg "remote install on $_h -> $_idir/my-tm"
-	fi
+	## Decide WHERE before saying anything. The first line of this output used
+	## to announce a target, explain why that target, and then do something else
+	## entirely -- because it was printed before looking for a my-tm already on
+	## the host. One decision, then one line about it. Looking costs one ssh
+	## round trip even on a dry run, which is the point: a plan naming the
+	## wrong directory is worse than no plan.
+	##
 	## Already on that host? Then use it and copy nothing. A second copy SHADOWS
 	## the one the host keeps current itself: on ada, a copy put in
 	## /LINKS/local/sbin made the farm link /LINKS/sbin/my-tm point at it instead
 	## of the site's /LINKS/global/sbin/my-tm, so no later promotion reached ada.
 	_ir_found=$(remote_find_my_tm "$_h")
+	_idir=$(loc_install_dir "${_loc:-}")
 	if [ -n "$_ir_found" ]; then
 		_idir=$(dirname "$_ir_found")
-		msg "my-tm is already on $_h at $_ir_found -- using it, not copying another"
+		msg "remote install on $_h -- using the my-tm already there: $_ir_found"
+	elif [ -n "$_idir" ]; then
+		msg "remote install on $_h -> $_idir/my-tm"
+		## A recorded directory wins over REMOTE_INSTALL_DIR_DEFAULT, which is
+		## right, but then the setting has no effect -- say so when they differ,
+		## or the setting looks ignored with the reason in a file nobody edits.
+		if [ -n "${REMOTE_INSTALL_DIR_DEFAULT:-}" ] &&
+		   [ "$_idir" != "$REMOTE_INSTALL_DIR_DEFAULT" ]; then
+			minor "recorded for '${_loc:-}' in $(locations_file), so REMOTE_INSTALL_DIR_DEFAULT ($REMOTE_INSTALL_DIR_DEFAULT) does not apply"
+			why "$US --uninstall $_h clears the recorded directory"
+		fi
+	else
+		_idir="${REMOTE_INSTALL_DIR_DEFAULT:-/usr/local/sbin}"
+		msg "remote install on $_h -> $_idir/my-tm"
 	fi
 	if [ "$_go" != "1" ]; then
 		minor "dry run -- add the word go"
@@ -8487,6 +8489,18 @@ t_test_install_uses_existing_my_tm() {
 	t_eq "and it is the one that runs the install" \
 		"$(count_match '/LINKS/sbin/my-tm --install go' <"$_ue_calls")" "1"
 	t_eq "its directory is what gets recorded" "[$(loc_install_dir ue)]" "[/LINKS/sbin]"
+	## ONE line about where, and it must be the truth: the run on ada announced
+	## /LINKS/local/sbin, explained why, then used /LINKS/sbin
+	printf '%s\n' "$_ue_save" | cache_write_locations
+	printf 'ue\tada:/Volumes/tm\t/LINKS/local/sbin\n' >>"$T_ROOT/cache/locations.tsv"
+	# shellcheck disable=SC2329  # deliberate overrides for this one call
+	_ue_o=$( ( remote_find_my_tm() { printf '/LINKS/sbin/my-tm\n'; }
+	           install_remote ada 0 ) 2>&1 )
+	t_eq "a found my-tm is announced once, and nothing else is" \
+		"$(printf '%s\n' "$_ue_o" | count_match 'remote install on') $(printf '%s\n' "$_ue_o" | count_match '/LINKS/local/sbin')" \
+		"1 0"
+	t_eq "and a recorded directory it is not using is not explained" \
+		"$(printf '%s\n' "$_ue_o" | count_match 'does not apply')" "0"
 
 	## not found: copied into REMOTE_INSTALL_DIR_DEFAULT as before
 	printf '%s\n' "$_ue_save" | cache_write_locations
