@@ -5818,7 +5818,11 @@ install_remote() {
 	_ir_ok=1
 	# shellcheck disable=SC2029  # building the remote command line here is the point
 	run ssh "$_h" "chmod 0755 $_idir/my-tm && $_idir/my-tm --install go" || {
-		warn "$_h: remote --install failed"
+		## The remote's output has streamed straight through, so anything it
+		## printed reads as though it came from HERE -- and a path like
+		## /LINKS/default/my-tm.conf exists on both machines, so there is nothing
+		## in it to say otherwise. Name the host that spoke.
+		warn "$_h: remote --install failed -- any message above it is ${_h}'s my-tm, about ${_h}'s configuration"
 		_ir_ok=0
 	}
 	## Record WHERE it went, so later commands find it instead of asking for
@@ -5847,7 +5851,7 @@ uninstall_remote() {
 	fi
 	# shellcheck disable=SC2029  # building the remote command line here is the point
 	run ssh "$_ur_h" "$_ur_dir/my-tm --uninstall go; rm -f $_ur_dir/my-tm" ||
-		warn "$_ur_h: remote --uninstall failed"
+		warn "$_ur_h: remote --uninstall failed -- any message above it is ${_ur_h}'s my-tm"
 	if [ -n "${_ur_loc:-}" ] && [ -n "$(loc_install_dir "$_ur_loc")" ]; then
 		locations_writable "--uninstall $_ur_h"
 		loc_set_field "$_ur_loc" 3 "" &&
@@ -8060,6 +8064,9 @@ t_test_ssh_locations() {
 		"ok ok"
 
 	## --uninstall takes a host, like --install
+	## a remote error streams through as if it were local: say whose it is
+	t_eq "a failed remote install names the host whose my-tm spoke" \
+		"$(sed -n '/^install_remote() {$/,/^}$/p' "$T_MYTM" | count_match "my-tm, about")" "1"
 	t_eq "--uninstall <HOST> does that host" \
 		"$(sed -n '/^cmd_uninstall() {$/,/^}$/p' "$T_MYTM" | count_match 'uninstall_remote')" "1"
 
@@ -8164,10 +8171,13 @@ t_test_remote_add_and_install() {
 	            install_remote ada 1 ) >/dev/null 2>&1; printf '%s' "$?" )
 	t_eq "a failed remote --install records nothing, and says so" \
 		"[$(loc_install_dir inst)] rc=$_ra_rc" "[] rc=1"
-	# shellcheck disable=SC2329  # this time both work
-	( scp() { return 0; }; ssh() { return 0; }; install_remote ada 1 ) >/dev/null 2>&1
+	## the directory is named here, not taken from whatever this machine's
+	## config happens to say -- a test that reads the host is a test of the host
+	# shellcheck disable=SC2329,SC2030  # both work; the subshell scoping is the point
+	( REMOTE_INSTALL_DIR_DEFAULT="/srv/only-root"
+	  scp() { return 0; }; ssh() { return 0; }; install_remote ada 1 ) >/dev/null 2>&1
 	t_eq "and one that worked does record where it put my-tm" \
-		"[$(loc_install_dir inst)]" "[/usr/local/sbin]"
+		"[$(loc_install_dir inst)]" "[/srv/only-root]"
 
 	printf '%s\n' "$_ra_save" | cache_write_locations
 }
@@ -8265,6 +8275,7 @@ t_test_private_var_is_var() {
 ## the code, so there was no way to choose another one.
 t_test_remote_install_dir() {
 	printf '\nWhere my-tm goes on a remote host\n'
+	# shellcheck disable=SC2031  # earlier subshells set it deliberately; this reads the real one
 	_ri_d="${REMOTE_INSTALL_DIR_DEFAULT:-}"
 	_ri_save=$(cat "$T_ROOT/cache/locations.tsv")
 
