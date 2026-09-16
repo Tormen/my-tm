@@ -787,14 +787,50 @@ cache_read_dirs() {
 ##   TARGET is a local path, an ssh target host:/path, or the word `local`.
 #############################################################################
 
-locations_file() { printf '%s/locations.tsv\n' "$(cache_write_dir)"; }
+## ONE list, in the shared cache dir, whoever runs my-tm: a location belongs to
+## the MACHINE, not to a person. A per-user copy would be listed for that user
+## alone and never refreshed, checked or indexed by the daemons, which run as
+## root and read this file.
+locations_file() { printf '%s/locations.tsv\n' "$CACHE_DIR"; }
+
+## The shared list is root's to write. Refuse in one line that names the very
+## command to run again, rather than writing a private copy nobody's daemon
+## reads.
+locations_writable() {
+	_lw_f=$(locations_file)
+	if [ -f "$_lw_f" ]; then
+		[ -w "$_lw_f" ] && return 0
+	else
+		need_dir "$(dirname "$_lw_f")" >/dev/null 2>&1
+		[ -w "$(dirname "$_lw_f")" ] && return 0
+	fi
+	err "$_lw_f is the shared location list: needs root -- rerun as root: $US ${1:-}"
+}
+
+## a per-user list from before that rule: no longer read, named once so the
+## locations in it do not just vanish
+locations_user_file() {
+	[ -n "${CACHE_DIR_USER:-}" ] || return 1
+	[ "$CACHE_DIR_USER" != "$CACHE_DIR" ] || return 1
+	[ -f "$CACHE_DIR_USER/locations.tsv" ] || return 1
+	printf '%s/locations.tsv\n' "$CACHE_DIR_USER"
+}
+
+locations_user_file_note() {
+	_luf=$(locations_user_file) || return 0
+	_lun=$(grep -cv '^[[:space:]]*\(#.*\)\{0,1\}$' "$_luf" 2>/dev/null) || _lun=0
+	[ "$_lun" -gt 0 ] || return 0
+	note "$_lun location(s) in $_luf are no longer read -- locations are shared now, add them again as root:"
+	awk -F'\t' 'NF && $1 !~ /^[[:space:]]*#/ { printf "  %s --add %s %s\n", us, $2, $1 }' us="$US" "$_luf" |
+		while IFS= read -r _lul; do minor "${_lul# }"; done
+	return 0
+}
 
 ## every registered location, shared file first, then this user's own
 locations_registered() {
-	for _d in $(cache_read_dirs); do
-		[ -f "$_d/locations.tsv" ] || continue
-		grep -v '^[[:space:]]*#' "$_d/locations.tsv" 2>/dev/null | grep -v '^[[:space:]]*$'
-	done
+	_lr=$(locations_file)
+	[ -f "$_lr" ] || return 0
+	grep -v '^[[:space:]]*#' "$_lr" 2>/dev/null | grep -v '^[[:space:]]*$'
 	return 0
 }
 
@@ -2783,6 +2819,8 @@ _EOF
 $_locs
 _EOF
 
+	locations_user_file_note
+
 	## footer: what the caches cost, and whether the index is behind
 	_csize="-"
 	_cf=$(snapshots_cache_file)
@@ -4105,6 +4143,8 @@ _EOF
 		[ -n "$_gsa" ] && health_say hint "$_gsa -- JOBS_ACCESS_NETWORK_VOLUMES=0 would skip that"
 	fi
 
+	_lufh=$(locations_user_file) && health_say warn "$_lufh is no longer read -- locations are shared now ($US --status lists what to add again as root)"
+
 	## my-tm's own tree, which --install excludes
 	if ! tmutil isexcluded "$CACHE_DIR" 2>/dev/null | grep -q '\[Excluded\]'; then
 		health_say warn "$CACHE_DIR is NOT excluded from Time Machine -- it holds mounted snapshots and caches my-tm rebuilds: tmutil addexclusion -p $CACHE_DIR"
@@ -4774,10 +4814,7 @@ add_one() {
 	fi
 
 	_f=$(locations_file)
-	need_dir "$(dirname "$_f")" || err "cannot create $(dirname "$_f")"
-	if [ -f "$_f" ] && [ ! -w "$_f" ]; then
-		err "$_f is root-owned: re-run with sudo."
-	fi
+	locations_writable "--add $_folder${2:+ $2}"
 	{
 		[ -f "$_f" ] && cat "$_f"
 		printf '%s\t%s\t\n' "$_handle" "$_folder"
@@ -4798,7 +4835,7 @@ cmd_forget() {
 	[ -f "$_f" ] || err "no locations file at $_f"
 	awk -F'\t' -v h="$_handle" '$1 == h {found = 1} END {exit(found ? 0 : 1)}' "$_f" ||
 		err "$_handle: not a registered location"
-	[ -w "$_f" ] || err "$_f is root-owned: re-run with sudo."
+	locations_writable "--forget $_handle"
 	awk -F'\t' -v h="$_handle" '$1 != h' "$_f" | atomic_write "$_f" || err "cannot write $_f"
 	msg "forgot location '$_handle' -- no backup was touched"
 	why "deleting snapshots is a different verb: $US --rm <ID> go"
@@ -6356,6 +6393,46 @@ t_test_config() {
 	t_true sh -n "$_f"
 	t_match "the default config carries no site-specific values" \
 		"$(count_match 'TM_GROUP=""' < "$_f")" "1"
+}
+
+## One shared location list. Adversarial: a per-user copy used to be written
+## whenever the shared dir was not writable, and read back only for that user --
+## so a location added that way looked registered while no daemon (all root)
+## ever saw it. It must not be written, must not be read, and must not vanish
+## silently either.
+t_test_one_shared_location_list() {
+	printf '\nOne shared location list\n'
+	_sl_cd="$CACHE_DIR"; _sl_cu="$CACHE_DIR_USER"
+
+	t_eq "the list is the shared one, whoever runs my-tm" \
+		"$(locations_file)" "$CACHE_DIR/locations.tsv"
+
+	## a per-user list is not read ...
+	mkdir -p "$CACHE_DIR_USER"
+	printf 'mine\t%s/store\t\n' "$T_ROOT" >"$CACHE_DIR_USER/locations.tsv"
+	t_eq "a per-user list is not read" \
+		"$(locations_registered | count_match 'mine')" "0"
+	## ... and not passed off as a location
+	t_eq "so it is no location either" "$(locations_all | count_match 'mine')" "0"
+	## ... but it is named, with what to do about it
+	_sl_out=$(cmd_status 2>&1)
+	t_match "--status names the file that is no longer read" "$_sl_out" "no longer read"
+	t_match "and how to add it again as root" "$_sl_out" "add $T_ROOT/store mine"
+	rm -f "$CACHE_DIR_USER/locations.tsv"
+	t_eq "with no such file, --status says nothing about it" \
+		"$(cmd_status 2>&1 | count_match 'no longer read')" "0"
+
+	## writing it where it is not ours to write: refuse, and name the command
+	_sl_ro="$T_ROOT/ro-cache"
+	mkdir -p "$_sl_ro"; : >"$_sl_ro/locations.tsv"; chmod 0444 "$_sl_ro/locations.tsv"
+	CACHE_DIR="$_sl_ro"
+	_sl_err=$( ( cmd_add "$T_ROOT/store" newloc ) 2>&1 >/dev/null )
+	t_match "--add refuses a list it cannot write" "$_sl_err" "needs root"
+	t_match "and names the command to run again" "$_sl_err" "add $T_ROOT/store newloc"
+	t_eq "and wrote nothing" "$(count_match 'newloc' < "$_sl_ro/locations.tsv")" "0"
+	chmod 0644 "$_sl_ro/locations.tsv"; rm -rf "$_sl_ro"
+	CACHE_DIR="$_sl_cd"; CACHE_DIR_USER="$_sl_cu"
+	return 0
 }
 
 t_test_locations() {
@@ -8503,6 +8580,7 @@ run_tests() {
 	t_test_config
 	t_test_location_parameters
 	t_test_locations
+	t_test_one_shared_location_list
 	t_test_ladder
 	t_test_mount_records
 	t_test_version_store

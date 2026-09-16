@@ -1133,7 +1133,11 @@ the plain `my-tm.conf`. It never overwrites a different file there (it offers
 
 ```sh
 # Locations live in $CACHE_DIR/locations.tsv, maintained by --add / --forget —
-# not in this file.
+# not in this file. ONE shared file, whoever runs my-tm: a location belongs to
+# the machine, and the daemons that refresh, check and index it all run as root.
+# --add and --forget refuse when that file is not theirs to write, naming the
+# command to run again as root. A per-user copy from before this rule is no
+# longer read; --status names it and prints an --add line per location in it.
 AUTODETECT_LOCAL_TM_BACKUPS=1   # also pick up destinations tmutil reports
 DEFAULT_CMD="--status"          # what a bare `my-tm` runs; params allowed
 TM_GROUP=""                     # group with read access to the shared cache;
