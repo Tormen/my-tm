@@ -7995,6 +7995,7 @@ t_test_every_default_is_offered() {
 	printf '\nEvery default is in the config --create-config writes\n'
 	## both sides pack more than one setting on a line (EJECT_RETRIES=10;
 	## EJECT_WAIT=5), so every assignment on a line counts, not just the first
+	# shellcheck disable=SC2016  # an awk program: $0 and p are awk's, not the shell's
 	_ed_names='{ n = split($0, p, ";")
 	             for (i = 1; i <= n; i++)
 	                 if (match(p[i], /^[ \t]*[A-Z][A-Z0-9_]*=/)) {
