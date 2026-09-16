@@ -1124,13 +1124,24 @@ loc_is_adhoc() {
 	awk -F'\t' -v h="$1" '$1 == h {f = 1} END {exit(f ? 0 : 1)}' "$RUN_DIR/adhoc"
 }
 
-loc_target() { loc_line "$1" | awk -F'\t' '{print $2}'; }
-loc_install_dir() { loc_line "$1" | awk -F'\t' '{print $3}'; }
+## one field of a location's row, in ONE awk: loc_line piped into a second awk
+## to pick a field forked twice for every handle lookup, dozens of times a run
+loc_field() {                   # <name> <field>
+	locations_all | awk -F'\t' -v w="$1" -v n="$2" '
+		$1 == w && !h { r = $n; h = 1 }
+		$2 == w && p == "" { p = $n; pp = 1 }
+		END { if (h) { print r; exit 0 }
+		      if (pp) { print p; exit 0 }
+		      exit 1 }'
+}
+
+loc_target() { loc_field "$1" 2; }
+loc_install_dir() { loc_field "$1" 3; }
 
 ## The INDEX column of locations.tsv: 1 opted in, 0 opted out, empty means the
 ## setting decides. A location that has only been DETECTED has no row at all,
 ## so it reads empty until something is written for it.
-loc_index_pref() { loc_line "$1" | awk -F'\t' '{print $4}'; }
+loc_index_pref() { loc_field "$1" 4; }
 
 ## Is this location indexed without being named? An explicit choice wins;
 ## otherwise AUTO_INDEX_TM_BACKUP_DISKS covers the Time Machine stores on a disk
@@ -3112,15 +3123,21 @@ _EOF
 ## folded in yet, the coverage record and the version store -- across every
 ## directory it is read from
 index_loc_bytes() {
-	_ilb=0
+	## every path in ONE du: one per file was 15 du and 15 awk for one row.
+	## The handle is saved first -- set -- below reuses $1 for the path list.
+	_ilb_h="$1"
+	set --
 	for _ilb_d in $(cache_read_dirs); do
-		for _ilb_p in "$_ilb_d/index/$1.db" "$_ilb_d/index/$1".inc.*.db \
-		              "$_ilb_d/index/$1.covered" "$_ilb_d/index/$1.versions"; do
-			[ -e "$_ilb_p" ] || continue
-			_ilb=$(( _ilb + $(du -sk "$_ilb_p" 2>/dev/null | awk '{print $1 * 1024}') ))
+		for _ilb_p in "$_ilb_d/index/$_ilb_h.db" "$_ilb_d/index/$_ilb_h".inc.*.db \
+		              "$_ilb_d/index/$_ilb_h.covered" "$_ilb_d/index/$_ilb_h.versions"; do
+			[ -e "$_ilb_p" ] && set -- "$@" "$_ilb_p"
 		done
 	done
-	printf '%s\n' "$_ilb"
+	if [ "$#" -eq 0 ]; then
+		printf '0\n'
+		return 0
+	fi
+	du -sk "$@" 2>/dev/null | awk '{ s += $1 } END { print s * 1024 }'
 }
 
 ## bytes of index on disk, across every directory it is read from
