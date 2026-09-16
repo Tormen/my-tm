@@ -2370,7 +2370,9 @@ indexer_still_running() {
 		*) return 1 ;;
 	esac
 	[ -n "${2:-}" ] || return 1
-	kill -0 "$2" 2>/dev/null
+	## ps, not kill -0: the indexer runs as root, and kill -0 from any other
+	## user answers "not permitted" -- which reads exactly like "not running"
+	ps -p "$2" >/dev/null 2>&1
 }
 
 sweep() {
@@ -2934,9 +2936,47 @@ index_covered_file() { printf '%s/%s.covered\n' "$(index_dir)" "$1"; }
 ## bookkeeping file to keep in step with it. Never indexed reads as the whole
 ## epoch, which is older than any interval anyone can configure.
 index_age() {
-	_ia_f=$(index_covered_file "$1")
-	[ -f "$_ia_f" ] || { now_epoch; return 0; }
-	printf '%s\n' "$(( $(now_epoch) - $(stat -f '%m' "$_ia_f" 2>/dev/null || echo 0) ))"
+	## every directory it may be READ from, not the one this user may write:
+	## the index is root's, and anyone else writes elsewhere
+	_ia_m=0
+	for _ia_d in $(cache_read_dirs); do
+		[ -f "$_ia_d/index/$1.covered" ] || continue
+		_ia_t=$(stat -f '%m' "$_ia_d/index/$1.covered" 2>/dev/null || echo 0)
+		[ "$_ia_t" -gt "$_ia_m" ] && _ia_m=$_ia_t
+	done
+	[ "$_ia_m" -gt 0 ] || { now_epoch; return 0; }
+	printf '%s\n' "$(( $(now_epoch) - _ia_m ))"
+}
+
+## the snapshots a location's index covers, as " ts ts ts " -- ONE line, so a
+## plain substring match answers membership and awk -v carries it safely
+index_covered_list() {
+	printf ' %s\n' "$(unique_cache_dump "$1" | awk 'NF {printf "%s ", $1}')"
+}
+
+## The snapshot an --index run is walking for LOCATION right now, as
+## "<ts> <seconds-in>", or nothing. Read from the mount records: an indexer
+## mount whose process is still alive -- the same test the sweep makes.
+index_in_progress() {
+	while IFS="$(printf '\t')" read -r _ip_id _ip_loc _ip_mp _ip_made _ip_ttl _ip_pid _ip_flags; do
+		[ "${_ip_loc:-}" = "$1" ] || continue
+		indexer_still_running "${_ip_flags:-}" "${_ip_pid:-}" || continue
+		printf '%s %s\n' "${_ip_mp##*/}" "$(( $(now_epoch) - ${_ip_made:-0} ))"
+		return 0
+	done <<_EOF
+$(mounts_read_all)
+_EOF
+	return 1
+}
+
+## bytes of index on disk, across every directory it is read from
+index_size_bytes() {
+	_is_b=0
+	for _is_d in $(cache_read_dirs); do
+		[ -d "$_is_d/index" ] || continue
+		_is_b=$(( _is_b + $(du -sk "$_is_d/index" 2>/dev/null | awk '{print $1 * 1024}') ))
+	done
+	printf '%s\n' "$_is_b"
 }
 
 ## Is there a backup this location's index has not seen? Opted in, reachable,
@@ -3021,6 +3061,7 @@ index_mark_covered() {
 
 cmd_status() {
 	_only="${1:-}"
+	_ix_lines=""
 	_locs=$(locations_all)
 	[ -n "$_locs" ] || { note "no locations. Add one: $US --add <FOLDER> [<HANDLE>]"; return 0; }
 
@@ -3086,7 +3127,38 @@ _EOF
 		## indexed at all, and -- when it is -- how far behind the index has
 		## fallen. "no" and "0/74" are different problems with different fixes.
 		if ( loc_indexes "$_h" ); then
-			_ixd="$(index_covered_count "$_h")/$_snaps"
+			## count only covered snapshots that still EXIST: a covered entry for
+			## one thinned away since is not coverage of anything
+			_covs=$(index_covered_list "$_h")
+			_ncov=$(printf '%s\n' "$_rows" | awk -F'\t' -v c="$_covs" 'NF && index(c, " " $2 " ") {n++} END {print n+0}')
+			_prog=$(index_in_progress "$_h") || _prog=""
+			if [ "$_snaps" = "-" ]; then
+				_ixd="yes"
+			else
+				_ixd="$_ncov/$_snaps"
+			fi
+			[ -n "$_prog" ] && _ixd="$_ixd now"
+			## what the cell cannot say: is anything happening, and will the rest
+			## ever be covered without being asked
+			if [ -n "$_prog" ]; then
+				_ixs="walking $(ts_display "${_prog% *}") now, $(human_age "${_prog#* }") in"
+			elif [ -n "$(printf '%s' "$_covs" | tr -d ' ')" ]; then
+				_ixs="idle, last indexed $(human_age "$(index_age "$_h")") ago"
+			else
+				_ixs="idle, not indexed yet"
+			fi
+			if [ -f "/Library/LaunchDaemons/$MAINT_JOB.plist" ]; then
+				_ixs="$_ixs · new backups follow automatically"
+			else
+				_ixs="$_ixs · new backups: $US --index $_h"
+			fi
+			if [ "$_snaps" != "-" ]; then
+				_rest=$(( _snaps - _ncov ))
+				[ -n "$_prog" ] && _rest=$(( _rest - 1 ))
+				[ "$_rest" -gt 0 ] && _ixs="$_ixs · $_rest more only with: $US --index $_h --all"
+			fi
+			_ix_lines="$_ix_lines
+$_h index: $_ixs"
 		else
 			_ixd="no"
 		fi
@@ -3115,9 +3187,8 @@ _EOF
 	_cf=$(snapshots_cache_file)
 	[ -f "$_cf" ] && _csize=$(human_bytes "$(wc -c <"$_cf" | tr -d ' ')")
 	_isize="-"
-	[ -d "$(index_dir)" ] &&
-		_isize=$(human_bytes "$(find "$(index_dir)" -type f -exec wc -c {} + 2>/dev/null |
-			awk 'END {print $1 + 0}')")
+	_isb=$(index_size_bytes)
+	[ "$_isb" -gt 0 ] && _isize=$(human_bytes "$_isb")
 	_scanned=""
 	if [ -f "$_cf" ]; then
 		_sa=$(( $(now_epoch) - $(stat -f '%m' "$_cf" 2>/dev/null || now_epoch) ))
@@ -3128,6 +3199,11 @@ _EOF
 		usage_sample "$_uh"
 	done
 	note "cache $_csize · index $_isize$_scanned"
+	while IFS= read -r _il; do
+		[ -n "$_il" ] && note "$_il"
+	done <<_EOF
+$_ix_lines
+_EOF
 
 	## how to change the INDEXED column -- each half only where it applies, so a
 	## setup with everything already indexed is not told how to opt in
@@ -3166,6 +3242,33 @@ _EOF
 ## --ls
 #############################################################################
 
+## Print TAB-separated rows as columns sized to their WIDEST cell. Fixed printf
+## widths were guessed from ordinary values, so one outlier -- 1011.5M, 433.9k,
+## 202.8x! -- pushed every column after it out of line, on exactly the row
+## that deserved attention. SPEC holds one letter per column: l or r.
+table_align() {
+	awk -F'\t' -v spec="$1" '
+		{
+			n[NR] = NF
+			for (i = 1; i <= NF; i++) {
+				c[NR, i] = $i
+				if (length($i) > w[i]) w[i] = length($i)
+			}
+		}
+		END {
+			for (r = 1; r <= NR; r++) {
+				line = ""
+				for (i = 1; i <= n[r]; i++) {
+					if (substr(spec, i, 1) == "r") cell = sprintf("%" w[i] "s", c[r, i])
+					else if (i == n[r]) cell = c[r, i]
+					else cell = sprintf("%-" w[i] "s", c[r, i])
+					line = line (i > 1 ? "  " : " ") cell
+				}
+				print line
+			}
+		}'
+}
+
 ## the typical ADDED of a location, as a median over its snapshot rows
 added_median() {
 	printf '%s\n' "$1" | awk -F'\t' '$7 != "-" && $7 != "" {print $7}' | sort -n |
@@ -3190,6 +3293,9 @@ json_ls() {
 		loc_ready "$_h" 2>/dev/null || _cached=true
 		_rows=$(snapshots_get "$_h")
 		[ -n "$_rows" ] || continue
+		_covs=$(index_covered_list "$_h")
+		_prog=$(index_in_progress "$_h") || _prog=""
+		_nowts="${_prog%% *}"
 		printf '%s\n' "$_rows" | sort -t"$(printf '\t')" -k3,3nr |
 		while IFS="$(printf '\t')" read -r _l _ts _ep _id _xid _f _a _t2 _u _st _vol; do
 			[ -n "${_ts:-}" ] || continue
@@ -3198,8 +3304,10 @@ json_ls() {
 				"$(json_escape "$_l")" "$_ts" "$_id" "${_ep:-0}"
 			printf ' "files": "%s", "added": "%s", "total": "%s",' \
 				"${_f:--}" "${_a:--}" "${_t2:--}"
-			printf ' "state": "%s", "volume": "%s", "from_cache": %s}' \
-				"${_st:-ok}" "$(json_escape "${_vol:--}")" "$_cached"
+			case "$_covs" in *" $_ts "*) _ix="yes" ;; *) _ix="no" ;; esac
+			[ -n "$_nowts" ] && [ "$_ts" = "$_nowts" ] && _ix="now"
+			printf ' "state": "%s", "volume": "%s", "indexed": "%s", "from_cache": %s}' \
+				"${_st:-ok}" "$(json_escape "${_vol:--}")" "$_ix" "$_cached"
 		done
 	done <<_EOF
 $_locs
@@ -3256,8 +3364,13 @@ cmd_ls() {
 		## 0.0x and a real spike no longer stands out.
 		_avg=$(added_median "$_rows")
 
-		printf ' %-8s %-20s %5s %6s %6s %6s %6s  %s\n' \
-			ID SNAPSHOT AGE FILES ADDED DRIFT TOTAL VOL
+		## per snapshot: covered by the index, being walked right now, or not
+		_covs=$(index_covered_list "$_h")
+		_prog=$(index_in_progress "$_h") || _prog=""
+		_nowts="${_prog%% *}"
+		_ncov=$(printf '%s\n' "$_rows" | awk -F'\t' -v c="$_covs" 'NF && index(c, " " $2 " ") {n++} END {print n+0}')
+		{
+		printf 'ID\tSNAPSHOT\tAGE\tFILES\tADDED\tDRIFT\tTOTAL\tINDEXED\tVOL\n'
 		printf '%s\n' "$_rows" | sort -t"$(printf '\t')" -k3,3nr |
 		{
 			_i=0
@@ -3268,25 +3381,33 @@ cmd_ls() {
 				_drift="-"
 				if [ "${_added:-}" != "-" ] && [ "$_avg" -gt 0 ]; then
 					_drift=$(awk -v a="$_added" -v m="$_avg" -v f="$HEALTH_DRIFT_FACTOR" \
-						'BEGIN {r = a / m; printf "%.1fx%s\n", r, (r >= f ? "!" : "")}')
+						'BEGIN {r = a / m; printf "%.1fx%s\n", r, (r >= f ? "!" : " ")}')
 				fi
 				_st=""
 				[ "${_state:-ok}" != "ok" ] && _st=" [$_state]"
-				printf ' %-8s %-20s %5s %6s %6s %6s %6s  %s%s\n' \
+				case "$_covs" in
+					*" $_ts "*) _ix="yes" ;;
+					*) _ix="no" ;;
+				esac
+				[ -n "$_nowts" ] && [ "$_ts" = "$_nowts" ] && _ix="now"
+				printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s%s\n' \
 					"$_id" "$(ts_display "$_ts")" "$_age" \
 					"$(human_count "$_files")" "$(human_bytes "$_added")" "$_drift" \
-					"$(human_bytes "$_total2")" \
+					"$(human_bytes "$_total2")" "$_ix" \
 					"${_vol:--}" "$_st"
 			done
 		}
+		} | table_align "llrrrrrll"
 		## local snapshots carry no manifest, so there is no ADDED to average:
 		## saying "median 0" would state a measurement that was never made
 		_med=""
 		[ "$_avg" -gt 0 ] && _med=" · ADDED median $(human_bytes "$_avg")"
+		_ixn=" · indexed $_ncov/$_total"
+		[ -n "$_nowts" ] && _ixn="$_ixn, walking $(ts_display "$_nowts") now"
 		if [ "$_max" -gt 0 ] && [ "$_total" -gt "$_max" ]; then
-			note "$(( _total - _max )) more (--all)$_med"
+			note "$(( _total - _max )) more (--all)$_med$_ixn"
 		else
-			note "$_total snapshots$_med"
+			note "$_total snapshots$_med$_ixn"
 		fi
 	done <<_EOF
 $_locs
@@ -8504,6 +8625,46 @@ t_test_install_uses_existing_my_tm() {
 	printf '%s\n' "$_ue_save" | cache_write_locations
 }
 
+## --ls columns hold their line whatever the values. Adversarial, from a real
+## listing on horse: 1011.5M, 433.9k and 202.8x! were wider than the fixed
+## widths, and pushed every later column out of line on the one row that
+## most needed reading.
+t_test_ls_columns_align() {
+	printf '\n--ls keeps its columns aligned\n'
+	_la=$(printf 'ID\tADDED\tDRIFT\tVOL\naaaaaa\t931.2M\t0.5x\tData\nbbbbbb\t1011.5M\t202.8x!\tData\ncc\t1.1G\t1.0x\tData\n' |
+		table_align "lrrl")
+	t_eq "every row puts VOL at the same column" \
+		"$(printf '%s\n' "$_la" | awk '{print index($0, " Data") + index($0, " VOL")}' | sort -u | count_lines)" "1"
+	t_eq "and right-aligned numbers end at the same column" \
+		"$(printf '%s\n' "$_la" | awk 'NR > 1 {print index($0, "M ") + index($0, "G ")}' | sort -u | count_lines)" "1"
+	t_eq "the listing uses it" \
+		"$(sed -n '/^cmd_ls() {$/,/^}$/p' "$T_MYTM" | count_match 'table_align')" "1"
+	_lb=$(cmd_ls store 2>/dev/null | grep -v '^ -->')
+	t_match "and has an INDEXED column" "$_lb" "INDEXED"
+}
+
+## what the index is doing, visible where people look. Adversarial: indexer
+## liveness was kill -0, which a non-root user gets "not permitted" for on
+## root's process -- read as "not running", so `my-tm` run by a person never
+## saw the walk in progress. PID 1 is root's and always alive: exactly that case.
+t_test_index_progress_visible() {
+	printf '\nIndexing in progress is visible\n'
+	t_eq "a live process owned by root counts as running" \
+		"$(indexer_still_running indexer 1 && echo alive || echo gone)" "alive"
+	_ipv_mc="$(cache_write_dir)/mounts.cache"
+	_ipv_save=$(cat "$_ipv_mc" 2>/dev/null)
+	_ipv_ts=$(snap_names store | tail -n 1)
+	printf 'zz11zz\tstore\t%s/.mnt/store/%s\t%s\t86400\t1\tindexer\n' "$MOUNT_ROOT" "$_ipv_ts" "$(( $(now_epoch) - 300 ))" >"$_ipv_mc"
+	t_eq "the walk is found, with the snapshot it holds" \
+		"$(index_in_progress store | awk '{print $1}')" "$_ipv_ts"
+	t_eq "and --ls marks that snapshot now" \
+		"$(cmd_ls store 2>/dev/null | grep -v '^ -->' | awk -v t="$(ts_display "$_ipv_ts")" 'index($0, t) {print ($0 ~ / now /) ? "now" : "not"}')" "now"
+	printf 'zz11zz\tstore\t%s/.mnt/store/%s\t1\t86400\t999999\tindexer\n' "$MOUNT_ROOT" "$_ipv_ts" >"$_ipv_mc"
+	t_eq "a dead indexer is not reported as walking" \
+		"$(index_in_progress store >/dev/null && echo found || echo none)" "none"
+	printf '%s\n' "$_ipv_save" | grep -v '^$' >"$_ipv_mc"
+}
+
 ## REGRESSION: the design promised an "exclusive size" column from tmutil
 ## uniquesize. That tool refuses on an APFS Time Machine store
 ## ("pathInAPFSBackup"), and nothing else on macOS reports per-snapshot space,
@@ -9964,6 +10125,8 @@ run_tests() {
 	t_test_attention_todo
 	t_test_install_writes_a_config
 	t_test_install_uses_existing_my_tm
+	t_test_ls_columns_align
+	t_test_index_progress_visible
 	t_test_launcher
 	t_test_install_launcher
 	t_test_job_guidance
