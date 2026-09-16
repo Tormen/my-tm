@@ -363,6 +363,23 @@ $CACHE_DIR/index/<loc>.versions/ -> the version store: per-snapshot delta rows
   setting, in both directions. `--status` reports the result in its `INDEXED`
   column — `no`, or how many of that location's snapshots the index covers —
   and its footer names the command to change it.
+* **When it is updated.** An opted-in location is indexed when there is a
+  backup its index has not seen — never on a clock alone, so a location that
+  has not been backed up since the last walk costs nothing. Two triggers:
+  * the **maintenance daemon**, which indexes right after a finished Time
+    Machine run. It will not start while Time Machine is still working on the
+    same disk: the walk pins one snapshot at a time and TM's thinning would
+    block on it. Where Time Machine has **no** schedule of its own
+    (`AutoBackup` off), the location's `INDEX_INTERVAL` (default 1 day) paces
+    it instead; where it does, a finished run is the pacing and the interval
+    is not consulted.
+  * the **backup daemon**, which runs backup → re-read that disk's table →
+    index → `POST_BACKUP`. The index goes before `POST_BACKUP` on purpose: the
+    walk needs the disk spinning, and `POST_BACKUP` is about to park it.
+
+  Neither trigger ever mounts a disk to look. A destination `POST_BACKUP` has
+  ejected stays ejected; the index catches up the next time it is there
+  anyway.
 * **Tier 1, free**: every path that exists *now* is already in the system
   `locate` database, refreshed by macOS. Costs nothing, covers most searches.
 * **Tier 2, `--index`**: walks snapshots to catch paths that no longer exist
@@ -1179,6 +1196,9 @@ INDEX_REMOTE_COPY=1             # also keep a local copy of a remote index, so
                                 # --find works while that host is offline
 AUTO_INDEX_TM_BACKUP_DISKS=0    # 1: this Mac's backup disks are indexed without
                                 # --index. Never local snapshots, never ssh
+INDEX_INTERVAL_DEFAULT="1d"     # only when Time Machine has no schedule of its
+                                # own; with AutoBackup on, a finished run is the
+                                # trigger and this is not consulted
 ID_LEN=6
 # --- retention ---
 THIN_POLICY_TO_KEEP_DEFAULT="24h:hourly 7d:daily 4w:weekly 2y:monthly"
@@ -1228,8 +1248,8 @@ set_location_parameters() {
 }
 ```
 
-**Per-location parameters.** `THIN_POLICY_TO_KEEP`, `POST_BACKUP` and
-`HEALTH_MAX_AGE` each have a `_DEFAULT` for every location; a config sets one
+**Per-location parameters.** `THIN_POLICY_TO_KEEP`, `POST_BACKUP`,
+`HEALTH_MAX_AGE` and `INDEX_INTERVAL` each have a `_DEFAULT` for every location; a config sets one
 for a single location in `set_location_parameters()`, which sees the handle in
 `$LOCATION`. The site's config and the host's may both define it: the site's is
 called first, the host's last, so the host wins where both name a location. At

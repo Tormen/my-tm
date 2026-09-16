@@ -67,6 +67,8 @@ INDEX_BASELINES="newest oldest"
 INDEX_INC_MAX=16
 INDEX_REMOTE_COPY=1
 AUTO_INDEX_TM_BACKUP_DISKS=0
+# shellcheck disable=SC2034  # read through loc_param, which builds its name
+INDEX_INTERVAL_DEFAULT="1d"
 ID_LEN=6
 ## per-location parameters: NAME_DEFAULT here; NAME for one location in a
 ## config's set_location_parameters() (see loc_param)
@@ -248,6 +250,10 @@ AUTO_INDEX_TM_BACKUP_DISKS=0    # 1: Time Machine backups on a disk connected to
                                 # --index. Never local snapshots, never ssh
                                 # locations -- their host's own config decides.
                                 # --index / --no-index per location win over it
+INDEX_INTERVAL_DEFAULT="1d"     # how often an opted-in location is re-indexed
+                                # when Time Machine has no schedule of its own.
+                                # With AutoBackup on, a finished run is the
+                                # trigger instead and this is not consulted
 IMAGE_GRACE=600                 # s an attached sparsebundle stays attached after
                                 # its last use; attaching one over a share costs
                                 # minutes, so back-to-back commands reuse it
@@ -415,7 +421,7 @@ _EOF
 ## the host's). The shell keeps only the LAST function of a name, so each file is
 ## sourced again right before its own is called. All of it in a subshell: nothing
 ## set for one location reaches the next, or my-tm itself.
-LOCATION_PARAMETERS="THIN_POLICY_TO_KEEP POST_BACKUP HEALTH_MAX_AGE"
+LOCATION_PARAMETERS="THIN_POLICY_TO_KEEP POST_BACKUP HEALTH_MAX_AGE INDEX_INTERVAL"
 
 loc_param() {
 	case " $LOCATION_PARAMETERS " in
@@ -2172,6 +2178,12 @@ tm_backup_running() {
 	tmutil status 2>/dev/null | grep -q 'Running = 1'
 }
 
+## Does Time Machine back this Mac up on its own schedule? When it does, a
+## finished run is a better trigger for indexing than any clock my-tm could keep.
+tm_autobackup_on() {
+	[ "$(defaults read /Library/Preferences/com.apple.TimeMachine AutoBackup 2>/dev/null)" = "1" ]
+}
+
 ## free percent of a mounted volume
 vol_free_pct() {
 	df -k "$1" 2>/dev/null | awk 'NR == 2 { if ($2 > 0) printf "%d\n", ($4 * 100) / $2; else print 100 }'
@@ -2733,6 +2745,48 @@ index_dbs() {
 }
 
 index_covered_file() { printf '%s/%s.covered\n' "$(index_dir)" "$1"; }
+
+## How long since this location was last indexed. The .covered file is
+## rewritten by every snapshot indexed, so its mtime IS the answer -- no second
+## bookkeeping file to keep in step with it. Never indexed reads as the whole
+## epoch, which is older than any interval anyone can configure.
+index_age() {
+	_ia_f=$(index_covered_file "$1")
+	[ -f "$_ia_f" ] || { now_epoch; return 0; }
+	printf '%s\n' "$(( $(now_epoch) - $(stat -f '%m' "$_ia_f" 2>/dev/null || echo 0) ))"
+}
+
+## Is there a backup this location's index has not seen? Opted in, reachable,
+## and its newest snapshot not covered yet. Reachability is checked WITHOUT
+## mounting: a daemon must not spin a disk up that POST_BACKUP has just parked,
+## and an index is never urgent enough to justify that. Call it in a subshell:
+## loc_target sets the same scratch variables its callers use.
+index_has_new() {
+	_ih_h="$1"
+	loc_indexes "$_ih_h" || return 1
+	loc_reachable "$_ih_h" || return 1
+	_ih_new=$(snap_names "$_ih_h" 2>/dev/null | tail -n 1)
+	[ -n "$_ih_new" ] || return 1
+	## covered already? then there is nothing new, whatever the clock says
+	unique_cache_dump "$_ih_h" |
+		awk -F'\t' -v t="$_ih_new" '$1 == t {f = 1} END {exit(f ? 0 : 1)}' && return 1
+	return 0
+}
+
+## Should a DAEMON index it now? Everything index_has_new asks, plus: never
+## while Time Machine is working on the same disk -- the walk pins one snapshot
+## at a time and its thinning would block on it -- and, when nothing else paces
+## this, no more often than INDEX_INTERVAL. Call it in a subshell.
+index_is_due() {
+	index_has_new "$1" || return 1
+	tm_backup_running && return 1
+	## Time Machine's own schedule already paces this: a finished run IS the
+	## trigger, so the interval must not hold the index back a further day.
+	tm_autobackup_on && return 0
+	_iu_iv=$(parse_interval "$(loc_param "$1" INDEX_INTERVAL)") || _iu_iv=86400
+	[ -n "$_iu_iv" ] || _iu_iv=86400
+	[ "$(index_age "$1")" -ge "$_iu_iv" ]
+}
 
 ## Everything indexed FOR one location: the consolidated db, the increments not
 ## folded in yet, the record of which snapshots are covered, and the version
@@ -3760,13 +3814,18 @@ cmd_index() {
 				_snaps="$_snaps $_t"
 			fi
 		done
-		## naming a location OPTS IT IN, so the daemons keep it current from now
-		## on -- that is a change to the shared list, and root's to make
-		if [ -n "$_locs" ]; then
-			## _locs is built as " h1 h2", so it already reads as arguments
-			locations_writable "--index$_locs"
-			for _t in $_locs; do
-				( loc_indexes "$_t" ) && continue
+		## Naming a location OPTS IT IN, so the daemons keep it current from now
+		## on -- a change to the shared list, and root's to make. Only the ones
+		## that are not opted in yet need that: re-indexing a location already on
+		## the list writes nothing, so it must not demand root either.
+		_optin=""
+		for _t in $_locs; do
+			( loc_indexes "$_t" ) || _optin="$_optin $_t"
+		done
+		if [ -n "$_optin" ]; then
+			## built as " h1 h2", so it already reads as arguments
+			locations_writable "--index$_optin"
+			for _t in $_optin; do
 				loc_set_index "$_t" 1 &&
 					msg "$_t: indexed from now on ($US --no-index $_t stops it)"
 			done
@@ -4751,7 +4810,8 @@ cmd_backup() {
 	## re-read the table of the disk just backed up WHILE it is still mounted:
 	## POST_BACKUP may eject it next, and a disk that is away only shows its
 	## last known table
-	for _bk_h in $(locations_all | awk -F'\t' -v t="/Volumes/$_bv" '$2 == t {print $1}'); do
+	_bk_locs=$(locations_all | awk -F'\t' -v t="/Volumes/$_bv" '$2 == t {print $1}')
+	for _bk_h in $_bk_locs; do
 		snapshots_cache_drop "$_bk_h"
 		snapshots_get "$_bk_h" >/dev/null
 	done
@@ -4761,6 +4821,14 @@ cmd_backup() {
 	if [ "$_bk_rc" = "3" ]; then
 		minor "leaving ${_bv:-the destination} mounted -- POST_BACKUP does not end a backup my-tm did not start"
 	else
+		## index BEFORE parking the disk: the walk needs it spinning, and
+		## POST_BACKUP is about to stop it. tm_backup_running is deliberately not
+		## consulted -- the run that just ended is our own.
+		for _bk_h in $_bk_locs; do
+			( index_has_new "$_bk_h" ) || continue
+			msg "indexing $_bk_h before the disk is parked"
+			cmd_index "$_bk_h"
+		done
 		do_post_backup
 	fi
 	return "$_bk_rc"
@@ -5580,6 +5648,13 @@ cmd_maintenance() {
 	sweep
 	dbg "maintenance: /tm refresh"
 	maint_refresh_trees
+	## a finished backup is the trigger; index_is_due decides for each location
+	## whether there is anything new and whether now is the moment
+	for _mi in $(locations_all | awk -F'\t' '{print $1}'); do
+		( index_is_due "$_mi" ) || continue
+		dbg "maintenance: $_mi has a backup its index has not seen"
+		cmd_index "$_mi"
+	done
 	if [ -n "$LOCAL_SNAP_INTERVAL" ]; then
 		_iv=$(parse_interval "$LOCAL_SNAP_INTERVAL") || _iv=""
 		if [ -n "$_iv" ]; then
@@ -7421,6 +7496,81 @@ t_test_opt_in_indexing() {
 	AUTO_INDEX_TM_BACKUP_DISKS="$_oi_a"
 }
 
+## When an index is updated. Adversarial: covering SOME snapshots must never
+## read as covering the newest (or a new backup is silently never indexed);
+## being up to date must read as nothing to do (or every maintenance run walks
+## the store again); an index must never start while Time Machine is working on
+## the same disk, because the walk pins a snapshot and its thinning would block
+## on it; and the interval must not hold back a location Time Machine itself
+## paces.
+t_test_index_timing() {
+	printf '\nAn index is updated when there is a backup it has not seen\n'
+	_it_a="${AUTO_INDEX_TM_BACKUP_DISKS:-0}"
+	_it_save=$(cat "$T_ROOT/cache/locations.tsv")
+	mkdir -p "$(index_dir)"
+	loc_set_index store 1
+
+	_it_new=$(snap_names store | tail -n 1)
+	_it_old=$(snap_names store | head -n 1)
+	t_ne "the fixture store has more than one snapshot" "$_it_old" "$_it_new"
+
+	rm -f "$(index_covered_file store)"
+	t_eq "a location whose index has nothing is a location to index" \
+		"$( ( index_has_new store ) && echo new || echo none)" "new"
+
+	printf '%s\n' "$_it_old" >"$(index_covered_file store)"
+	t_eq "covering an OLDER backup does not count as covering the newest" \
+		"$( ( index_has_new store ) && echo new || echo none)" "new"
+
+	printf '%s\n' "$_it_new" >"$(index_covered_file store)"
+	t_eq "covering the newest one does, so a second run finds nothing to do" \
+		"$( ( index_has_new store ) && echo new || echo none)" "none"
+
+	## opted out beats everything else that might make it look due
+	rm -f "$(index_covered_file store)"
+	loc_set_index store 0
+	t_eq "a location that is not indexed is never due" \
+		"$( ( index_has_new store ) && echo new || echo none)" "none"
+	loc_set_index store 1
+
+	# shellcheck disable=SC2329  # these override my-tm's own, for index_is_due
+	t_eq "never while Time Machine is working on the same disk" \
+		"$( ( tm_backup_running() { return 0; }; index_is_due store ) && echo due || echo not)" "not"
+
+	# shellcheck disable=SC2329  # ditto
+	t_eq "with AutoBackup on, a finished run is the trigger and the interval is not asked" \
+		"$( ( tm_backup_running() { return 1; }; tm_autobackup_on() { return 0; }
+		      INDEX_INTERVAL_DEFAULT="99d"; index_is_due store ) && echo due || echo not)" "due"
+
+	## the .covered file was just written, so its mtime is "now"
+	printf '%s\n' "$_it_old" >"$(index_covered_file store)"
+	# shellcheck disable=SC2329  # ditto
+	t_eq "with AutoBackup off, INDEX_INTERVAL holds it back" \
+		"$( ( tm_backup_running() { return 1; }; tm_autobackup_on() { return 1; }
+		      INDEX_INTERVAL_DEFAULT="99d"; index_is_due store ) && echo due || echo not)" "not"
+	# shellcheck disable=SC2329,SC2034  # ditto, plus a clock two minutes ahead
+	t_eq "and lets it through once the interval has passed" \
+		"$( ( tm_backup_running() { return 1; }; tm_autobackup_on() { return 1; }
+		      now_epoch() { printf '%s\n' "$(( $(date +%s) + 120 ))"; }
+		      INDEX_INTERVAL_DEFAULT="60s"; index_is_due store ) && echo due || echo not)" "due"
+
+	## the wiring, which is what makes any of the above happen on its own
+	## the CALL, not the comment above it that also names the function
+	# shellcheck disable=SC2016  # the literal source text is matched, not a variable
+	t_eq "the maintenance daemon asks before it indexes" \
+		"$(sed -n '/^cmd_maintenance() {$/,/^}$/p' "$T_MYTM" | count_match '( index_is_due "$_mi" )')" "1"
+	## the LAST do_post_backup in cmd_backup is the one that parks the disk;
+	## the index walk needs it still spinning, so it has to come first
+	_it_body=$(sed -n '/^cmd_backup() {$/,/^}$/p' "$T_MYTM")
+	t_eq "a backup indexes before it parks the disk" \
+		"$(printf '%s\n' "$_it_body" | awk '/index_has_new/ {i = NR} /do_post_backup/ {p = NR}
+			END {print (i && p && i < p) ? "before" : "after"}')" "before"
+
+	rm -f "$(index_covered_file store)"
+	printf '%s\n' "$_it_save" | cache_write_locations
+	AUTO_INDEX_TM_BACKUP_DISKS="$_it_a"
+}
+
 ## REGRESSION: the design promised an "exclusive size" column from tmutil
 ## uniquesize. That tool refuses on an APFS Time Machine store
 ## ("pathInAPFSBackup"), and nothing else on macOS reports per-snapshot space,
@@ -8869,6 +9019,7 @@ run_tests() {
 	t_test_job_plist_streams
 	t_test_network_volume_of
 	t_test_opt_in_indexing
+	t_test_index_timing
 	t_test_launcher
 	t_test_install_launcher
 	t_test_job_guidance
