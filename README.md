@@ -524,11 +524,13 @@ It does three cheap things, and a third daemon is not needed for any of them:
    trims by `LOCAL_SNAP_KEEP_H` / `LOCAL_SNAP_MAX`.
 
 A location on a network volume (SMB, NFS, AFP, WebDAV — read from `mount`,
-matched on whole path components) is skipped by the maintenance and health
-jobs unless `JOBS_ACCESS_NETWORK_VOLUMES=1`: each sparsebundle attach over a
-share costs minutes, and without Full Disk Access a job cannot see inside one
-anyway (§9). Releasing mounts is not affected — the sweep detaches without
-opening a location. Commands you run yourself are never limited by it.
+matched on whole path components) is treated like any other: the expensive
+case, a sparsebundle on a share, is refused where it is registered rather than
+worked around here — it belongs to the host that stores it and is read there
+over ssh (*Network stores*, §11). What a job still needs for a store on a
+share is Full Disk
+Access, without which it finds an empty directory; `--status`, `--health`,
+`--show` and `--refresh` say so where that is the case (§9).
 
 ### What the sweep is for
 
@@ -754,19 +756,14 @@ after a reboot, which `--uninstall` says in one line. It asks before deleting
 
 macOS grants Full Disk Access per program. The jobs run `/bin/dash`, and
 granting that would give every dash script on the Mac the access — so a small
-launcher holds the grant instead, and the jobs run my-tm through it. Two config
-values decide it, both `0` by default; set them in the site's global config and
-override them per Mac in the local one, which is loaded on top:
+launcher holds the grant instead, and the jobs run my-tm through it. One config
+value decides it, `0` by default; set it in the site's global config and
+override it per Mac in the local one, which is loaded on top:
 
-| `JOBS_RUN_WITH_FULL_DISK_ACCESS` | `JOBS_ACCESS_NETWORK_VOLUMES` | what the jobs do |
-|---|---|---|
-| 0 | 0 | skip locations on network volumes; `HEALTH_VERIFY` checksums fail |
-| 1 | 0 | checksums work, but no sparsebundle is ever attached over a share |
-| 1 | 1 | everything, locations on network volumes included |
-| 0 | 1 | cannot see inside network volumes — `--install` installs, and warns |
-
-The first is an access decision; the second a cost decision — minutes per
-attach, the network, the remote disk kept awake.
+| `JOBS_RUN_WITH_FULL_DISK_ACCESS` | what the jobs do |
+|---|---|
+| 0 | `HEALTH_VERIFY` checksums fail, and a store on a network volume reads as empty |
+| 1 | everything |
 
 The launcher, `my-tm-launcher.c` (carried inside my-tm, byte for byte):
 
@@ -787,17 +784,15 @@ granting again, editing my-tm does not. Only the launcher's fixed my-tm gains
 the access, and only root can change that file; run from Terminal, the
 launcher is covered by Terminal's grant, not its own.
 
-**Hints.** A command mentions these values only where they changed what it did
-in that run, in one line naming the value to flip:
+**Hints.** A command mentions this value only where it changed what it did in
+that run, in one line naming the value to flip:
 
-* the maintenance job, when an attach over a share passes 60 s while
-  `JOBS_ACCESS_NETWORK_VOLUMES=1` — said while it waits, and the wait recorded;
-* `--health`: a location the jobs skip or cannot see into, `HEALTH_VERIFY`
-  without the access, and the day's slow attaches;
+* `--health`: a location the jobs cannot see into, and `HEALTH_VERIFY` without
+  the access;
 * `--status`, `--show` (on its `BROWSE` line) and `--refresh`: a location on a
-  network volume whose `/tm` tree the jobs will not keep current.
+  network volume whose `/tm` tree the jobs cannot keep current.
 
-Every other command runs with your own access, and says nothing about them.
+Every other command runs with your own access, and says nothing about it.
 
 ## 10. Managing the backups *(spec)*
 
@@ -1197,7 +1192,6 @@ BACKUP_SCHEDULE="on-boot"       # space-separated, combinable. Examples:
                                 #   Mon 03:30          -> weekly
 JOBS_RUN_WITH_FULL_DISK_ACCESS=0 # 1: the jobs run my-tm through JOBS_LAUNCHER (§9)
 JOBS_LAUNCHER="/usr/local/sbin/my-tm-launcher"  # built by --install; root:wheel 0700
-JOBS_ACCESS_NETWORK_VOLUMES=0   # 1: the jobs may open locations on network volumes
 # --- backup control (from the old my-tm.sh) ---
 BACKUP_VOLUME=""                # "" = ask tmutil. Resolved ONCE at startup
 POST_BACKUP_DEFAULT="eject"     # none | unmount | eject, when a backup ends
