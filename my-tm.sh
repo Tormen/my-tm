@@ -1001,8 +1001,12 @@ autodetect_images() {
 	fi
 	## through atomic_write like every other cache file: a list built in /tmp
 	## and moved in kept /tmp's group and mktemp's 0600
-	for _b in /Volumes/*/*.sparsebundle; do
+	for _b in "${VOLUMES_DIR:-/Volumes}"/*/*.sparsebundle; do
 		[ -d "$_b" ] || continue
+		## a bundle on a SHARE belongs to the host that stores it: reading it
+		## from here means pulling every block over the network (1060 s for
+		## horse.sparsebundle on ada). It is reached through ssh instead.
+		path_on_network_volume "$_b" && continue
 		bundle_is_mine "$_b" || continue
 		printf '%s\n' "$_b"
 	done | atomic_write "$_f" 2>/dev/null
@@ -1789,15 +1793,36 @@ network_mounts() {
 
 ## Is this path on a network volume? Matched on whole path components, so
 ## /Volumes/share does not claim /Volumes/shareX.
-path_on_network_volume() {
-	_pn_p="$1"
-	while IFS= read -r _pn_mp; do
-		[ -n "$_pn_mp" ] || continue
-		case "$_pn_p/" in "$_pn_mp"/*) return 0 ;; esac
+## the network mount point a path sits on, if any -- matched on whole path
+## components, so /Volumes/tm2 is not "inside" /Volumes/tm
+network_volume_of() {
+	_nv_p="$1"
+	while IFS= read -r _nv_mp; do
+		[ -n "$_nv_mp" ] || continue
+		case "$_nv_p/" in "$_nv_mp"/*) printf '%s\n' "$_nv_mp"; return 0 ;; esac
 	done <<_EOF
 $(network_mounts)
 _EOF
 	return 1
+}
+
+path_on_network_volume() { network_volume_of "$1" >/dev/null 2>&1; }
+
+## the host a share comes from, as the mount table spells it:
+##   //me@ada/tm on /Volumes/timeMachine (smbfs, ...)  -> ada
+##   ada:/export on /Volumes/x (nfs, ...)              -> ada
+network_mount_host() {
+	if [ -n "$MOUNT_TABLE_FILE" ]; then cat "$MOUNT_TABLE_FILE"; else mount 2>/dev/null; fi |
+		awk -v mp="${1:-}" '{
+			if (!match($0, / on .* \(/)) next
+			m = substr($0, RSTART + 4, RLENGTH - 6)
+			if (m != mp) next
+			src = $1
+			sub(/^\/\//, "", src)
+			sub(/^[^@\/]*@/, "", src)
+			sub(/[\/:].*$/, "", src)
+			if (src != "" && !f) { print src; f = 1 }
+		}'
 }
 
 ## A job skips a location on a network volume unless JOBS_ACCESS_NETWORK_VOLUMES=1:
@@ -4816,6 +4841,10 @@ add_one() {
 	fi
 	handle_is_sane "$_handle" ||
 		err "'$_handle' cannot be a handle: letters, digits, '-', '.' and '@' only, and not starting with '-' or '.'. It names a directory under $FIRMLINK and several cache files."
+	if is_image_target "$_folder" && _ad_nv=$(network_volume_of "$_folder"); then
+		_ad_h=$(network_mount_host "$_ad_nv")
+		err "$_folder is on a network share (${_ad_h:-another host}) -- read it where it is stored: $US --add ${_ad_h:-<host>}:<path on ${_ad_h:-that host}>/$(basename "$_folder")"
+	fi
 	is_id_word "$_handle" &&
 		err "'$_handle' reads like a snapshot ID (6-8 characters, all from the ID alphabet), so my-tm could never tell them apart. Try '$_handle-tm'."
 	## awk's `exit` still runs END, so END's status would win -- use a flag
@@ -7449,6 +7478,46 @@ t_test_full_disk_access() {
 ## my own backup history?" a fact rather than a guess -- which is what lets
 ## my-tm pick up its own bundles automatically while leaving other machines'
 ## backups alone.
+## A sparsebundle belongs to the machine that STORES it. Adversarial: detection
+## picked up /Volumes/*/*.sparsebundle wherever it sat, so horse.sparsebundle on
+## ada became a location here -- and every health run pulled it over SMB, 1060 s
+## measured. On a share it must not be detected, and --add must refuse it and
+## name the ssh form instead.
+t_test_network_bundles() {
+	printf '\nA sparsebundle on a share belongs to its host\n'
+	_nb_mt="$MOUNT_TABLE_FILE"; _nb_vd="$VOLUMES_DIR"; _nb_uu="$MAC_UUID"
+	MAC_UUID="AAAA1111-2222-3333-4444-555566667777"
+	VOLUMES_DIR="$T_ROOT/vols2"
+	mkdir -p "$VOLUMES_DIR/timeMachine" "$VOLUMES_DIR/usbdisk"
+	t_make_bundle "$VOLUMES_DIR/timeMachine/horse.sparsebundle" "$MAC_UUID" "Mac16,5"
+	t_make_bundle "$VOLUMES_DIR/usbdisk/horse.sparsebundle" "$MAC_UUID" "Mac16,5"
+	MOUNT_TABLE_FILE="$T_ROOT/nb.table"
+	printf '//me@ada/tm on %s (smbfs, nodev, nosuid)\n' "$VOLUMES_DIR/timeMachine" >"$MOUNT_TABLE_FILE"
+	printf '/dev/disk9s2 on %s (apfs, local, journaled)\n' "$VOLUMES_DIR/usbdisk" >>"$MOUNT_TABLE_FILE"
+	rm -f "$(cache_write_dir)/images.autodetect"
+
+	_nb_det=$(autodetect_images)
+	t_eq "the bundle on the share is not detected" \
+		"$(printf '%s\n' "$_nb_det" | count_match 'timeMachine/horse.sparsebundle')" "0"
+	t_eq "the one on the local disk still is" \
+		"$(printf '%s\n' "$_nb_det" | count_match 'usbdisk/horse.sparsebundle')" "1"
+
+	_nb_err=$( ( cmd_add "$VOLUMES_DIR/timeMachine/horse.sparsebundle" fromada ) 2>&1 >/dev/null )
+	t_match "--add refuses it" "$_nb_err" "on a network share"
+	t_match "names the host it is stored on" "$_nb_err" "(ada)"
+	t_match "and shows the ssh form" "$_nb_err" "add ada:"
+	t_eq "and registered nothing" \
+		"$(locations_registered | count_match 'fromada')" "0"
+
+	t_eq "the host behind the share is read from the mount table" \
+		"$(network_mount_host "$VOLUMES_DIR/timeMachine")" "ada"
+
+	rm -f "$(cache_write_dir)/images.autodetect"
+	rm -rf "$VOLUMES_DIR"
+	MOUNT_TABLE_FILE="$_nb_mt"; VOLUMES_DIR="$_nb_vd"; MAC_UUID="$_nb_uu"
+	return 0
+}
+
 t_test_bundle_ownership() {
 	printf '\nSparsebundles: whose backups are these\n'
 	_saved="$MAC_UUID"
@@ -8698,6 +8767,7 @@ run_tests() {
 	t_test_presence_by_size_not_inode
 	t_test_full_disk_access
 	t_test_bundle_ownership
+	t_test_network_bundles
 	t_test_add_picker
 	t_test_image_orphan_adoption
 	t_test_snapshot_set_is_validated

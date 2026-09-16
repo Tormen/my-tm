@@ -943,10 +943,21 @@ does the local machine and every configured host.
 
 A Time Machine destination on a NAS or Time Capsule is a **sparsebundle** on an
 SMB/AFP share holding an ordinary APFS store -- same manifest, same APFS
-snapshots, same size columns. my-tm treats it as one more kind of location:
+snapshots, same size columns.
+
+**A bundle on a share is read where it is STORED, over ssh** — never across the
+share. Reading it from here pulls every block over the network: 1060 s measured
+for `horse.sparsebundle` on ada, per health run. So detection skips bundles on
+network volumes, and `--add` refuses one, naming the host from the mount table:
 
 ```text
-my-tm --add /Volumes/<share>/<host>.sparsebundle nas
+!!! /Volumes/timeMachine/horse.sparsebundle is on a network share (ada) -- read it where it is stored: my-tm --add ada:<path on ada>/horse.sparsebundle
+```
+
+A bundle on a **locally attached** disk is an ordinary location:
+
+```text
+my-tm --add /Volumes/<disk>/<host>.sparsebundle usbtm
 ```
 
 * **Attached read-only, always** (`hdiutil attach -readonly -nobrowse -noverify`):
