@@ -160,6 +160,10 @@ TRANSIENT_IMAGES="${TMPDIR:-/tmp}/.my-tm.images.$$"
 ##   ~~~  debug             ~    fine debug (-DD)
 #############################################################################
 
+## Colour is decided before the first helper that uses it. Empty strings when
+## nothing will render them, so every printf below is unaffected.
+C_RED=""; C_YEL=""; C_OFF=""
+
 ## Progress and diagnostics go to STDERR; results go to stdout.
 ##
 ## Not cosmetic: snap_mount and image_attach are called inside $(...) to capture
@@ -168,7 +172,7 @@ TRANSIENT_IMAGES="${TMPDIR:-/tmp}/.my-tm.images.$$"
 msg()   { printf ' >>> %s\n' "$*" >&2; }
 med()   { printf '  >> %s\n' "$*" >&2; }
 minor() { printf '    > %s\n' "$*" >&2; }
-warn()  { printf ' !!! %s\n' "$*" >&2; }
+warn()  { printf ' !!! %s%s%s\n' "$C_YEL" "$*" "$C_OFF" >&2; }
 note()  { printf ' --> %s\n' "$*"; }
 
 ## Colour, and ONLY where something will render it. A LaunchDaemon's stdout is
@@ -177,9 +181,10 @@ note()  { printf ' --> %s\n' "$*"; }
 ## Both streams are checked because todo() writes to stdout and warn() to
 ## stderr; NO_COLOR is honoured (no-color.org).
 if [ -t 1 ] && [ -t 2 ] && [ -z "${NO_COLOR:-}" ]; then
-	C_RED=$(printf '\033[1;31m'); C_OFF=$(printf '\033[0m')
+	C_RED=$(printf '\033[1;31m'); C_YEL=$(printf '\033[1;33m')
+	C_OFF=$(printf '\033[0m')
 else
-	C_RED=""; C_OFF=""
+	C_RED=""; C_YEL=""; C_OFF=""
 fi
 
 ## A step no command can take for you: it needs a human, at a GUI, on THIS
@@ -5693,14 +5698,27 @@ cmd_install() {
 
 	require_root "--install"
 	if [ -z "$CONFIG_SOURCED" ]; then
-		warn "--install needs a config: job labels, directories and the group are site-specific, and guessing them is worse than asking."
-		note "no config found -- write one, most common place first:"
-		config_offer_paths | while IFS= read -r _cp; do
-			minor "$US --create-config > $_cp"
-		done
-		why "$US --help lists every place searched, in search order"
-		exit 1
+		## A host that has never run my-tm has no config, and refusing here made
+		## --install <HOST> impossible to bootstrap over ssh: the one command
+		## meant to set a machine up demanded that the machine be set up. Write
+		## the defaults and carry on -- they are neutral, which is why the run
+		## ends by telling someone to look at them.
+		_ic_new=$(config_offer_paths | awk 'NR == 1 { p = $0 } END { print p }')
+		[ -n "$_ic_new" ] || _ic_new="$SITE_CONF_DIR/my-tm.conf"
+		need_dir "$(dirname "$_ic_new")" || err "cannot create $(dirname "$_ic_new") for the config"
+		_default_config_content >"$_ic_new" || err "cannot write $_ic_new"
+		msg "no config found -- wrote the defaults to $_ic_new"
+		## in force from here on, so the rest of this install uses what was written
+		# shellcheck source=/dev/null
+		. "$_ic_new"
+		CONFIG_SOURCED="$_ic_new"
+		todo "review $_ic_new -- job labels, directories and the group are site-specific, and these defaults are neutral"
+	else
+		warn "a config is already in place, so the defaults were NOT written: $CONFIG_SOURCED"
 	fi
+	## the pair, which is how one config serves a site and a machine at once
+	note "a shared config may sit beside a host's own: <file>.GLOBAL is read first, <file> on top"
+	why "so site values go in my-tm.conf.GLOBAL and only what is true of THIS Mac in my-tm.conf"
 
 	MY_TM_BIN=$(abs_path "$0")
 	## the daemons log where the config says, like every other my-tm run
@@ -8370,6 +8388,42 @@ t_test_attention_todo() {
 		"$(grep -c '^	note "grant it Full Disk Access' "$T_MYTM")" "0"
 }
 
+## The config --install finds, or writes. Adversarial: refusing when there is
+## no config made `--install <HOST>` impossible to bootstrap -- the one command
+## whose job is to set a machine up demanded that the machine already be set
+## up. And the defaults it writes are NEUTRAL, so a run that installs them and
+## says nothing has quietly given the site the wrong job labels.
+t_test_install_writes_a_config() {
+	printf '\n--install writes a config when the host has none\n'
+	_iw_root="$T_ROOT/iwc"; rm -rf "$_iw_root"; mkdir -p "$_iw_root/site"
+	_iw_body=$(sed -n '/^cmd_install() {$/,/^}$/p' "$T_MYTM")
+
+	t_eq "no config is no longer fatal" \
+		"$(printf '%s\n' "$_iw_body" | count_match 'exit 1')" "0"
+	t_eq "the defaults get written instead" \
+		"$(printf '%s\n' "$_iw_body" | count_match '_default_config_content >')" "1"
+	t_eq "and the run says to review them, in red" \
+		"$(printf '%s\n' "$_iw_body" | count_match 'todo "review')" "1"
+	t_eq "an existing config is reported, not overwritten" \
+		"$(printf '%s\n' "$_iw_body" | count_match 'defaults were NOT written')" "1"
+	t_eq "and the GLOBAL/host pair is explained either way" \
+		"$(printf '%s\n' "$_iw_body" | count_match 'GLOBAL is read first')" "1"
+
+	## what it writes has to BE a config: sourcing it must not fail, and it must
+	## carry the settings, or the host is installed against an empty file
+	_default_config_content >"$_iw_root/site/my-tm.conf"
+	t_eq "the written config parses as shell" \
+		"$(dash -n "$_iw_root/site/my-tm.conf" 2>&1 >/dev/null; printf 'rc=%s' "$?")" "rc=0"
+	t_match "and carries the site-specific values it warns about" \
+		"$(cat "$_iw_root/site/my-tm.conf")" "MAINT_JOB="
+
+	## a warning is yellow ONLY where something renders it
+	t_eq "warnings carry no escape codes when captured" \
+		"$(warn "plain" 2>&1 | LC_ALL=C tr -d '\040-\176' | tr -d '\n' | wc -c | tr -d ' ')" "0"
+
+	rm -rf "$_iw_root"
+}
+
 ## REGRESSION: the design promised an "exclusive size" column from tmutil
 ## uniquesize. That tool refuses on an APFS Time Machine store
 ## ("pathInAPFSBackup"), and nothing else on macOS reports per-snapshot space,
@@ -9828,6 +9882,7 @@ run_tests() {
 	t_test_private_var_is_var
 	t_test_remote_install_dir
 	t_test_attention_todo
+	t_test_install_writes_a_config
 	t_test_launcher
 	t_test_install_launcher
 	t_test_job_guidance
