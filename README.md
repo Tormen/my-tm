@@ -538,7 +538,8 @@ or under `<PATH>` when you give one (with `--all`, each snapshot becomes a
 subdirectory of `<PATH>`), and prints the mountpoint. `--mount <LOCATION>`
 means its newest snapshot; `--mount <LOCATION> --all <TTL>` mounts every
 snapshot of that location — measured at seconds, not minutes. It also covers
-what nothing else does: a disk attached from another Mac, an HFS+ store.
+what nothing else does: a store on a disk attached from another Mac, which
+Time Machine's own browser will not open.
 
 ### One maintenance job: sweep, refresh, snapshot
 
@@ -883,13 +884,11 @@ non-zero on the worst — suitable for cron and for a LaunchDaemon.
 | destination reachable | configured destination not mounted / not seen for N days |
 | free space | backup disk below `HEALTH_MIN_FREE_PCT`, or thinning cannot reclaim |
 | stuck backups | leftover `.inprogress` / `.interrupted` dirs above `HEALTH_MAX_INTERRUPTED` |
-| stalled run | `tmutil status` sitting in one phase with no byte progress |
 | drift spike | ADDED past `HEALTH_DRIFT_FACTOR` × the running average (§4) |
-| exclusion drift | a path in `HEALTH_WATCH_PATHS` is excluded from backup (`tmutil isexcluded`) or on a volume no configured location covers — or the reverse: an exclusion set in `--setup` that is being backed up anyway |
-| local snapshots | piling up on `/`, or purged so fast that hourly history is gone |
+| exclusion drift | a path in `HEALTH_WATCH_PATHS` is excluded from backup (`tmutil isexcluded`), or does not exist at all |
+| local snapshots | none at all (no history without a disk attached), or more than 2 × `LOCAL_SNAP_MAX` piling up on `/` |
 | stale mounts | a my-tm mount past its TTL that `lsof` says is idle but could not be released |
-| ownership | destination claimed by another machine (`inheritbackup` needed) |
-| jobs | a my-tm LaunchDaemon/Agent is loaded but failing, or points at a path that no longer exists |
+| jobs | a my-tm LaunchDaemon points at a program that is not executable |
 | my-tm excluded | `$CACHE_DIR` is no longer excluded from Time Machine (mounted snapshots and rebuildable caches would be backed up) |
 | Full Disk Access | missing — reported once, as a pointer (to the launcher when the jobs use one), not a stack of errors |
 | checksums | only when `HEALTH_VERIFY` names a path (below) |
@@ -925,10 +924,12 @@ HEALTH_VERIFY="
 "
 ```
 
-Which locations get scanned: `HEALTH_LOCATIONS`, a list of keywords and/or
-paths — `ON-THIS-DISK` (locations on the internal disk), `LOCAL` (internal +
-attached external), `ALL` (adds network/remote), an absolute path, a handle, or
-an `ssh` target `host1:/Volumes/TimeMachine.Ext`.
+Which locations get scanned: `HEALTH_LOCATIONS` — one of the keywords
+`ON-THIS-DISK` (just `local`, the boot volume's own snapshots), `LOCAL` (the
+default: everything **stored on this Mac**, including a sparsebundle on an
+attached disk, but not another host's store, which that host checks for
+itself), `ALL` (adds the ssh locations) — or a space-separated list of handles
+and paths.
 
 **Remote locations go over `ssh`, not SMB.** Walking a Time Machine store over
 SMB is unusably slow; instead my-tm re-executes *itself* on the far side
@@ -1320,8 +1321,9 @@ measured) plus a scan for this Mac's own sparsebundles, cached for
 skipped, so the same disk never appears twice — once under the name you gave it
 and once under its volume name, which would make every snapshot ID ambiguous.
 Snapshot enumeration stays cache-backed and `CACHE_TTL`-gated, never implicit
-for a location you did not ask about. Network destinations are never
-auto-mounted; they show their last known state with `?`.
+for a location you did not ask about. A sparsebundle is never **attached** for
+a status line — that costs minutes — so it shows its last known state with `?`,
+as does any destination that is not there right now.
 
 ## 14. Backup control — replacing `my-tm.sh` *(spec)*
 

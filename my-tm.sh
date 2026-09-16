@@ -4276,6 +4276,25 @@ health_notify_headless() {
 	return 0
 }
 
+## Which locations a --health run covers. LOCAL used to be a synonym for ALL,
+## so a daemon run here reached across the network on every single run.
+health_locations() {
+	case "${HEALTH_LOCATIONS:-}" in
+		ALL) locations_all | awk -F'\t' '{print $1}' ;;
+		ON-THIS-DISK) printf 'local\n' ;;
+		LOCAL|"")
+			## everything STORED on this Mac -- the boot volume's own snapshots,
+			## an attached disk, a sparsebundle on one -- but not another host's
+			## store, which that host checks for itself
+			for _hl in $(locations_all | awk -F'\t' '{print $1}'); do
+				[ "$(loc_kind "$_hl")" = "ssh" ] && continue
+				printf '%s\n' "$_hl"
+			done ;;
+		*) printf '%s\n' "$HEALTH_LOCATIONS" | tr ' ' '\n' ;;
+	esac
+	return 0
+}
+
 cmd_health() {
 	BACKGROUND_JOB=1
 	HEALTH_PROBLEMS=0; HEALTH_FIRST_FAIL=""; HEALTH_FIRST_WARN=""
@@ -4283,12 +4302,7 @@ cmd_health() {
 	if [ -n "$_only" ]; then
 		_locs="$_only"
 	else
-		case "$HEALTH_LOCATIONS" in
-			ALL) _locs=$(locations_all | awk -F'\t' '{print $1}') ;;
-			ON-THIS-DISK) _locs="local" ;;
-			LOCAL|"") _locs=$(locations_all | awk -F'\t' '{print $1}') ;;
-			*) _locs=$(printf '%s\n' "$HEALTH_LOCATIONS" | tr ' ' '\n') ;;
-		esac
+		_locs=$(health_locations)
 	fi
 	_now=$(now_epoch)
 
@@ -4367,6 +4381,10 @@ _EOF
 	_lsn=$(tmutil listlocalsnapshots /System/Volumes/Data 2>/dev/null | count_match 'com.apple')
 	[ "$_lsn" -eq 0 ] &&
 		health_say warn "no local APFS snapshots -- the only history that works with no backup disk attached"
+	## and the other way round: they live ON the boot volume, so a pile that
+	## never gets trimmed is a startup disk filling up
+	[ "$_lsn" -gt "$(( ${LOCAL_SNAP_MAX:-48} * 2 ))" ] &&
+		health_say warn "$_lsn local APFS snapshots on / (LOCAL_SNAP_MAX $LOCAL_SNAP_MAX) -- they take space on the boot volume ($US --local-snap trims to the cap)"
 
 	## paths that MUST be backed up
 	if [ -n "$HEALTH_WATCH_PATHS" ]; then
@@ -7932,6 +7950,37 @@ t_test_ssh_locations() {
 	printf '%s\n' "$_r7_save" | cache_write_locations
 }
 
+## Which locations --health covers, and the checks the README promises.
+## Adversarial: LOCAL must NOT mean ALL -- it was a synonym, so every daemon
+## run on this Mac reached across the network to another host's store; and the
+## local-snapshot check has to fire in BOTH directions, since none at all and
+## far too many are different failures with the same cause.
+t_test_health_scope() {
+	printf '\nWhat a health run covers\n'
+	_h8_l="${HEALTH_LOCATIONS:-}"; _h8_m="${LOCAL_SNAP_MAX:-48}"
+
+	_h8=$( ( HEALTH_LOCATIONS=LOCAL; health_locations ) )
+	t_eq "LOCAL covers this Mac's own stores and leaves another host's alone" \
+		"store:$(printf '%s\n' "$_h8" | awk '$1 == "store"' | count_lines) remote:$(printf '%s\n' "$_h8" | awk '$1 == "remote"' | count_lines)" \
+		"store:1 remote:0"
+	t_eq "ALL is the one that adds it" \
+		"$( ( HEALTH_LOCATIONS=ALL; health_locations ) | awk '$1 == "remote"' | count_lines)" "1"
+	t_eq "ON-THIS-DISK is the boot volume alone" \
+		"$( ( HEALTH_LOCATIONS=ON-THIS-DISK; health_locations ) | tr '\n' ' ')" "local "
+	t_eq "and a list is taken as given" \
+		"$( ( HEALTH_LOCATIONS="store remote"; health_locations ) | tr '\n' ' ')" "store remote "
+	t_eq "an empty setting means LOCAL, not ALL" \
+		"$( ( HEALTH_LOCATIONS=""; health_locations ) | awk '$1 == "remote"' | count_lines)" "0"
+
+	## local snapshots: too few and too many are both worth saying
+	t_eq "a pile of local snapshots on the boot volume is a warning" \
+		"$( ( LOCAL_SNAP_MAX=0; cmd_health local ) 2>&1 | count_match 'local APFS snapshots on /')" "1"
+	t_eq "and a normal number is not" \
+		"$( ( LOCAL_SNAP_MAX=48; cmd_health local ) 2>&1 | count_match 'local APFS snapshots on /')" "0"
+
+	HEALTH_LOCATIONS="$_h8_l"; LOCAL_SNAP_MAX="$_h8_m"
+}
+
 ## REGRESSION: the design promised an "exclusive size" column from tmutil
 ## uniquesize. That tool refuses on an APFS Time Machine store
 ## ("pathInAPFSBackup"), and nothing else on macOS reports per-snapshot space,
@@ -9383,6 +9432,7 @@ run_tests() {
 	t_test_index_timing
 	t_test_headless_health_notifies
 	t_test_ssh_locations
+	t_test_health_scope
 	t_test_launcher
 	t_test_install_launcher
 	t_test_job_guidance
