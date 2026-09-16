@@ -68,6 +68,7 @@ INDEX_INC_MAX=16
 SHADOW_SSH_INDEX_FILES=1
 SSH_CONNECT_TIMEOUT=3
 REMOTE_INSTALL_DIR_DEFAULT="/usr/local/sbin"
+REMOTE_MY_TM_PATHS="/usr/local/sbin/my-tm /sbin/my-tm"
 AUTO_INDEX_TM_BACKUP_DISKS=0
 # shellcheck disable=SC2034  # read through loc_param, which builds its name
 INDEX_INTERVAL_DEFAULT="1d"
@@ -291,6 +292,11 @@ REMOTE_INSTALL_DIR_DEFAULT="/usr/local/sbin"   # where --install <HOST> puts
                                 # /usr/local/sbin is group-writable on many Macs
                                 # (Homebrew), and --install refuses it when so.
                                 # locations.tsv's 3rd field wins per location
+REMOTE_MY_TM_PATHS="/usr/local/sbin/my-tm /sbin/my-tm"   # where my-tm may
+                                # ALREADY be on a host, checked in order before
+                                # --install <HOST> copies one in. A copy found
+                                # is used, never replaced: a second copy would
+                                # shadow the one that host keeps current itself
 AUTO_INDEX_TM_BACKUP_DISKS=0    # 1: Time Machine backups on a disk connected to
                                 # this Mac (internal or external, a sparsebundle
                                 # stored on one included) are indexed without
@@ -5862,14 +5868,28 @@ install_remote() {
 		_idir="${REMOTE_INSTALL_DIR_DEFAULT:-/usr/local/sbin}"
 		msg "remote install on $_h -> $_idir/my-tm"
 	fi
+	## Already on that host? Then use it and copy nothing. A second copy SHADOWS
+	## the one the host keeps current itself: on ada, a copy put in
+	## /LINKS/local/sbin made the farm link /LINKS/sbin/my-tm point at it instead
+	## of the site's /LINKS/global/sbin/my-tm, so no later promotion reached ada.
+	_ir_found=$(remote_find_my_tm "$_h")
+	if [ -n "$_ir_found" ]; then
+		_idir=$(dirname "$_ir_found")
+		msg "my-tm is already on $_h at $_ir_found -- using it, not copying another"
+	fi
 	if [ "$_go" != "1" ]; then
 		minor "dry run -- add the word go"
 		return 0
 	fi
-	run scp "$(abs_path "$0")" "$_h:$_idir/my-tm" || { warn "$_h: copy failed"; return 1; }
+	if [ -z "$_ir_found" ]; then
+		run scp "$(abs_path "$0")" "$_h:$_idir/my-tm" || { warn "$_h: copy failed"; return 1; }
+	fi
 	_ir_ok=1
 	# shellcheck disable=SC2029  # building the remote command line here is the point
-	run ssh "$_h" "chmod 0755 $_idir/my-tm && $_idir/my-tm --install go" || {
+	## chmod only a copy we just put there; a found one keeps the host's modes
+	if [ -n "$_ir_found" ]; then _ir_cmd="$_idir/my-tm --install go"
+	else _ir_cmd="chmod 0755 $_idir/my-tm && $_idir/my-tm --install go"; fi
+	run ssh "$_h" "$_ir_cmd" || {
 		## The remote's output has streamed straight through, so anything it
 		## printed reads as though it came from HERE -- and a path like
 		## /LINKS/default/my-tm.conf exists on both machines, so there is nothing
@@ -5890,6 +5910,16 @@ install_remote() {
 	return 0
 }
 
+## The first my-tm REMOTE_MY_TM_PATHS finds on a host, or nothing. One ssh
+## round trip for the whole list. -x follows a symlink, which is what a farm
+## link like /LINKS/sbin/my-tm needs.
+remote_find_my_tm() {           # <host>
+	# shellcheck disable=SC2029  # the list is expanded HERE, on purpose
+	ssh -o BatchMode=yes -o ConnectTimeout="${SSH_CONNECT_TIMEOUT:-3}" "$1" \
+		"for p in ${REMOTE_MY_TM_PATHS:-}; do [ -x \"\$p\" ] && { printf '%s\\n' \"\$p\"; exit 0; }; done; exit 1" \
+		2>/dev/null
+}
+
 ## The reverse: my-tm's own --uninstall on the host, then the binary itself.
 uninstall_remote() {
 	_ur_h="$1"; _ur_go="$2"
@@ -5902,7 +5932,16 @@ uninstall_remote() {
 		return 0
 	fi
 	# shellcheck disable=SC2029  # building the remote command line here is the point
-	run ssh "$_ur_h" "$_ur_dir/my-tm --uninstall go; rm -f $_ur_dir/my-tm" ||
+	## Remove the binary only when it is one --install itself copied in, i.e.
+	## it lives in REMOTE_INSTALL_DIR_DEFAULT. One found on the host belongs to
+	## that host -- removing /LINKS/sbin/my-tm would break its own farm link.
+	if [ "$_ur_dir" = "${REMOTE_INSTALL_DIR_DEFAULT:-/usr/local/sbin}" ]; then
+		_ur_cmd="$_ur_dir/my-tm --uninstall go; rm -f $_ur_dir/my-tm"
+	else
+		_ur_cmd="$_ur_dir/my-tm --uninstall go"
+		minor "leaving $_ur_dir/my-tm in place -- it is $_ur_h's own, not one --install copied"
+	fi
+	run ssh "$_ur_h" "$_ur_cmd" ||
 		warn "$_ur_h: remote --uninstall failed -- any message above it is ${_ur_h}'s my-tm"
 	if [ -n "${_ur_loc:-}" ] && [ -n "$(loc_install_dir "$_ur_loc")" ]; then
 		locations_writable "--uninstall $_ur_h"
@@ -8424,6 +8463,68 @@ t_test_install_writes_a_config() {
 	rm -rf "$_iw_root"
 }
 
+## Using a my-tm that is already on the host. Seen on ada on 2026-09-16: a copy
+## --install put in /LINKS/local/sbin made the farm link /LINKS/sbin/my-tm point
+## at it, so no later site promotion ever reached ada. Adversarial on both ends:
+## a found my-tm must not be copied over OR chmod-ed, and --uninstall must never
+## remove one it did not put there -- rm-ing /LINKS/sbin/my-tm would break the
+## host's own farm link.
+t_test_install_uses_existing_my_tm() {
+	printf '\nA my-tm already on the host is used, never replaced\n'
+	_ue_save=$(cat "$T_ROOT/cache/locations.tsv")
+	_ue_calls="$T_ROOT/ue.calls"
+	printf 'ue\tada:/Volumes/tm\t\n' >>"$T_ROOT/cache/locations.tsv"
+
+	## found: no scp, no chmod, and the found directory is what gets recorded
+	: >"$_ue_calls"
+	# shellcheck disable=SC2329  # deliberate overrides for this one call
+	( remote_find_my_tm() { printf '/LINKS/sbin/my-tm\n'; }
+	  scp() { printf 'scp %s\n' "$*" >>"$_ue_calls"; return 0; }
+	  ssh() { printf 'ssh %s\n' "$*" >>"$_ue_calls"; return 0; }
+	  install_remote ada 1 ) >/dev/null 2>&1
+	t_eq "a found my-tm is not copied over" "$(count_match 'scp' <"$_ue_calls")" "0"
+	t_eq "nor chmod-ed -- it keeps the host's own modes" "$(count_match 'chmod' <"$_ue_calls")" "0"
+	t_eq "and it is the one that runs the install" \
+		"$(count_match '/LINKS/sbin/my-tm --install go' <"$_ue_calls")" "1"
+	t_eq "its directory is what gets recorded" "[$(loc_install_dir ue)]" "[/LINKS/sbin]"
+
+	## not found: copied into REMOTE_INSTALL_DIR_DEFAULT as before
+	printf '%s\n' "$_ue_save" | cache_write_locations
+	printf 'ue\tada:/Volumes/tm\t\n' >>"$T_ROOT/cache/locations.tsv"
+	: >"$_ue_calls"
+	# shellcheck disable=SC2329,SC2030  # deliberate overrides and scoping
+	( REMOTE_INSTALL_DIR_DEFAULT="/srv/only-root"
+	  remote_find_my_tm() { return 1; }
+	  scp() { printf 'scp %s\n' "$*" >>"$_ue_calls"; return 0; }
+	  ssh() { printf 'ssh %s\n' "$*" >>"$_ue_calls"; return 0; }
+	  install_remote ada 1 ) >/dev/null 2>&1
+	t_eq "with none on the host, one is copied in" \
+		"$(count_match 'scp' <"$_ue_calls") $(count_match '/srv/only-root/my-tm' <"$_ue_calls")" "1 2"
+
+	## --uninstall: remove only what --install copied
+	printf '%s\n' "$_ue_save" | cache_write_locations
+	printf 'ue\tada:/Volumes/tm\t/LINKS/sbin\n' >>"$T_ROOT/cache/locations.tsv"
+	: >"$_ue_calls"
+	# shellcheck disable=SC2329  # deliberate override
+	( ssh() { printf 'ssh %s\n' "$*" >>"$_ue_calls"; return 0; }
+	  uninstall_remote ada 1 ) >/dev/null 2>&1
+	t_eq "--uninstall never removes a my-tm the host keeps itself" \
+		"$(count_match 'rm -f' <"$_ue_calls")" "0"
+
+	printf '%s\n' "$_ue_save" | cache_write_locations
+	printf 'ue\tada:/Volumes/tm\t/srv/only-root\n' >>"$T_ROOT/cache/locations.tsv"
+	: >"$_ue_calls"
+	# shellcheck disable=SC2329,SC2030  # deliberate override and scoping
+	( REMOTE_INSTALL_DIR_DEFAULT="/srv/only-root"
+	  ssh() { printf 'ssh %s\n' "$*" >>"$_ue_calls"; return 0; }
+	  uninstall_remote ada 1 ) >/dev/null 2>&1
+	t_eq "but does remove one --install copied in" \
+		"$(count_match 'rm -f /srv/only-root/my-tm' <"$_ue_calls")" "1"
+
+	rm -f "$_ue_calls"
+	printf '%s\n' "$_ue_save" | cache_write_locations
+}
+
 ## REGRESSION: the design promised an "exclusive size" column from tmutil
 ## uniquesize. That tool refuses on an APFS Time Machine store
 ## ("pathInAPFSBackup"), and nothing else on macOS reports per-snapshot space,
@@ -9883,6 +9984,7 @@ run_tests() {
 	t_test_remote_install_dir
 	t_test_attention_todo
 	t_test_install_writes_a_config
+	t_test_install_uses_existing_my_tm
 	t_test_launcher
 	t_test_install_launcher
 	t_test_job_guidance

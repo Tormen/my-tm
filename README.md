@@ -953,8 +953,14 @@ host1	host1:/Volumes/TimeMachine.Ext	/usr/local/sbin	1
 host2	host2:/Volumes/Backup
 ```
 
-**my-tm is installed on the host — that is the normal way.** It goes to the
-location's 3rd field, else `REMOTE_INSTALL_DIR_DEFAULT` (`/usr/local/sbin`),
+**my-tm is installed on the host — that is the normal way.** `--install
+<HOST>` first looks for a my-tm **already there**, along `REMOTE_MY_TM_PATHS`,
+and uses the first it finds — copying nothing and changing no modes. A second
+copy would *shadow* the one the host keeps current itself: in a `/LINKS` farm a
+file in `local/sbin` wins over `global/sbin`, so a copy put there stops every
+later promotion from reaching that host. `--uninstall <HOST>` likewise never
+removes a my-tm it did not put there. Only when none is found is one copied, to
+the location's 3rd field, else `REMOTE_INSTALL_DIR_DEFAULT` (`/usr/local/sbin`),
 and `--install` **refuses a directory anyone but root can write**: a
 LaunchDaemon runs my-tm as root, so whoever can write there can run anything as
 root. `/usr/local/sbin` is group-writable on many Macs — Homebrew leaves it
@@ -1242,6 +1248,8 @@ SHADOW_SSH_INDEX_FILES=1        # shadow an ssh location's index here too, so
 SSH_CONNECT_TIMEOUT=3           # s before an ssh host counts as unreachable
 REMOTE_INSTALL_DIR_DEFAULT="/usr/local/sbin"   # where --install <HOST> puts
                                 # my-tm; must be writable by ROOT ONLY
+REMOTE_MY_TM_PATHS="/usr/local/sbin/my-tm /sbin/my-tm"   # a my-tm already on
+                                # the host, used in preference to copying one
 AUTO_INDEX_TM_BACKUP_DISKS=0    # 1: this Mac's backup disks are indexed without
                                 # --index. Never local snapshots, never ssh
 INDEX_INTERVAL_DEFAULT="1d"     # only when Time Machine has no schedule of its
