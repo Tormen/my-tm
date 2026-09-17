@@ -1049,7 +1049,7 @@ discarded, so a `--status` that was waiting on ada looked like a hang. Those
 lines are now printed as they arrive, each named for the host saying it:
 
 ```text
-    > ada: attaching horse.sparsebundle -- this can take minutes over a share
+    > ada: attaching horse.sparsebundle -- 4.2T on a spinning disk, about 2m40s
     > ada: still attaching, 22s so far
 ```
 
@@ -1079,13 +1079,38 @@ A bundle on a **locally attached** disk is an ordinary location:
 my-tm --add /Volumes/<disk>/<host>.sparsebundle usbtm
 ```
 
-* **It says how long it has been waiting.** `hdiutil` reports nothing at all
-  for an attach, so there is no percentage to show and inventing one would be
-  a made-up number; what is true is the elapsed time. The first line comes
-  once the attach is slow enough to worry about, then every 15 s — with the
-  gap doubling every four lines (15, 30, 60, 120 …), so a ten-minute attach
-  stays audible without filling the screen. A **daemon** says it three times
-  and then gets on with it: nobody is watching its log while it waits.
+* **It says how big the store is, what it is sitting on, and how long that
+  should take.** `hdiutil` reports nothing at all for an attach, so there is no
+  percentage to show and inventing one would be a made-up number — but the size
+  and the disk are known, and they are what decides it:
+
+  ```text
+   >>> attaching horse.sparsebundle -- 4.2T on a spinning disk, about 2m40s
+      > that is what the last attach of this image here cost
+      > still attaching, 83s of about 2m40s
+   >>> attached horse.sparsebundle after 157s
+  ```
+
+  The size is the **bands that exist** (`band-size` × how many), never the
+  `size` in `Info.plist` — that is the capacity the image may grow to, 11.4 T
+  for a 4.2 T store, and estimating from it is three times wrong. The rate is
+  `ATTACH_SECONDS_PER_TB_HDD` (38 s/TB, measured: 4.2 T in 157 s on a spinning
+  SATA disk) or `ATTACH_SECONDS_PER_TB_SSD`, chosen by asking `diskutil`
+  whether the disk under the image is solid state. **Once an image has been
+  attached, its own measured time replaces the rate** — and is scaled if the
+  store has grown since. A store whose bands cannot be read gets no number at
+  all rather than a guess.
+
+  Why it is slow at all, local disk or not: attaching means mounting the APFS
+  container inside the bundle, and that is a seek for every piece of its
+  metadata — thousands of them, ~10 ms each on a rotating disk. Nothing my-tm
+  does adds to it; the attach is already `-readonly -noverify -noautofsck`.
+
+  The first line comes once the attach is slow enough to worry about, then
+  every 15 s — with the gap doubling every four lines (15, 30, 60, 120 …), so a
+  ten-minute attach stays audible without filling the screen. A **daemon** says
+  it three times and then gets on with it: nobody is watching its log while it
+  waits.
 * **Attached read-only, always** (`hdiutil attach -readonly -nobrowse -noverify`):
   the bundle belongs to the Mac that backs up into it, and a writable attach
   could collide with it. Read-only also means no `fsck` and no risk to a backup.

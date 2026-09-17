@@ -62,6 +62,8 @@ NOTIFY_MOUNT_WARN=1
 CACHE_TTL=3600
 USAGE_SAMPLE_INTERVAL=21600
 IMAGE_GRACE=600
+ATTACH_SECONDS_PER_TB_HDD=38
+ATTACH_SECONDS_PER_TB_SSD=8
 IMAGE_SCAN_TTL=300
 INDEX_BASELINES="newest oldest"
 INDEX_INC_MAX=16
@@ -328,8 +330,18 @@ INDEX_INTERVAL_DEFAULT="1d"     # how often an opted-in location is re-indexed
                                 # With AutoBackup on, a finished run is the
                                 # trigger instead and this is not consulted
 IMAGE_GRACE=600                 # s an attached sparsebundle stays attached after
-                                # its last use; attaching one over a share costs
-                                # minutes, so back-to-back commands reuse it
+                                # its last use; attaching one costs minutes, so
+                                # back-to-back commands reuse it
+ATTACH_SECONDS_PER_TB_HDD=38    # what attaching a sparsebundle costs per TB of
+                                # bands, used to estimate the wait BEFORE it is
+                                # over. Measured: 4.2T attached in 157s on a
+                                # spinning SATA disk -- a rotating disk seeks
+                                # for every piece of APFS metadata in the image,
+                                # which is why the SIZE of the store decides it
+ATTACH_SECONDS_PER_TB_SSD=8     # the same for an SSD -- NOT measured here, a
+                                # starting point. Either way, once an image has
+                                # been attached once, its own measured time is
+                                # used instead of these
 ID_LEN=6
 # --- retention ---
 THIN_POLICY_TO_KEEP_DEFAULT="24h:hourly 7d:daily 4w:weekly 2y:monthly"
@@ -1861,6 +1873,126 @@ image_mountpoint() {
 	return 0
 }
 
+## The volume a path sits on, and how it is mounted: "<mountpoint> <TAB> <type>".
+## The longest mountpoint that prefixes the path wins, or / would match anything.
+path_volume() {
+	mount_table | LC_ALL=C awk -v p="$1/" '
+		{ i = index($0, " on "); if (i == 0) next
+		  r = substr($0, i + 4); j = index(r, " ("); if (j == 0) next
+		  m = substr(r, 1, j - 1)
+		  t = substr(r, j + 2); k = index(t, ","); if (k > 0) t = substr(t, 1, k - 1)
+		  pre = (m == "/" ? "/" : m "/")
+		  if (index(p, pre) == 1 && length(m) >= length(best)) { best = m; bt = t } }
+		END { if (best != "") printf "%s\t%s\n", best, bt }'
+}
+
+## What kind of disk an image sits on: ssd | hdd | network | unknown. What it
+## costs to attach is decided here -- a spinning disk seeks for every piece of
+## APFS metadata in the image, and there are thousands of them.
+image_media() {
+	_imm_v=$(path_volume "$1")
+	[ -n "$_imm_v" ] || { printf 'unknown\n'; return 0; }
+	case "${_imm_v#*"$(printf '\t')"}" in
+		smbfs|afpfs|nfs|webdav|ftp) printf 'network\n'; return 0 ;;
+	esac
+	_imm_d=$(vol_device "${_imm_v%%"$(printf '\t')"*}" 2>/dev/null)
+	[ -n "$_imm_d" ] || { printf 'unknown\n'; return 0; }
+	case "$(diskutil info "$_imm_d" 2>/dev/null |
+			LC_ALL=C awk -F: '/Solid State/ {gsub(/[^A-Za-z]/, "", $2); print tolower($2); exit}')" in
+		yes) printf 'ssd\n' ;;
+		no)  printf 'hdd\n' ;;
+		*)   printf 'unknown\n' ;;
+	esac
+}
+
+media_phrase() {
+	case "$1" in
+		ssd)     printf 'an SSD\n' ;;
+		hdd)     printf 'a spinning disk\n' ;;
+		network) printf 'a network share\n' ;;
+		*)       printf 'this disk\n' ;;
+	esac
+}
+
+## How much of a sparsebundle is really there: the bands that exist, times the
+## band size its Info.plist declares. The plist's own "size" is the capacity
+## the image may grow to (11.4T for a 4.2T store), which would estimate wildly.
+## Reading the band NAMES only -- no stat per file -- so this stays a directory
+## read; it still costs seconds on a spinning disk, so it is asked for once an
+## attach is already slow, never on the fast path.
+image_bytes() {
+	_ib_bs=$(plutil -p "$1/Info.plist" 2>/dev/null |
+		LC_ALL=C awk -F'=>' '/"band-size"/ {gsub(/[^0-9]/, "", $2); print $2; exit}')
+	[ -n "$_ib_bs" ] || return 1
+	# shellcheck disable=SC2012  # names only, no stat per file: that is the point
+	_ib_n=$(ls -f "$1/bands" 2>/dev/null |
+		LC_ALL=C awk '$0 != "." && $0 != ".." && length($0) > 0 {n++} END {print n + 0}')
+	[ "${_ib_n:-0}" -gt 0 ] || return 1
+	printf '%s\n' "$(( _ib_n * _ib_bs ))"
+}
+
+## Where the last attach of an image recorded what it really cost.
+attach_record_file() { printf '%s/attach.%s\n' "$(cache_write_dir)" "$(slug "$1")"; }
+
+## Remember it: seconds and the size it was for, so the next estimate is this
+## machine's own measurement rather than a rate from somewhere else.
+attach_record() {               # <img> <seconds> <bytes>
+	[ "${2:-0}" -gt 0 ] || return 0
+	[ "${3:-0}" -gt 0 ] || return 0
+	need_dir "$(cache_write_dir)" || return 0
+	printf '%s\t%s\t%s\n' "$2" "$3" "$(now_epoch)" >"$(attach_record_file "$1")" 2>/dev/null
+	return 0
+}
+
+## What the last attach of THIS image really cost, scaled to the size it is
+## now: "<seconds>". A rate per TB would round the measurement away -- 400s
+## came back as 399 -- so the measured seconds are carried, not a rate.
+attach_measured() {             # <img> <bytes-now>
+	_am_f=$(attach_record_file "$1")
+	[ -f "$_am_f" ] || return 1
+	LC_ALL=C awk -F'\t' -v now="${2:-0}" '
+		$1 > 0 && $2 > 0 {
+			if (now <= 0 || now == $2) s = $1
+			else s = int(($1 * now + $2 / 2) / $2)
+			if (s < 1) s = 1
+			print s; f = 1; exit
+		}
+		END { exit(f ? 0 : 1) }' "$_am_f"
+}
+
+## How long this attach should take: "<seconds> <TAB> <bytes> <TAB> <media>
+## <TAB> measured|rate". Empty when the size cannot be read, because an
+## estimate with nothing behind it is a made-up number.
+attach_estimate() {
+	_aes_b=$(image_bytes "$1") || return 1
+	_aes_m=$(image_media "$1")
+	if _aes_s=$(attach_measured "$1" "$_aes_b"); then
+		_aes_how="measured"
+	else
+		_aes_how="rate"
+		case "$_aes_m" in
+			ssd) _aes_r="${ATTACH_SECONDS_PER_TB_SSD:-8}" ;;
+			*)   _aes_r="${ATTACH_SECONDS_PER_TB_HDD:-38}" ;;
+		esac
+		[ "${_aes_r:-0}" -gt 0 ] || return 1
+		## bytes x seconds-per-TB / 1 TB; a 12 TB image at 38 s/TB is 4.6e14,
+		## well inside what the shell's arithmetic holds
+		_aes_s=$(( _aes_b * _aes_r / 1000000000000 ))
+		[ "$_aes_s" -gt 0 ] || _aes_s=1
+	fi
+	printf '%s\t%s\t%s\t%s\n' "$_aes_s" "$_aes_b" "$_aes_m" "$_aes_how"
+	return 0
+}
+
+## 157 -> 2m37s, 45 -> 45s: an estimate nobody has to convert in their head.
+human_secs() {
+	awk -v s="${1:-0}" 'BEGIN{
+		if (s < 60) { printf "%ds\n", s; exit }
+		if (s < 3600) { printf "%dm%02ds\n", int(s/60), s % 60; exit }
+		printf "%dh%02dm\n", int(s/3600), int((s % 3600) / 60);
+	}'
+}
+
 ## Attach read-only, always: a Time Machine sparsebundle belongs to the Mac
 ## that backs up into it, and a writable attach could collide with it.
 ## Read-only also means no fsck and no risk to the backup.
@@ -1909,13 +2041,15 @@ image_attach() {
 	_pl=$(mktemp /tmp/my-tm.att.XXXXXX) || { attach_unlock "$_att_lock"; return 1; }
 	run_echo hdiutil attach -readonly -nobrowse -noverify -noautofsck "$_img"
 	why "read-only, so it cannot collide with the Mac that backs up into it"
-	## Attaching a sparsebundle over a share takes minutes and hdiutil says
-	## NOTHING while it does: -puppetstrings emits no progress for an attach
-	## with -noverify (measured -- the man page's "indeterminate" case), so
-	## there is no percentage to report and pretending otherwise would be a
-	## made-up number. What IS true is how long it has been going, so say
-	## that -- and only once it is slow enough to worry about, so a fast
-	## local attach stays silent.
+	## Attaching a big sparsebundle takes minutes -- on a spinning disk as
+	## much as over a share, because the cost is a seek for every piece of
+	## APFS metadata in the image -- and hdiutil says NOTHING while it does:
+	## -puppetstrings emits no progress for an attach with -noverify
+	## (measured -- the man page's "indeterminate" case), so there is no
+	## percentage to report and pretending otherwise would be a made-up
+	## number. What IS true is how long it has been going and what an attach
+	## of this image, on this disk, has cost before, so say those -- and only
+	## once it is slow enough to worry about, so a fast attach stays silent.
 	## These lines go to STDERR like every other progress line: this function
 	## is called inside $(...) for the path it prints.
 	hdiutil attach -readonly -nobrowse -noverify -noautofsck -plist "$_img" \
@@ -1931,12 +2065,32 @@ image_attach() {
 		_att_el=$(( $(now_epoch) - _att_t0 ))
 		[ "$_att_el" -lt 6 ] && continue
 		if [ "$_att_said" = "0" ]; then
-			msg "attaching $(basename "$_img") -- this can take minutes over a share"
+			## asked for HERE, not before the attach: reading the band names
+			## costs seconds on the very disk that makes an attach slow
+			_att_est=""; _att_ez=""
+			if _att_e=$(attach_estimate "$_img"); then
+				_att_est=$(printf '%s' "$_att_e" | awk -F'\t' '{print $1}')
+				_att_ez=$(printf '%s' "$_att_e" | awk -F'\t' '{print $2}')
+				_att_em=$(printf '%s' "$_att_e" | awk -F'\t' '{print $3}')
+				_att_eh=$(printf '%s' "$_att_e" | awk -F'\t' '{print $4}')
+				msg "attaching $(basename "$_img") -- $(human_bytes "$_att_ez") on $(media_phrase "$_att_em"), about $(human_secs "$_att_est")"
+				if [ "$_att_eh" = "measured" ]; then
+					why "that is what the last attach of this image here cost"
+				else
+					why "at ${ATTACH_SECONDS_PER_TB_HDD:-38}s per TB for a spinning disk (ATTACH_SECONDS_PER_TB_*); the next one goes by what this attach really takes"
+				fi
+			else
+				msg "attaching $(basename "$_img") -- this can take minutes"
+			fi
 			_att_said=1; _att_n=1
 			_att_next=$(( _att_el + $(attach_gap "$_att_n") ))
 		elif [ "$_att_el" -ge "$_att_next" ]; then
 			if attach_says_more "$_att_n"; then
-				minor "still attaching, ${_att_el}s so far"
+				if [ -n "$_att_est" ]; then
+					minor "still attaching, ${_att_el}s of about $(human_secs "$_att_est")"
+				else
+					minor "still attaching, ${_att_el}s so far"
+				fi
 				_att_n=$(( _att_n + 1 ))
 			fi
 			_att_next=$(( _att_el + $(attach_gap "$_att_n") ))
@@ -1951,8 +2105,10 @@ image_attach() {
 		[ "$_att_said" = "1" ] && warn "attach of $(basename "$_img") failed after $(( $(now_epoch) - _att_t0 ))s"
 		return 1
 	fi
-	[ "$_att_said" = "1" ] &&
-		msg "attached $(basename "$_img") after $(( $(now_epoch) - _att_t0 ))s"
+	_att_took=$(( $(now_epoch) - _att_t0 ))
+	[ "$_att_said" = "1" ] && msg "attached $(basename "$_img") after ${_att_took}s"
+	## what it really cost, so the next estimate is this machine's own number
+	[ -n "${_att_ez:-}" ] && attach_record "$_img" "$_att_took" "$_att_ez"
 	_mp=$(plutil -p "$_pl" 2>/dev/null |
 		awk '/"mount-point" =>/ && !f { m = $0; sub(/^[^>]*=> /, "", m);
 		                                gsub(/"/, "", m); print m; f = 1 }')
@@ -9394,6 +9550,93 @@ t_test_index_increment_only_new() {
 	rm -f "$_tinc_ix"/store.*db "$(index_covered_file store)"; rm -rf "$(vs_dir store)" "$_tinc_fs"
 }
 
+## The wait was announced as "this can take minutes over a share" -- on a local
+## SATA disk, where no share is involved. What decides it is the SIZE of the
+## store and the disk under it: a rotating disk seeks for every piece of APFS
+## metadata in the image. Adversarial: a sparsebundle's Info.plist declares the
+## capacity it may GROW to (11.4T for a 4.2T store), so an estimate taken from
+## that number is ~3x wrong; only the bands that exist count.
+t_test_attach_estimate() {
+	printf '\nAn attach says how big the store is and how long it should take\n'
+	_ae_img="$T_ROOT/est.sparsebundle"
+	mkdir -p "$_ae_img/bands"
+	## 8 bands x 256 MB = 2 GB real, while the plist claims 11.4 T of capacity
+	{
+		printf '<?xml version="1.0" encoding="UTF-8"?>\n'
+		printf '<plist version="1.0"><dict>\n'
+		printf '<key>band-size</key><integer>268435456</integer>\n'
+		printf '<key>size</key><integer>11399877943296</integer>\n'
+		printf '</dict></plist>\n'
+	} >"$_ae_img/Info.plist"
+	_ae_i=0
+	while [ "$_ae_i" -lt 8 ]; do : >"$_ae_img/bands/$_ae_i"; _ae_i=$(( _ae_i + 1 )); done
+
+	t_eq "the size is the bands that exist, not the capacity claimed" \
+		"$(image_bytes "$_ae_img")" "2147483648"
+
+	## the disk under it decides the rate
+	_ae_save="$MOUNT_TABLE_FILE"
+	MOUNT_TABLE_FILE="$T_ROOT/est.table"
+	printf '/dev/disk9s1 on %s (apfs, local, journaled)\n' "$T_ROOT" >"$MOUNT_TABLE_FILE"
+	printf '/dev/disk1s5 on / (apfs, local, read-only)\n' >>"$MOUNT_TABLE_FILE"
+	t_eq "the image is placed on the volume it really sits on, not /" \
+		"$(path_volume "$_ae_img" | cut -f1)" "$T_ROOT"
+
+	_ae_stub="$(t_stub_dir)/diskutil"
+	_ae_stub_save="$T_ROOT/diskutil.orig"
+	cp "$_ae_stub" "$_ae_stub_save"
+	{ printf '#!/bin/sh\n'; printf 'printf "   Solid State:              No\\n"\n'; printf 'exit 0\n'; } >"$_ae_stub"
+	chmod 0755 "$_ae_stub"
+	t_eq "a rotating disk is recognised" "$(image_media "$_ae_img")" "hdd"
+	## 2 GB at 38 s/TB
+	## a rate that makes 2 GB a visible number, rather than 4000 fake bands
+	_ae_rate_save="$ATTACH_SECONDS_PER_TB_HDD"
+	ATTACH_SECONDS_PER_TB_HDD=5000
+	t_eq "and the estimate follows the size and that rate" \
+		"$(attach_estimate "$_ae_img" | cut -f1)" "10"
+	ATTACH_SECONDS_PER_TB_HDD="$_ae_rate_save"
+	t_eq "the estimate says where it came from" \
+		"$(attach_estimate "$_ae_img" | cut -f4)" "rate"
+
+	{ printf '#!/bin/sh\n'; printf 'printf "   Solid State:              Yes\\n"\n'; printf 'exit 0\n'; } >"$_ae_stub"
+	chmod 0755 "$_ae_stub"
+	t_eq "an SSD is recognised" "$(image_media "$_ae_img")" "ssd"
+
+	## what a real attach cost beats any rate
+	attach_record "$_ae_img" 400 2147483648
+	t_eq "a measured attach is preferred" \
+		"$(attach_estimate "$_ae_img" | cut -f4)" "measured"
+	t_eq "and its own time is what is estimated, to the second" \
+		"$(attach_estimate "$_ae_img" | cut -f1)" "400"
+	## a store that has grown since scales that measurement
+	attach_record "$_ae_img" 400 1073741824
+	t_eq "a store twice the size it was doubles the estimate" \
+		"$(attach_estimate "$_ae_img" | cut -f1)" "800"
+	rm -f "$(attach_record_file "$_ae_img")"
+
+	## a bundle with no bands yet has nothing to estimate from, and says nothing
+	_ae_empty="$T_ROOT/empty.sparsebundle"; mkdir -p "$_ae_empty/bands"
+	cp "$_ae_img/Info.plist" "$_ae_empty/Info.plist"
+	t_eq "an image with no bands yields no estimate" \
+		"$(attach_estimate "$_ae_empty" >/dev/null 2>&1 && echo guessed || echo silent)" "silent"
+
+	t_eq "seconds are written for people" "$(human_secs 157) $(human_secs 45) $(human_secs 5400)" "2m37s 45s 1h30m"
+
+	cp "$_ae_stub_save" "$_ae_stub"; chmod 0755 "$_ae_stub"
+	MOUNT_TABLE_FILE="$_ae_save"
+	rm -rf "$_ae_img" "$_ae_empty" "$_ae_stub_save"
+}
+
+## The attach message named a share that is not involved: every store my-tm
+## attaches is on this Mac, because one on a share is refused where it is
+## registered and read over ssh instead.
+t_test_attach_message_is_about_this_disk() {
+	printf '\nThe attach message describes the disk it is really on\n'
+	t_eq "no message promises a share any more" \
+		"$(awk '/^[\t ]*msg "attaching/ && /over a share/ {n++} END {print n + 0}' "$T_MYTM")" "0"
+	t_eq "and neither does --help" "$(usage | count_match 'over a share')" "0"
+}
+
 ## REGRESSION: hdiutil keeps attaching after the run that started it is gone.
 ## Every interrupted run left one behind -- six were found queued on one store,
 ## competing for the same image so that none of them finished, and the one that
@@ -11071,6 +11314,8 @@ run_tests() {
 	t_test_cache_excluded
 	t_test_config_search_order
 	t_test_attach_progress
+	t_test_attach_estimate
+	t_test_attach_message_is_about_this_disk
 	t_test_attach_is_not_orphaned
 	t_test_attach_one_at_a_time
 	t_test_remote_progress_reaches_the_caller
