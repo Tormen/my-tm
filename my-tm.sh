@@ -171,6 +171,9 @@ TRANSIENT_LIST="$RUN_DIR/transient"
 TRANSIENT_VOLUMES="$RUN_DIR/volumes"
 ## Disk images WE attached, to be detached again on the way out.
 TRANSIENT_IMAGES="$RUN_DIR/images"
+## The attach running right now, if any. A file, because image_attach is
+## called inside $(...) and the pid would die with that subshell.
+ATTACH_PIDFILE="$RUN_DIR/attach.pid"
 
 #############################################################################
 ## OUTPUT
@@ -1869,7 +1872,41 @@ image_attach() {
 		printf '%s\n' "$_mp"
 		return 0
 	fi
-	_pl=$(mktemp /tmp/my-tm.att.XXXXXX) || return 1
+	## One attach at a time per image. Two runs asking at once start two
+	## hdiutil attaches of the SAME sparsebundle, which then compete and take
+	## longer than either alone -- six were found queued on one store, none of
+	## them finished. The second run waits for the first and uses its result.
+	_att_lock="$MOUNT_ROOT/.attaching.$(slug "$_img")"
+	_att_w0=$(now_epoch)
+	while ! mkdir "$_att_lock" 2>/dev/null; do
+		_att_own=$(cat "$_att_lock/owner" 2>/dev/null)
+		if [ -z "$_att_own" ] || ! kill -0 "$_att_own" 2>/dev/null; then
+			warn "an interrupted run left the attach lock for $(basename "$_img") -- taking it over"
+			rm -f "$_att_lock/owner"; rmdir "$_att_lock" 2>/dev/null
+			continue
+		fi
+		if _mp=$(image_mountpoint "$_img"); then
+			msg "$(basename "$_img") was attached by another run after $(( $(now_epoch) - _att_w0 ))s"
+			image_touch "$_img" "$_mp"
+			printf '%s\n' "$_mp"
+			return 0
+		fi
+		[ "$(( $(now_epoch) - _att_w0 ))" -ge 6 ] &&
+			minor "another run is attaching $(basename "$_img"), $(( $(now_epoch) - _att_w0 ))s so far -- waiting for it"
+		sleep 2
+	done
+	printf '%s\n' "$$" >"$_att_lock/owner" 2>/dev/null
+	## The run we waited for may have finished attaching it: check again now
+	## that the lock is ours, or waiting would end in a second attach anyway.
+	if _mp=$(image_mountpoint "$_img"); then
+		attach_unlock "$_att_lock"
+		msg "$(basename "$_img") was attached by another run after $(( $(now_epoch) - _att_w0 ))s"
+		image_touch "$_img" "$_mp"
+		printf '%s\n' "$_mp"
+		return 0
+	fi
+
+	_pl=$(mktemp /tmp/my-tm.att.XXXXXX) || { attach_unlock "$_att_lock"; return 1; }
 	run_echo hdiutil attach -readonly -nobrowse -noverify -noautofsck "$_img"
 	why "read-only, so it cannot collide with the Mac that backs up into it"
 	## Attaching a sparsebundle over a share takes minutes and hdiutil says
@@ -1884,6 +1921,8 @@ image_attach() {
 	hdiutil attach -readonly -nobrowse -noverify -noautofsck -plist "$_img" \
 			>"$_pl" 2>/dev/null &
 	_att_pid=$!
+	## so the run's cleanup can stop it: hdiutil outlives its parent otherwise
+	printf '%s\n' "$_att_pid" >"$ATTACH_PIDFILE" 2>/dev/null
 	_att_t0=$(now_epoch)
 	_att_said=0
 	_att_n=0
@@ -1905,8 +1944,10 @@ image_attach() {
 	done
 	_att_rc=0
 	wait "$_att_pid" || _att_rc=1
+	rm -f "$ATTACH_PIDFILE"
 	if [ "$_att_rc" != "0" ]; then
 		rm -f "$_pl"
+		attach_unlock "$_att_lock"
 		[ "$_att_said" = "1" ] && warn "attach of $(basename "$_img") failed after $(( $(now_epoch) - _att_t0 ))s"
 		return 1
 	fi
@@ -1916,9 +1957,17 @@ image_attach() {
 		awk '/"mount-point" =>/ && !f { m = $0; sub(/^[^>]*=> /, "", m);
 		                                gsub(/"/, "", m); print m; f = 1 }')
 	rm -f "$_pl"
+	attach_unlock "$_att_lock"
 	[ -n "$_mp" ] || return 1
 	image_touch "$_img" "$_mp"
 	printf '%s\n' "$_mp"
+	return 0
+}
+
+attach_unlock() {
+	[ -n "${1:-}" ] || return 0
+	rm -f "$1/owner"
+	rmdir "$1" 2>/dev/null
 	return 0
 }
 
@@ -2428,14 +2477,35 @@ cleanup_run_dir() {
 	return 0
 }
 
+## hdiutil keeps attaching after the run that started it is gone -- an ssh
+## session that drops, a Ctrl-C, a killed daemon -- so every interrupted run
+## left one behind, and they pile up and compete for the same image: six of
+## them were found on one store, none finished. TERM alone does not stop
+## hdiutil; KILL does.
+cleanup_attach() {
+	[ -f "${ATTACH_PIDFILE:-}" ] || return 0
+	_cat_p=$(cat "$ATTACH_PIDFILE" 2>/dev/null)
+	rm -f "$ATTACH_PIDFILE"
+	[ -n "$_cat_p" ] || return 0
+	kill -0 "$_cat_p" 2>/dev/null || return 0
+	kill "$_cat_p" 2>/dev/null
+	sleep 1
+	kill -0 "$_cat_p" 2>/dev/null && kill -9 "$_cat_p" 2>/dev/null
+	dbg "stopped the attach still running as pid $_cat_p"
+	return 0
+}
+
 cleanup_all() {
 	_ca_rc=$?
-	cleanup_transient; cleanup_images; cleanup_volumes; cleanup_run_dir
+	cleanup_attach; cleanup_transient; cleanup_images; cleanup_volumes; cleanup_run_dir
 	return $_ca_rc
 }
 trap 'cleanup_all' EXIT
 trap 'cleanup_all; exit 130' INT
 trap 'cleanup_all; exit 143' TERM
+## HUP is how a dropped ssh session ends a remote run -- without it the run
+## died with its attach still going.
+trap 'cleanup_all; exit 129' HUP
 
 ## transient_snapshot <loc> <ts> -- echo the mountpoint, release it at exit.
 ## Safe to call from inside $(...): the list it appends to is a file.
@@ -4746,14 +4816,30 @@ remote_run() {                  # <handle> <args...>
 	[ -n "$_rr_dir" ] ||
 		err "my-tm is not installed on $_rr_host -- run: $US --install $_rr_host"
 	# shellcheck disable=SC2029  # building the remote command line here is the point
-	ssh "$_rr_host" "$_rr_dir/my-tm $*"
+	## the same terms as remote_find_my_tm: never a password prompt, and a
+	## connection that cannot answer fails instead of hanging
+	ssh -o BatchMode=yes -o ConnectTimeout="${SSH_CONNECT_TIMEOUT:-3}" \
+		"$_rr_host" "$_rr_dir/my-tm $*"
 }
 
 remote_snap_names() {
 	_t=$(loc_target "$1")
+	_rsn_host=$(remote_host "$_t")
+	_rsn_out=$(mktemp /tmp/my-tm.rsn.XXXXXX) || return 1
+	## What the remote says about ITS work belongs on this screen: attaching a
+	## sparsebundle there takes minutes, and swallowing its progress made that
+	## a silent hang here. Its lines are re-prefixed and named for the host, so
+	## it is never in doubt which machine is talking.
+	remote_run "$1" -J --ls "$(remote_path "$_t")" 2>&1 >"$_rsn_out" |
+		LC_ALL=C awk -v h="$_rsn_host" '{
+			line = $0; sub(/^[[:space:]]*(>>>|>>|~~~|-->|!!!|>|~)[[:space:]]?/, "", line)
+			if (line == "") next
+			if ($0 ~ /^[[:space:]]*!!!/) printf " !!! %s: %s\n", h, line
+			else printf "    > %s: %s\n", h, line
+		}' >&2
 	## the remote copy of my-tm answers in JSON, so nothing has to be re-parsed
-	remote_run "$1" -J --ls "$(remote_path "$_t")" 2>/dev/null |
-		sed -nE 's/.*"snapshot": *"([0-9-]+)".*/\1/p' | sort
+	sed -nE 's/.*"snapshot": *"([0-9-]+)".*/\1/p' "$_rsn_out" | sort
+	rm -f "$_rsn_out"
 	return 0
 }
 
@@ -9308,6 +9394,175 @@ t_test_index_increment_only_new() {
 	rm -f "$_tinc_ix"/store.*db "$(index_covered_file store)"; rm -rf "$(vs_dir store)" "$_tinc_fs"
 }
 
+## REGRESSION: hdiutil keeps attaching after the run that started it is gone.
+## Every interrupted run left one behind -- six were found queued on one store,
+## competing for the same image so that none of them finished, and the one that
+## eventually did left the image attached with nothing recorded to release it.
+t_test_attach_is_not_orphaned() {
+	printf '\nAn attach does not outlive the run that started it\n'
+	## written from HERE, not read through $(...): a subshell resets the traps
+	trap >"$T_ROOT/traps.out"
+	t_match "a dropped connection is trapped, not just Ctrl-C" \
+		"$(cat "$T_ROOT/traps.out")" "HUP"
+	rm -f "$T_ROOT/traps.out"
+
+	## the pidfile is what lets the run's cleanup reach a child of a subshell
+	sleep 30 &
+	_atn_p=$!
+	printf '%s\n' "$_atn_p" >"$ATTACH_PIDFILE"
+	cleanup_attach
+	t_eq "cleanup stops an attach that is still running" \
+		"$(kill -0 "$_atn_p" 2>/dev/null && echo alive || echo stopped)" "stopped"
+	t_eq "and forgets it" "$([ -f "$ATTACH_PIDFILE" ] && echo left || echo gone)" "gone"
+	wait "$_atn_p" 2>/dev/null
+
+	## a pid that has already exited is not an error, and nothing is killed
+	( exit 0 ) & _atn_d=$!
+	wait "$_atn_d" 2>/dev/null
+	printf '%s\n' "$_atn_d" >"$ATTACH_PIDFILE"
+	cleanup_attach
+	t_eq "a pid that is already gone is no error" "$?" "0"
+	rm -f "$ATTACH_PIDFILE"
+
+	## and the real shape: the run dies mid-attach, its cleanup kills the child
+	_atn_img="$T_ROOT/orphan.sparsebundle"; mkdir -p "$_atn_img"
+	_atn_stub="$(t_stub_dir)/hdiutil"
+	{
+		printf '#!/bin/sh\n'
+		# shellcheck disable=SC2016  # writing a script: $1 is the STUB's argument
+		printf 'if [ "$1" = "info" ]; then exit 0; fi\n'
+		printf 'sleep 60\n'
+		printf 'exit 0\n'
+	} >"$_atn_stub"
+	chmod 0755 "$_atn_stub"
+	( image_attach "$_atn_img" >/dev/null 2>&1 ) &
+	_atn_run=$!
+	_atn_i=0
+	while [ ! -f "$ATTACH_PIDFILE" ] && [ "$_atn_i" -lt 40 ]; do
+		_atn_i=$(( _atn_i + 1 )); sleep 0.25
+	done
+	_atn_child=$(cat "$ATTACH_PIDFILE" 2>/dev/null)
+	t_ne "the attach in flight is recorded" "$_atn_child" ""
+	kill "$_atn_run" 2>/dev/null; wait "$_atn_run" 2>/dev/null
+	cleanup_attach
+	t_eq "killing the run leaves no attach behind" \
+		"$(kill -0 "$_atn_child" 2>/dev/null && echo alive || echo stopped)" "stopped"
+	rm -rf "$_atn_img"; rm -f "$ATTACH_PIDFILE"
+	attach_unlock "$MOUNT_ROOT/.attaching.$(slug "$_atn_img")"
+}
+
+## Two runs asking for the same image at once started two attaches of it, which
+## then competed and took longer than either alone. The second must wait for
+## the first and use its result.
+t_test_attach_one_at_a_time() {
+	printf '\nOne attach at a time per image\n'
+	_aol_img="$T_ROOT/shared.sparsebundle"; mkdir -p "$_aol_img"
+	_aol_n="$T_ROOT/attach.count"; : >"$_aol_n"
+	_aol_done="$T_ROOT/attach.done"; rm -f "$_aol_done"
+	_aol_stub="$(t_stub_dir)/hdiutil"
+	## records every attach, and answers "info" as attached once one finished
+	{
+		printf '#!/bin/sh\n'
+		# shellcheck disable=SC2016  # writing a script: the stub reads its own args
+		printf 'if [ "$1" = "info" ]; then\n'
+		printf '  [ -f "%s" ] || exit 0\n' "$_aol_done"
+		printf '  %s\n' 'cat <<XEOF'
+		printf '<?xml version="1.0" encoding="UTF-8"?>\n'
+		printf '<plist version="1.0"><dict><key>images</key><array><dict>\n'
+		printf '<key>image-path</key><string>%s</string>\n' "$_aol_img"
+		printf '<key>system-entities</key><array><dict>\n'
+		printf '<key>mount-point</key><string>/Volumes/Shared</string>\n'
+		printf '</dict></array></dict></array></dict></plist>\n'
+		printf 'XEOF\n'
+		printf '  exit 0\n'
+		printf 'fi\n'
+		printf 'printf "attach\\n" >>"%s"\n' "$_aol_n"
+		printf 'sleep 8\n'
+		printf 'touch "%s"\n' "$_aol_done"
+		printf '%s\n' 'cat <<XEOF'
+		printf '<?xml version="1.0" encoding="UTF-8"?>\n'
+		printf '<plist version="1.0"><dict><key>system-entities</key><array><dict>\n'
+		printf '<key>mount-point</key><string>/Volumes/Shared</string>\n'
+		printf '</dict></array></dict></plist>\n'
+		printf 'XEOF\n'
+		printf 'exit 0\n'
+	} >"$_aol_stub"
+	chmod 0755 "$_aol_stub"
+
+	_aol_lock="$MOUNT_ROOT/.attaching.$(slug "$_aol_img")"
+	attach_unlock "$_aol_lock"
+	image_attach "$_aol_img" >"$T_ROOT/attach.first" 2>/dev/null &
+	_aol_run=$!
+	_aol_i=0
+	while [ ! -d "$_aol_lock" ] && [ "$_aol_i" -lt 40 ]; do
+		_aol_i=$(( _aol_i + 1 )); sleep 0.25
+	done
+	_aol_second=$(image_attach "$_aol_img" 2>"$T_ROOT/attach.second.err")
+	wait "$_aol_run" 2>/dev/null
+	t_eq "hdiutil was asked to attach it once, not twice" \
+		"$(count_lines < "$_aol_n")" "1"
+	t_eq "the waiting run gets the same mountpoint" "$_aol_second" "/Volumes/Shared"
+	t_eq "the first run gets it too" "$(cat "$T_ROOT/attach.first")" "/Volumes/Shared"
+	t_match "and says what it is waiting for" \
+		"$(cat "$T_ROOT/attach.second.err")" "attached by another run"
+
+	## a lock left by a run that died is taken over, and said so
+	mkdir -p "$_aol_lock"; printf '999999\n' >"$_aol_lock/owner"
+	rm -f "$_aol_done"; : >"$_aol_n"
+	_aol_third=$(image_attach "$_aol_img" 2>"$T_ROOT/attach.third.err")
+	t_match "a lock whose owner is gone is taken over, out loud" \
+		"$(cat "$T_ROOT/attach.third.err")" "interrupted run left the attach lock"
+	t_eq "and the attach then happens" "$_aol_third" "/Volumes/Shared"
+	attach_unlock "$_aol_lock"
+	rm -rf "$_aol_img"; rm -f "$_aol_n" "$_aol_done"
+}
+
+## The remote does the slow work -- attaching a sparsebundle takes minutes --
+## and its progress was sent to /dev/null, so the caller saw a silent hang.
+## Its ssh also had no BatchMode or timeout, so it could wait for a password
+## nobody would ever type, while the discovery call beside it had both.
+t_test_remote_progress_reaches_the_caller() {
+	printf '\nThe remote says what it is doing, and its ssh is bounded\n'
+	_rpt_stub="$(t_stub_dir)/ssh"
+	{
+		printf '#!/bin/sh\n'
+		printf 'printf "ssh %%s\\n" "$*" >>"%s"\n' "$(t_calls)"
+		printf '%s\n' 'printf " >>> attaching horse.sparsebundle -- this can take minutes over a share\n" >&2'
+		printf '%s\n' 'printf "    > still attaching, 22s so far\n" >&2'
+		printf '%s\n' 'printf " !!! something the remote warns about\n" >&2'
+		printf '%s\n' 'printf "[\n"'
+		printf '%s\n' 'printf "  {\"location\": \"path-x\", \"snapshot\": \"2026-01-02-030405\"}\n"'
+		printf '%s\n' 'printf "]\n"'
+		printf 'exit 0\n'
+	} >"$_rpt_stub"
+	chmod 0755 "$_rpt_stub"
+	: >"$(t_calls)"
+
+	_rpt_names=$(remote_snap_names remote 2>"$T_ROOT/remote.err")
+	t_eq "the snapshot list still comes back" "$_rpt_names" "2026-01-02-030405"
+	t_match "the remote's progress reaches the screen" \
+		"$(cat "$T_ROOT/remote.err")" "this can take minutes"
+	t_match "named for the host that is doing it" \
+		"$(cat "$T_ROOT/remote.err")" "host1: attaching"
+	t_match "a warning stays a warning" \
+		"$(cat "$T_ROOT/remote.err")" "!!! host1: something the remote warns"
+	t_eq "and nothing of it leaks into the answer" \
+		"$(printf '%s' "$_rpt_names" | count_match 'attaching')" "0"
+
+	t_eq "the ssh never waits for a password" \
+		"$(count_match 'BatchMode=yes' < "$(t_calls)")" "1"
+	t_eq "and gives up on a host that cannot answer" \
+		"$(count_match 'ConnectTimeout' < "$(t_calls)")" "1"
+
+	## put the suite's own stub back
+	cat >"$_rpt_stub" <<_EOF
+#!/bin/sh
+printf 'ssh %s\n' "\$*" >>"$(t_calls)"
+exit 255
+_EOF
+	chmod 0755 "$_rpt_stub"
+}
+
 ## REGRESSION: the design promised an "exclusive size" column from tmutil
 ## uniquesize. That tool refuses on an APFS Time Machine store
 ## ("pathInAPFSBackup"), and nothing else on macOS reports per-snapshot space,
@@ -10816,6 +11071,9 @@ run_tests() {
 	t_test_cache_excluded
 	t_test_config_search_order
 	t_test_attach_progress
+	t_test_attach_is_not_orphaned
+	t_test_attach_one_at_a_time
+	t_test_remote_progress_reaches_the_caller
 	t_test_lsof_never_answers
 	t_test_install_builds_no_tree
 	t_test_runs_without_home

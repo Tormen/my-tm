@@ -1037,6 +1037,22 @@ location. Assuming reachability was worse than the round trip: `--health` used
 to report *"no snapshots found"* for a Mac that was merely switched off, which
 reads as data loss.
 
+**Every ssh my-tm makes is on the same terms**, the command calls included:
+`BatchMode` (never a password prompt nobody is there to answer) and
+`SSH_CONNECT_TIMEOUT`. The reachability probe had both while the command call
+beside it had neither, so a host that accepted the connection and then went
+quiet hung with nothing on screen.
+
+**What the remote is doing shows up here.** The far side does the slow work —
+attaching a sparsebundle there takes minutes — and its progress used to be
+discarded, so a `--status` that was waiting on ada looked like a hang. Those
+lines are now printed as they arrive, each named for the host saying it:
+
+```text
+    > ada: attaching horse.sparsebundle -- this can take minutes over a share
+    > ada: still attaching, 22s so far
+```
+
 **Deleting happens where the store is.** `--rm` and `--thin` refuse an ssh
 location and name the command to run on that host. Run here, `tmutil delete -d
 host:/path` addresses a *local* path — which either fails or, far worse, does
@@ -1075,6 +1091,14 @@ my-tm --add /Volumes/<disk>/<host>.sparsebundle usbtm
   could collide with it. Read-only also means no `fsck` and no risk to a backup.
 * **Attached only when the store must really be read.** A fresh cache answers
   `--status` and `--ls` with no attach at all; a stale one pays for it once.
+* **One attach at a time per bundle.** Two runs asking at once used to start
+  two `hdiutil` attaches of the same image, which then competed and took longer
+  than either alone; the second now waits for the first and uses its result.
+* **The attach dies with the run that started it.** `hdiutil` keeps going when
+  its parent is gone, so every interrupted run — a Ctrl-C, a dropped `ssh`
+  session, a killed daemon — used to leave one behind, and they accumulated.
+  my-tm stops its own attach when it exits or is interrupted (`HUP` included,
+  which is how a dropped `ssh` session ends a remote run).
 * **Kept for `IMAGE_GRACE` (default 10 min) after its last use**, then detached
   by the sweep. Measured against a NAS store: the first command costs **66 s**
   of attach and mount, and every command after it **1 s**. Detaching the moment
