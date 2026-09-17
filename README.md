@@ -362,7 +362,7 @@ several databases at once, with globs. No dependency, no daemon, no new format.
 ```text
 $CACHE_DIR/index/system.db     -> the live volume: reuse /var/db/locate.database (free)
 $CACHE_DIR/index/<loc>.db      -> consolidated union of paths seen in that history
-$CACHE_DIR/index/<loc>.inc.NN.db -> per-run increments, folded in on consolidation
+$CACHE_DIR/index/<loc>.inc.NN.db -> per-snapshot increments (new paths only), folded in on consolidation
 $CACHE_DIR/index/<loc>.covered -> snapshot IDs already indexed
 $CACHE_DIR/index/<loc>.versions/ -> the version store: a baseline plus one
                                   compressed delta per snapshot (path, size, mtime), §6
@@ -469,7 +469,10 @@ $CACHE_DIR/index/<loc>.versions/ -> the version store: a baseline plus one
     be consolidated without re-walking anything.
 
   So the index is kept log-structured: `<loc>.db` is the consolidated union,
-  and each `--index` run appends a small `<loc>.inc.<NN>.db`. Queries pass the
+  and each walked snapshot appends a small `<loc>.inc.<NN>.db` holding only
+  the paths it **adds** — the real rows of its version-store delta, since
+  every other path it holds is already in the indexed snapshot before it.
+  Only a snapshot that becomes the baseline writes its whole list. Queries pass the
   whole set to `locate -d`. **`--index` consolidates at the end of its own run**, once the increments
   exceed `INDEX_INC_MAX`: it dumps them
   all, `sort -u`s, rebuilds one database and drops the increments. Doing it

@@ -4640,9 +4640,29 @@ index_one() {
 		LC_ALL=C sed "s|^$_base||" |
 		LC_ALL=C awk -F'\t' 'length($1) > 0' |
 		LC_ALL=C sort >"$_stats"
-	cut -f1 "$_stats" >"$_paths"
-	_count=$(count_lines < "$_paths")
-	if [ "$_count" -gt 0 ]; then
+	_count=$(count_lines < "$_stats")
+
+	## No exclusive size here: macOS does not expose one for an APFS Time
+	## Machine snapshot (tmutil uniquesize refuses with pathInAPFSBackup, and
+	## diskutil reports no per-snapshot space), so asking cost a second full
+	## walk of the disk to fail every time.
+	## The version store first: its delta is what the name index needs.
+	_vs_rc=0
+	vs_record_snapshot "$_h" "$_ts" "$_stats" || _vs_rc=1
+
+	## Only what this snapshot ADDS to the union goes into its increment: every
+	## path it holds is either a real row of its delta or already in the indexed
+	## snapshot before it, and --find asks the union. A full list per snapshot
+	## was ~57 MB each. The baseline has no delta, so its list is whole.
+	_dlt="$(vs_dir "$_h")/d.$_ts.tsv.gz"
+	if [ "$_vs_rc" = 0 ] && [ -f "$_dlt" ]; then
+		gzip -cd <"$_dlt" 2>/dev/null | LC_ALL=C awk -F'\t' '$2 != "-" {print $1}' >"$_paths"
+	else
+		LC_ALL=C cut -f1 "$_stats" >"$_paths"
+	fi
+	_new=$(count_lines < "$_paths")
+	dbg "index: $_new of $_count paths are new to the name index"
+	if [ "$_new" -gt 0 ]; then
 		if _mk=$(locate_tool locate.mklocatedb); then
 			if ! "$_mk" <"$_paths" >"$_inc" 2>/dev/null || [ ! -s "$_inc" ]; then
 				warn "$_ts: building the name index failed -- nothing was written"
@@ -4650,17 +4670,12 @@ index_one() {
 			fi
 		else
 			warn "locate.mklocatedb not found (looked on PATH and in /usr/libexec) -- the name index cannot be built"
-			rm -f "$_paths"
+			rm -f "$_paths" "$_stats"
 			snap_umount "$_mp" >/dev/null 2>&1
 			return 1
 		fi
 	fi
 
-	## No exclusive size here: macOS does not expose one for an APFS Time
-	## Machine snapshot (tmutil uniquesize refuses with pathInAPFSBackup, and
-	## diskutil reports no per-snapshot space), so asking cost a second full
-	## walk of the disk to fail every time.
-	vs_record_snapshot "$_h" "$_ts" "$_stats"
 	index_mark_covered "$_h" "$_ts"
 	msg "$(human_count "$_count") paths indexed"
 	rm -f "$_stats"
@@ -9231,6 +9246,68 @@ t_test_vol_device() {
 	MOUNT_TABLE_FILE="$_vd_save"
 }
 
+## The name index grew by a FULL path list per snapshot (~57 MB each) although
+## --find only asks the union. An increment now holds what its snapshot adds.
+## Adversarial: the snapshot walked second is OLDER and becomes the baseline --
+## a path only it holds is in no delta as a real row, so a delta-only
+## increment would lose it from --find.
+t_test_index_increment_only_new() {
+	printf '\nA name-index increment holds only the paths its snapshot adds\n'
+	## the suite stubs locate.mklocatedb on PATH; this test needs the real one
+	if [ ! -x /usr/libexec/locate.mklocatedb ]; then
+		t_skip "increments through the real locate tools" "/usr/libexec/locate.mklocatedb not present"
+		return 0
+	fi
+	_tinc_ix=$(index_dir); rm -f "$_tinc_ix"/store.*db; rm -rf "$(vs_dir store)"
+	_tinc_fs="$T_ROOT/incfs"
+	_tinc_old=2026-02-01-000000; _tinc_new=2026-03-01-000000
+	mkdir -p "$_tinc_fs/$_tinc_old/a" "$_tinc_fs/$_tinc_new/a"
+	: >"$_tinc_fs/$_tinc_old/a/common.txt"; : >"$_tinc_fs/$_tinc_old/a/only-old.txt"
+	: >"$_tinc_fs/$_tinc_new/a/common.txt"; : >"$_tinc_fs/$_tinc_new/a/only-new.txt"
+	(
+		# shellcheck disable=SC2329  # called by index_one
+		snap_mount() { return 0; }
+		# shellcheck disable=SC2329
+		snap_umount() { return 0; }
+		# shellcheck disable=SC2329
+		mnt_volume_path() { printf '%s/%s\n' "$_tinc_fs" "$2"; }
+		# shellcheck disable=SC2329
+		locate_tool() { printf '/usr/libexec/%s\n' "$1"; }
+		index_one store "$_tinc_new" >/dev/null 2>&1
+		index_one store "$_tinc_old" >/dev/null 2>&1
+	)
+	_tinc_i0=$(locate -d "$_tinc_ix/store.inc.00.db" '*' 2>/dev/null | count_lines)
+	_tinc_i1=$(locate -d "$_tinc_ix/store.inc.01.db" '*' 2>/dev/null | tr '\n' ' ')
+	t_eq "the first walk holds the whole snapshot" "$_tinc_i0" "3"
+	t_eq "an older walk that becomes the baseline holds its whole list too" \
+		"$_tinc_i1" "/a /a/common.txt /a/only-old.txt "
+	## index_dbs puts the system database first; only this store's paths matter
+	_tinc_found=$(locate -d "$(index_dbs store)" '*only-*' 2>/dev/null | grep '^/a/' | LC_ALL=C sort -u | tr '\n' ' ')
+	t_eq "the union still finds a path only either snapshot held" \
+		"$_tinc_found" "/a/only-new.txt /a/only-old.txt "
+
+	## a later walk after both: only its own additions
+	_tinc_later=2026-04-01-000000
+	## unchanged files keep their mtime, as they do in a real snapshot
+	cp -Rp "$_tinc_fs/$_tinc_new" "$_tinc_fs/$_tinc_later"
+	: >"$_tinc_fs/$_tinc_later/a/brand-new.txt"
+	(
+		# shellcheck disable=SC2329
+		snap_mount() { return 0; }
+		# shellcheck disable=SC2329
+		snap_umount() { return 0; }
+		# shellcheck disable=SC2329
+		mnt_volume_path() { printf '%s/%s\n' "$_tinc_fs" "$2"; }
+		# shellcheck disable=SC2329
+		locate_tool() { printf '/usr/libexec/%s\n' "$1"; }
+		index_one store "$_tinc_later" >/dev/null 2>&1
+	)
+	## (its directory changed too: one more entry)
+	t_eq "a newer walk's increment holds only what it adds" \
+		"$(locate -d "$_tinc_ix/store.inc.02.db" '*' 2>/dev/null | tr '\n' ' ')" "/a /a/brand-new.txt "
+	rm -f "$_tinc_ix"/store.*db "$(index_covered_file store)"; rm -rf "$(vs_dir store)" "$_tinc_fs"
+}
+
 ## REGRESSION: the design promised an "exclusive size" column from tmutil
 ## uniquesize. That tool refuses on an APFS Time Machine store
 ## ("pathInAPFSBackup"), and nothing else on macOS reports per-snapshot space,
@@ -10791,6 +10868,7 @@ run_tests() {
 	t_test_image_orphan_adoption
 	t_test_snapshot_set_is_validated
 	t_test_no_exclusive_size_claims
+	t_test_index_increment_only_new
 	t_test_site_conf_dir_from_env
 	t_test_detached_store_still_answers
 	t_test_rm_needs_the_store
