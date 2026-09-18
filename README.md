@@ -1163,7 +1163,10 @@ my-tm --add /Volumes/<disk>/<host>.sparsebundle usbtm
   its parent is gone, so every interrupted run — a Ctrl-C, a dropped `ssh`
   session, a killed daemon — used to leave one behind, and they accumulated.
   my-tm stops its own attach when it exits or is interrupted (`HUP` included,
-  which is how a dropped `ssh` session ends a remote run).
+  which is how a dropped `ssh` session ends a remote run), and then hands back
+  its attach lock — so the next run neither waits on a dead owner nor warns
+  about an "interrupted run" that was your own Ctrl-C a second earlier. A lock
+  held by another live run is never touched.
 * **Kept for `IMAGE_GRACE` (default 10 min) after its last use**, then detached
   by the sweep. Measured against a NAS store: the first command costs **66 s**
   of attach and mount, and every command after it **1 s**. Detaching the moment

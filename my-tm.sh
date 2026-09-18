@@ -176,6 +176,9 @@ TRANSIENT_IMAGES="$RUN_DIR/images"
 ## The attach running right now, if any. A file, because image_attach is
 ## called inside $(...) and the pid would die with that subshell.
 ATTACH_PIDFILE="$RUN_DIR/attach.pid"
+## ...and the attach lock this run holds, so an interrupted run hands it back
+## instead of leaving the next one to wait for a dead owner and then break it
+ATTACH_LOCKFILE="$RUN_DIR/attach.lock"
 
 #############################################################################
 ## OUTPUT
@@ -2028,6 +2031,7 @@ image_attach() {
 		sleep 2
 	done
 	printf '%s\n' "$$" >"$_att_lock/owner" 2>/dev/null
+	printf '%s\n' "$_att_lock" >"$ATTACH_LOCKFILE" 2>/dev/null
 	## The run we waited for may have finished attaching it: check again now
 	## that the lock is ours, or waiting would end in a second attach anyway.
 	if _mp=$(image_mountpoint "$_img"); then
@@ -2124,6 +2128,8 @@ attach_unlock() {
 	[ -n "${1:-}" ] || return 0
 	rm -f "$1/owner"
 	rmdir "$1" 2>/dev/null
+	## handed back: nothing left for this run's cleanup to release
+	[ "$(cat "${ATTACH_LOCKFILE:-/nonexistent}" 2>/dev/null)" = "$1" ] && rm -f "$ATTACH_LOCKFILE"
 	return 0
 }
 
@@ -2639,15 +2645,28 @@ cleanup_run_dir() {
 ## them were found on one store, none finished. TERM alone does not stop
 ## hdiutil; KILL does.
 cleanup_attach() {
-	[ -f "${ATTACH_PIDFILE:-}" ] || return 0
-	_cat_p=$(cat "$ATTACH_PIDFILE" 2>/dev/null)
-	rm -f "$ATTACH_PIDFILE"
-	[ -n "$_cat_p" ] || return 0
-	kill -0 "$_cat_p" 2>/dev/null || return 0
-	kill "$_cat_p" 2>/dev/null
-	sleep 1
-	kill -0 "$_cat_p" 2>/dev/null && kill -9 "$_cat_p" 2>/dev/null
-	dbg "stopped the attach still running as pid $_cat_p"
+	if [ -f "${ATTACH_PIDFILE:-}" ]; then
+		_cat_p=$(cat "$ATTACH_PIDFILE" 2>/dev/null)
+		rm -f "$ATTACH_PIDFILE"
+		if [ -n "$_cat_p" ] && kill -0 "$_cat_p" 2>/dev/null; then
+			kill "$_cat_p" 2>/dev/null
+			sleep 1
+			kill -0 "$_cat_p" 2>/dev/null && kill -9 "$_cat_p" 2>/dev/null
+			dbg "stopped the attach still running as pid $_cat_p"
+		fi
+	fi
+	## Then the lock -- after the attach is stopped, never before, or a second
+	## run would start attaching the image while ours is still going. Only a
+	## lock whose owner is THIS run: a record that points at someone else's
+	## lock is released by them, not by us.
+	if [ -f "${ATTACH_LOCKFILE:-}" ]; then
+		_cat_l=$(cat "$ATTACH_LOCKFILE" 2>/dev/null)
+		rm -f "$ATTACH_LOCKFILE"
+		if [ -n "$_cat_l" ] && [ "$(cat "$_cat_l/owner" 2>/dev/null)" = "$$" ]; then
+			attach_unlock "$_cat_l"
+			dbg "released the attach lock $_cat_l"
+		fi
+	fi
 	return 0
 }
 
@@ -9903,8 +9922,27 @@ t_test_attach_is_not_orphaned() {
 	cleanup_attach
 	t_eq "killing the run leaves no attach behind" \
 		"$(kill -0 "$_atn_child" 2>/dev/null && echo alive || echo stopped)" "stopped"
+	## ...and no lock behind either: the next run must not wait on a dead owner
+	## and then announce it is breaking a lock, when the "interrupted run" was
+	## the reader's own Ctrl-C a second earlier
+	t_eq "and hands its attach lock back" \
+		"$([ -d "$MOUNT_ROOT/.attaching.$(slug "$_atn_img")" ] && echo held || echo released)" "released"
 	rm -rf "$_atn_img"; rm -f "$ATTACH_PIDFILE"
 	attach_unlock "$MOUNT_ROOT/.attaching.$(slug "$_atn_img")"
+
+	## adversarial: a record pointing at a lock ANOTHER live run holds must not
+	## release it -- that run is still attaching
+	_atn_lk="$MOUNT_ROOT/.attaching.someone-else"
+	mkdir -p "$_atn_lk"
+	sleep 30 &
+	_atn_other=$!
+	printf '%s\n' "$_atn_other" >"$_atn_lk/owner"
+	printf '%s\n' "$_atn_lk" >"$ATTACH_LOCKFILE"
+	cleanup_attach
+	t_eq "another run's lock is left to that run" \
+		"$([ -d "$_atn_lk" ] && echo held || echo released)" "held"
+	kill "$_atn_other" 2>/dev/null; wait "$_atn_other" 2>/dev/null
+	rm -f "$_atn_lk/owner"; rmdir "$_atn_lk" 2>/dev/null
 }
 
 ## Two runs asking for the same image at once started two attaches of it, which
