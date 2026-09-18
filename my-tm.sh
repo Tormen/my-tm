@@ -3644,6 +3644,24 @@ index_mark_covered() {
 ## --status
 #############################################################################
 
+## An empty row is a question -- why is there nothing, and what can I do about
+## it -- and a bare "-" answers neither. The cell carries a number, the answer
+## goes under the table: what is missing, why, and the command that fills it.
+## Never a subshell: the numbering has to survive back into the row loop.
+status_footnote() {             # <text>; sets FN_MARK
+	STATUS_FN_N=$(( ${STATUS_FN_N:-0} + 1 ))
+	FN_MARK="($STATUS_FN_N)"
+	STATUS_FN_TEXT="${STATUS_FN_TEXT:-}($STATUS_FN_N) $1
+"
+}
+
+## How long opening this store took the last time anyone did, if it is known --
+## from the record alone, never by reading the bands: a status stays instant.
+status_open_cost() {            # <target>
+	_soc_s=$(attach_measured "$1" 0 2>/dev/null) || return 1
+	printf ' (about %s, once)' "$(human_secs "$_soc_s")"
+}
+
 cmd_status() {
 	_only="${1:-}"
 	if [ -n "$_only" ]; then
@@ -3675,6 +3693,7 @@ _EOF
 	## also gathers the per-location index lines printed below the table.
 	_tbl="LOC	DESTINATION	SNAPS	SPAN	LAST	USED/FREE	INDEXED	INDEX	PER SNAP"
 	_now=$(now_epoch)
+	STATUS_FN_N=0; STATUS_FN_TEXT=""
 	while IFS="$(printf '\t')" read -r _h _t _idir; do
 		[ -n "${_h:-}" ] || continue
 		[ -n "$_only" ] && [ "$_h" != "$_only" ] && continue
@@ -3683,19 +3702,41 @@ _EOF
 		[ "$_t" = "local" ] && _dest="/ + /System/Volumes/Data"
 		_snaps="-"; _span="-"; _last="-"; _space="-"; _mark=""
 
+		FN_MARK=""
 		if [ "$(loc_kind "$_h")" = "image" ]; then
 			## an image is reported from what has already been read, never by
 			## attaching it here (see above)
 			_rows=$(snapshots_cached_only "$_h")
-			[ -n "$_rows" ] || _mark="?"
+			if [ -n "$_rows" ]; then
+				_mark="?"
+			else
+				status_footnote "$_h: nothing has been read from it yet, and a status never attaches a sparsebundle -- it would take minutes. Read it once with: $US --ls $_h$(status_open_cost "$_t")"
+				_mark="$FN_MARK"
+			fi
 		elif loc_ready "$_h"; then
 			_rows=$(snapshots_get "$_h")
+			if [ -z "$_rows" ]; then
+				if [ "$_t" = "local" ]; then
+					status_footnote "$_h: this Mac keeps no local snapshots right now -- Time Machine makes them while backing THIS Mac up, so a Mac that is only a backup TARGET has none. Check with: tmutil destinationinfo"
+				else
+					status_footnote "$_h: the store is readable but holds no backups yet -- Time Machine has not written one here"
+				fi
+				_mark="$FN_MARK"
+			fi
 		else
 			## not attached (ejected, unplugged, network destination): show the
 			## last known table marked "?", never nothing -- a disk that has not
 			## been written to for weeks is the thing --status exists to surface
-			_mark="?"
 			_rows=$(snapshots_cached_only "$_h")
+			if [ -n "$_rows" ]; then
+				_mark="?"
+			elif is_remote_target "$_t"; then
+				status_footnote "$_h: $(remote_host "$_t") is not answering, and nothing was ever read from it -- try again when that Mac is up, or: $US --ls $_h"
+				_mark="$FN_MARK"
+			else
+				status_footnote "$_h: the destination is not attached and nothing was ever read from it -- plug it in (or mount it), then: $US --ls $_h"
+				_mark="$FN_MARK"
+			fi
 		fi
 		if [ -n "$_rows" ]; then
 			_snaps=$(printf '%s\n' "$_rows" | count_lines)
@@ -3776,6 +3817,16 @@ $_h	$(printf '%s' "$_dest" | cut -c1-30)	$_snaps	$_span	$_last$_mark	$_space	$_i
 $_locs
 _EOF
 	printf '%s\n' "$_tbl" | table_align "llrlrrlrr"
+
+	## the numbers in the table, answered: why there is nothing, and what fills it
+	if [ -n "${STATUS_FN_TEXT:-}" ]; then
+		while IFS= read -r _fn_line; do
+			[ -n "$_fn_line" ] || continue
+			note "$_fn_line"
+		done <<_FNEOF
+$STATUS_FN_TEXT
+_FNEOF
+	fi
 
 	## locations the jobs cannot see into, each named once with the setting that
 	## would change it -- nothing for any other location
@@ -6053,8 +6104,15 @@ add_one() {
 	msg "added location '$_handle' -> $_folder"
 
 	if ! is_remote_target "$_folder"; then
-		_n=$(snap_names "$_handle" | count_lines)
+		## Scanned THROUGH the cache, not counted with snap_names: the store is
+		## open right now -- an image was just attached for its uuid, which costs
+		## minutes -- and counting alone would throw that away, leaving the next
+		## --status a blank row for a location that was just added.
+		_rows=$(snapshots_get "$_handle")
+		_n=$(printf '%s\n' "$_rows" | count_lines)
 		minor "$_n snapshots"
+		[ "$_n" -gt 0 ] &&
+			why "kept, so '$US' shows this store without opening it again"
 	fi
 	return 0
 }
@@ -9550,6 +9608,90 @@ t_test_index_increment_only_new() {
 	rm -f "$_tinc_ix"/store.*db "$(index_covered_file store)"; rm -rf "$(vs_dir store)" "$_tinc_fs"
 }
 
+## A row with nothing in it used to be a wall of "-": no snapshots, no span, no
+## last backup, and no way to tell whether the store was empty, unreadable, or
+## simply never opened -- which is exactly what was asked about a registered
+## sparsebundle. Each empty row now carries a number, answered under the table
+## with the reason AND the command that fills it in.
+## Adversarial: a row that HAS a cached table must keep its plain "?" and cost
+## no footnote, or every away-disk grows a pointless number; and the numbers in
+## the cells must match the answers under the table when there are several.
+## --add opened the store to identify it -- for a sparsebundle that is minutes
+## of attaching -- counted its snapshots for one line of output, and kept
+## nothing, so the location it had just added showed an empty row until
+## something else read it.
+t_test_add_caches_what_it_opened() {
+	printf '\nAdding a location keeps what opening it cost\n'
+	_ac_save=$(cat "$T_ROOT/cache/locations.tsv")
+	_ac_cf=$(snapshots_cache_file)
+	_ac_cache_save=""
+	[ -f "$_ac_cf" ] && _ac_cache_save=$(cat "$_ac_cf")
+
+	t_eq "nothing is cached for it before" \
+		"$(snapshots_cached_only fresh-add | count_lines)" "0"
+	_ac_err=$( ( add_one "$T_ROOT/store" fresh-add ) 2>&1 >/dev/null )
+	t_eq "adding it says nothing is wrong" \
+		"$(printf '%s' "$_ac_err" | count_match '!!!')" "0"
+	t_eq "and its table is cached the moment it is added" \
+		"$(snapshots_cached_only fresh-add | count_lines)" "2"
+	## which is the point: the row is filled in without opening the store again
+	t_eq "so a status shows it with no note" \
+		"$(cmd_status 2>&1 | count_match 'fresh-add: nothing has been read')" "0"
+
+	printf '%s\n' "$_ac_save" >"$T_ROOT/cache/locations.tsv"
+	locations_run_cache_drop
+	[ -n "$_ac_cache_save" ] && printf '%s\n' "$_ac_cache_save" >"$_ac_cf"
+	return 0
+}
+
+
+t_test_status_footnotes() {
+	printf '\nAn empty row says why, and what to do about it\n'
+	_sf_save=$(cat "$T_ROOT/cache/locations.tsv")
+
+	_sf_out=$(cmd_status 2>&1)
+	## the fixture's ssh location cannot be reached, and its store was never read
+	t_match "an empty row points at a note" "$_sf_out" "remote .*-(1)"
+	t_match "which says why there is nothing" "$_sf_out" "(1) remote: host1 is not answering"
+	t_match "and what can be done about it" "$_sf_out" "[-][-]ls remote"
+	t_eq "a location with a table gets no note" \
+		"$(printf '%s\n' "$_sf_out" | count_match 'store: nothing has been read')" "0"
+
+	## every number in the table is answered under it, and only once
+	_sf_marks=$(printf '%s\n' "$_sf_out" | sed -nE 's/.*-\(([0-9]+)\).*/\1/p' | sort -u | tr '\n' ' ')
+	_sf_notes=$(printf '%s\n' "$_sf_out" | sed -nE 's/^ --> \(([0-9]+)\) .*/\1/p' | sort -u | tr '\n' ' ')
+	t_eq "every number in the table has an answer under it" "$_sf_marks" "$_sf_notes"
+	t_ne "and there is at least one" "$_sf_marks" ""
+
+	## an unattached store nobody ever read names the disk, not a scan
+	t_match "an unattached store says so" "$_sf_out" "not attached and nothing was ever read"
+
+	## the same store WITH a cached table keeps the plain "?" and costs no number
+	printf 'awaystore\t/Volumes/NotHereAtAll\t\n' >>"$T_ROOT/cache/locations.tsv"
+	locations_run_cache_drop
+	printf 'awaystore\t2026-01-01-000000\t1767225600\taway77\t-\t-\t-\t-\t-\tok\tData\n' | t_cache_add
+	_sf_out2=$(cmd_status 2>&1)
+	t_match "a known-but-absent store is marked, not footnoted" "$_sf_out2" "awaystore .*[0-9][0-9]*d?"
+	t_eq "and gets no note of its own" \
+		"$(printf '%s\n' "$_sf_out2" | count_match 'awaystore: the destination is not attached')" "0"
+
+	## a sparsebundle that was never opened is the case this came from: the note
+	## must not tell the reader to wait for a status that will never attach one
+	printf 'bundle\t%s/nother.sparsebundle\t\n' "$T_ROOT" >>"$T_ROOT/cache/locations.tsv"
+	mkdir -p "$T_ROOT/nother.sparsebundle"
+	: >"$T_ROOT/nother.sparsebundle/Info.plist"
+	locations_run_cache_drop
+	_sf_out3=$(cmd_status 2>&1)
+	t_match "an unopened sparsebundle says a status never attaches one" \
+		"$_sf_out3" "never attaches a sparsebundle"
+	t_match "and names the command that reads it once" "$_sf_out3" "[-][-]ls bundle"
+
+	printf '%s\n' "$_sf_save" >"$T_ROOT/cache/locations.tsv"
+	locations_run_cache_drop
+	rm -rf "$T_ROOT/nother.sparsebundle"
+}
+
+
 ## The wait was announced as "this can take minutes over a share" -- on a local
 ## SATA disk, where no share is involved. What decides it is the SIZE of the
 ## store and the disk under it: a rotating disk seeks for every piece of APFS
@@ -11314,6 +11456,8 @@ run_tests() {
 	t_test_cache_excluded
 	t_test_config_search_order
 	t_test_attach_progress
+	t_test_add_caches_what_it_opened
+	t_test_status_footnotes
 	t_test_attach_estimate
 	t_test_attach_message_is_about_this_disk
 	t_test_attach_is_not_orphaned

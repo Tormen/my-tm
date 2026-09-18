@@ -236,7 +236,33 @@ $ my-tm 'invoice*.pdf'                             # = --find
  --> my-tm <path> for the version table · --all to expand every version here
 ```
 
-Rows from cache for an unmounted location are marked `?`.
+Rows from cache for an unmounted location are marked `?`. A row with nothing
+in it at all carries a **number** instead, answered under the table — why there
+is nothing, and the command that fills it in:
+
+```text
+ LOC     DESTINATION                     SNAPS  SPAN  LAST  USED/FREE    INDEXED
+ horse   /Volumes/backup/timeMachine/ho      -  -     -(1)  9.65T/4.90T  no
+ local   / + /System/Volumes/Data            -  -     -(2)            -  no
+ --> (1) horse: nothing has been read from it yet, and a status never attaches a
+         sparsebundle -- it would take minutes. Read it once with: my-tm --ls horse
+ --> (2) local: this Mac keeps no local snapshots right now -- Time Machine makes
+         them while backing THIS Mac up, so a Mac that is only a backup TARGET has
+         none. Check with: tmutil destinationinfo
+```
+
+`-` on its own would say none of that: empty, unreadable and never opened look
+identical, and the reader is left to guess which. The cases answered are a
+sparsebundle nobody has opened, a destination that is not attached, a host that
+is not answering, a store with no backups in it yet, and a Mac with no local
+snapshots. Where an image's attach has been timed before, the note says what it
+will cost.
+
+**Opening a store keeps what that cost.** `--add` attaches a sparsebundle to
+identify it — minutes, on a spinning disk — so it scans it through the cache
+while it is open, rather than counting the snapshots for one line of output and
+throwing the table away. A location is therefore never blank right after being
+added.
 
 **The index columns of `--status`.** `INDEXED` counts the snapshots the index
 covers that still exist, `no` for a location not opted in, and adds `now` while
