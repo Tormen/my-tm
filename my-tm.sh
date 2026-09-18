@@ -130,7 +130,7 @@ VS_GENERATION=2
 #############################################################################
 
 VRB=0; DBG=0; DEEPDBG=0; DBG_PATH=""
-JSON=0; OPT_ALL=0; LIMIT=""; FORCE=0; SRC=""
+JSON=0; OPT_ALL=0; LIMIT=""; FORCE=0; SRC=""; OPT_CACHED=0
 CONFIG_FILE=""; CONFIG_SOURCED=""
 EXIT_RC=0
 ## set by the daemons only.  A background job may read what is already
@@ -1306,8 +1306,7 @@ remote_reachable() {
 			no)  return 1 ;;
 		esac
 	fi
-	if ssh -o BatchMode=yes -o ConnectTimeout="${SSH_CONNECT_TIMEOUT:-3}" \
-		"$1" true >/dev/null 2>&1; then
+	if ssh_batch "$1" true >/dev/null 2>&1; then
 		_rr_a=yes
 	else
 		_rr_a=no
@@ -3498,10 +3497,16 @@ locate_tool() {
 	return 1
 }
 
-## every database to query for a location, colon-joined, system db first
+## every database to query for a location, colon-joined.
+## The system database (/var/db/locate.database) is THIS Mac's live disk, so it
+## belongs to `local` alone. Added for every location it answered for backups
+## it has nothing to do with: on ada, a search in horse's store -- which ada
+## had never indexed -- listed ada's own /Applications as if they were in
+## horse's history. A store is searched through its own index or not at all.
 index_dbs() {
 	_loc="$1"; _list=""
-	[ -f /var/db/locate.database ] && _list="/var/db/locate.database"
+	[ "$(loc_target "$_loc")" = "local" ] && [ -f /var/db/locate.database ] &&
+		_list="/var/db/locate.database"
 	for _d in $(cache_read_dirs); do
 		for _f in "$_d/index/$_loc.db" "$_d/index/$_loc".inc.*.db; do
 			[ -f "$_f" ] || continue
@@ -3700,7 +3705,7 @@ status_open_cost() {            # <target>
 cmd_status() {
 	_only="${1:-}"
 	if [ -n "$_only" ]; then
-		_only=$(loc_resolve "$_only" adhoc) || err "${1}: no such location. Try: $US --status"
+		_only=$(loc_resolve "$_only" adhoc) || err "$(no_such_location "$1")"
 	fi
 	_ix_lines=""
 	_locs=$(locations_all)
@@ -3729,6 +3734,9 @@ _EOF
 	_tbl="LOC	DESTINATION	SNAPS	SPAN	LAST	USED/FREE	INDEXED	INDEX	PER SNAP"
 	_now=$(now_epoch)
 	STATUS_FN_N=0; STATUS_FN_TEXT=""
+	## every read this status makes of ANOTHER Mac asks for that Mac's cached
+	## table only (remote_snap_names): a status opens nothing, here or there
+	STATUS_READ=1
 	while IFS="$(printf '\t')" read -r _h _t _idir; do
 		[ -n "${_h:-}" ] || continue
 		[ -n "$_only" ] && [ "$_h" != "$_only" ] && continue
@@ -3751,7 +3759,9 @@ _EOF
 		elif loc_ready "$_h"; then
 			_rows=$(snapshots_get "$_h")
 			if [ -z "$_rows" ]; then
-				if [ "$_t" = "local" ]; then
+				if is_remote_target "$_t"; then
+					status_footnote "$(remote_host "$_t") has not read it yet, and a status never makes it open the store -- it could take minutes there. Read it once with: $US --ls $_h"
+				elif [ "$_t" = "local" ]; then
 					status_footnote "this Mac keeps no local snapshots right now -- Time Machine makes them while backing THIS Mac up, so a Mac that is only a backup TARGET has none. Check with: tmutil destinationinfo"
 				else
 					status_footnote "the store is readable but holds no backups yet -- Time Machine has not written one here"
@@ -4031,7 +4041,7 @@ _EOF
 cmd_ls() {
 	_only="${1:-}"
 	if [ -n "$_only" ]; then
-		_only=$(loc_resolve "$_only" adhoc) || err "${1}: no such location. Try: $US --status"
+		_only=$(loc_resolve "$_only" adhoc) || err "$(no_such_location "$1")"
 		_locs="$_only"
 	else
 		_locs=$(locations_all | awk -F'\t' '{print $1}')
@@ -4043,8 +4053,14 @@ cmd_ls() {
 	_now=$(now_epoch)
 	while IFS= read -r _h; do
 		[ -n "$_h" ] || continue
-		_detached=0
-		if loc_ready "$_h"; then
+		_detached=0; _cached_only=0
+		if [ "$OPT_CACHED" = "1" ]; then
+			## asked for what is already known, and nothing more: nothing is
+			## mounted, attached or scanned. This is what a status on ANOTHER
+			## Mac asks, so its "instant" is not paid for in minutes here.
+			_rows=$(snapshots_cached_only "$_h")
+			_cached_only=1
+		elif loc_ready "$_h"; then
 			_rows=$(snapshots_get "$_h")
 		else
 			## the disk is away: the last known table is still worth showing
@@ -4056,7 +4072,9 @@ cmd_ls() {
 			## Printing nothing reads like "no backups exist", which may be the
 			## opposite of the truth -- the disk may simply be detached.
 			if [ -n "$_only" ]; then
-				if [ "$_detached" = "1" ]; then
+				if [ "$_cached_only" = "1" ]; then
+					note "$_h: nothing has been read from it yet -- $US --ls $_h opens it once"
+				elif [ "$_detached" = "1" ]; then
 					note "$_h is not attached, and nothing is remembered about it yet -- attach it, then: $US --refresh $_h"
 				else
 					note "$_h has no snapshots"
@@ -4067,6 +4085,8 @@ cmd_ls() {
 		[ -z "$_only" ] && printf '\n%s:\n' "$_h"
 		[ "$_detached" = "1" ] &&
 			note "$_h is not attached -- this is the last known table"
+		[ "$_cached_only" = "1" ] &&
+			note "$_h: the last known table (--cached opens nothing)"
 
 		_max="${LIMIT:-20}"
 		[ "$OPT_ALL" = "1" ] && _max=0
@@ -4366,10 +4386,13 @@ cmd_find() {
 	esac
 
 	_hits=$(mktemp /tmp/my-tm.find.XXXXXX) || return 1
+	_noidx=""
 	while IFS= read -r _h; do
 		[ -n "$_h" ] || continue
 		_dbs=$(index_dbs "$_h")
-		[ -n "$_dbs" ] || continue
+		## nothing to search in here -- remembered, so the answer can say so
+		## instead of reading as "no such file was ever backed up"
+		[ -n "$_dbs" ] || { _noidx="$_noidx $_h"; continue; }
 		run_echo locate -d "$_dbs" "$_pattern"
 		locate -d "$_dbs" "$_pattern" 2>/dev/null | sed -e 's|^.*\.backup/[^/]*||' |
 			grep '^/' >>"$_hits" 2>/dev/null || true
@@ -4380,6 +4403,12 @@ _EOF
 	_n=$(sort -u "$_hits" | count_lines)
 	if [ "$_n" -eq 0 ]; then
 		rm -f "$_hits"
+		## "no match" is only true of what was searched: a store with no index
+		## was not searched at all, and saying "no match" about it is a lie
+		if [ -n "$_noidx" ]; then
+			note "not indexed here, so not searched:${_noidx} -- index one: $US --index <LOCATION>"
+			return 0
+		fi
 		_l=$(printf '%s\n' "$_locs" | head -n 1)
 		_cov=$(index_covered_count "$_l")
 		_tot=$(snapshots_get "$_l" 2>/dev/null | count_lines)
@@ -4408,6 +4437,9 @@ _EOF
 	done
 	[ "$_max" -gt 0 ] && [ "$_n" -gt "$_max" ] &&
 		note "$(( _n - _max )) more (--all) · $US <path> for the version table"
+	## the hits are only from what WAS searched -- say what was not
+	[ -n "$_noidx" ] &&
+		note "not indexed here, so not searched:${_noidx} -- index one: $US --index <LOCATION>"
 	rm -f "$_hits"
 	return 0
 }
@@ -4898,7 +4930,7 @@ cmd_no_index() {
 	[ "$#" -ge 1 ] || err "--no-index needs a <LOCATION>"
 	_nxs=""
 	for _nx in "$@"; do
-		_nh=$(loc_resolve "$_nx") || err "no such location: $_nx ($US --status lists them)"
+		_nh=$(loc_resolve "$_nx") || err "$(no_such_location "$_nx")"
 		_nxs="$_nxs $_nh"
 	done
 	locations_writable "--no-index$_nxs"
@@ -4920,7 +4952,7 @@ cmd_rm_index() {
 	[ "$#" -ge 1 ] || err "--rm-index needs a <LOCATION>"
 	_rxs=""
 	for _rx in "$@"; do
-		_rh=$(loc_resolve "$_rx") || err "no such location: $_rx ($US --status lists them)"
+		_rh=$(loc_resolve "$_rx") || err "$(no_such_location "$_rx")"
 		_rxs="$_rxs $_rh"
 	done
 	locations_writable "--rm-index$_rxs"
@@ -5054,7 +5086,7 @@ index_remote() {
 	remote_run "$_h" --index "$(remote_path "$_t")" || return 1
 	if [ "${SHADOW_SSH_INDEX_FILES:-1}" = "1" ]; then
 		_dir=$(index_dir); need_dir "$_dir"
-		run scp "$_rhost:$CACHE_DIR/index/*.db" "$_dir/" 2>/dev/null ||
+		run scp_batch "$_rhost:$CACHE_DIR/index/*.db" "$_dir/" 2>/dev/null ||
 			dbg "no index database on $_rhost to shadow yet"
 	fi
 	return 0
@@ -5068,6 +5100,30 @@ index_remote() {
 ## `--install <host>` found or put there, whose directory locations.tsv
 ## records. That host's my-tm reads that host's own config; nothing is shipped
 ## from here, and nothing is ever run from a temporary copy.
+## Every ssh and scp my-tm starts takes its options from HERE, and nowhere
+## else -- the probe once had BatchMode while the command call beside it did
+## not, and the difference only showed as a hang.
+##
+## ControlMaster=no on all of them: may USE a shared connection, never BECOMES
+## one. With "ControlMaster auto" in an ssh config and no ControlPersist, the
+## first ssh to a host becomes the master and stays in the foreground, and a
+## master cannot exit while another session rides on it -- a status waited ten
+## minutes for the user to log out of an unrelated ssh to ada.
+##
+## Unattended calls (a probe, a question, a command that sends nothing) also
+## never prompt, give up on a host that does not answer, and never read the
+## terminal. Attended ones (--install, --uninstall) may ask: the reader is there.
+ssh_batch() {
+	ssh -n -o BatchMode=yes -o ConnectTimeout="${SSH_CONNECT_TIMEOUT:-3}" \
+		-o ControlMaster=no "$@"
+}
+scp_batch() {
+	scp -o BatchMode=yes -o ConnectTimeout="${SSH_CONNECT_TIMEOUT:-3}" \
+		-o ControlMaster=no "$@"
+}
+ssh_attended() { ssh -o ControlMaster=no "$@"; }
+scp_attended() { scp -o ControlMaster=no "$@"; }
+
 remote_run() {                  # <handle> <args...>
 	_rr_h="$1"; shift
 	_rr_t=$(loc_target "$_rr_h")
@@ -5076,10 +5132,7 @@ remote_run() {                  # <handle> <args...>
 	[ -n "$_rr_dir" ] ||
 		err "my-tm is not installed on $_rr_host -- run: $US --install $_rr_host"
 	# shellcheck disable=SC2029  # building the remote command line here is the point
-	## the same terms as remote_find_my_tm: never a password prompt, and a
-	## connection that cannot answer fails instead of hanging
-	ssh -o BatchMode=yes -o ConnectTimeout="${SSH_CONNECT_TIMEOUT:-3}" \
-		"$_rr_host" "$_rr_dir/my-tm $*"
+	ssh_batch "$_rr_host" "$_rr_dir/my-tm $*"
 }
 
 remote_snap_names() {
@@ -5090,7 +5143,14 @@ remote_snap_names() {
 	## sparsebundle there takes minutes, and swallowing its progress made that
 	## a silent hang here. Its lines are re-prefixed and named for the host, so
 	## it is never in doubt which machine is talking.
-	remote_run "$1" -J --ls "$(remote_path "$_t")" 2>&1 >"$_rsn_out" |
+	## A status asks for what the far side already knows, and nothing more: its
+	## own rule is to never open a store for a status line, and asking a remote
+	## to --ls would make it open one there -- a status on horse once waited
+	## 2m46s for ada to attach a sparsebundle. --cached comes BEFORE --ls, so a
+	## remote too old to know it refuses the call rather than opening anyway.
+	_rsn_c=""
+	[ "${STATUS_READ:-0}" = "1" ] && _rsn_c="--cached"
+	remote_run "$1" -J $_rsn_c --ls "$(remote_path "$_t")" 2>&1 >"$_rsn_out" |
 		LC_ALL=C awk -v h="$_rsn_host" '{
 			line = $0; sub(/^[[:space:]]*(>>>|>>|~~~|-->|!!!|>|~)[[:space:]]?/, "", line)
 			if (line == "") next
@@ -5269,7 +5329,7 @@ cmd_health() {
 	HEALTH_PROBLEMS=0; HEALTH_FIRST_FAIL=""; HEALTH_FIRST_WARN=""
 	_only="${1:-}"
 	if [ -n "$_only" ]; then
-		_locs=$(loc_resolve "$_only" adhoc) || err "${_only}: no such location. Try: $US --status"
+		_locs=$(loc_resolve "$_only" adhoc) || err "$(no_such_location "$_only")"
 	else
 		_locs=$(health_locations)
 	fi
@@ -5643,7 +5703,7 @@ cmd_thin() {
 	_policy=$(printf '%s' "$_policy" | sed 's/^ //')
 
 	if [ -n "$_loc" ]; then
-		_loc=$(loc_resolve "$_loc") || err "no such location: $_loc ($US --status lists them)"
+		_loc=$(loc_resolve "$_loc") || err "$(no_such_location "$_loc")"
 		_locs="$_loc"
 	else
 		_locs=$(locations_all | awk -F'\t' '{print $1}')
@@ -6123,8 +6183,7 @@ add_one() {
 			minor "$_ad_rh is not reachable right now -- registering it unchecked"
 		elif is_image_target "$_folder"; then
 			# shellcheck disable=SC2029  # the path is expanded HERE on purpose
-			if ssh -o BatchMode=yes -o ConnectTimeout="${SSH_CONNECT_TIMEOUT:-3}" \
-			     "$_ad_rh" "test -f '$_ad_rp/Info.plist'" >/dev/null 2>&1; then
+			if ssh_batch "$_ad_rh" "test -f '$_ad_rp/Info.plist'" >/dev/null 2>&1; then
 				minor "disk image store on $_ad_rh"
 			else
 				warn "$_ad_rp has no Info.plist on $_ad_rh -- it does not look like a sparsebundle"
@@ -6188,7 +6247,7 @@ cmd_forget() {
 cmd_refresh() {
 	_only="${1:-}"
 	if [ -n "$_only" ]; then
-		_only=$(loc_resolve "$_only" adhoc) || err "${1}: no such location. Try: $US --status"
+		_only=$(loc_resolve "$_only" adhoc) || err "$(no_such_location "$1")"
 	fi
 	## re-read every table that CAN be read; a disk that is away keeps its last
 	## known one, since nothing could replace it
@@ -6750,14 +6809,14 @@ install_remote() {
 		return 0
 	fi
 	if [ -z "$_ir_found" ]; then
-		run scp "$(abs_path "$0")" "$_h:$_idir/my-tm" || { warn "$_h: copy failed"; return 1; }
+		run scp_attended "$(abs_path "$0")" "$_h:$_idir/my-tm" || { warn "$_h: copy failed"; return 1; }
 	fi
 	_ir_ok=1
 	# shellcheck disable=SC2029  # building the remote command line here is the point
 	## chmod only a copy we just put there; a found one keeps the host's modes
 	if [ -n "$_ir_found" ]; then _ir_cmd="$_idir/my-tm --install go"
 	else _ir_cmd="chmod 0755 $_idir/my-tm && $_idir/my-tm --install go"; fi
-	run ssh "$_h" "$_ir_cmd" || {
+	run ssh_attended "$_h" "$_ir_cmd" || {
 		## The remote's output has streamed straight through, so anything it
 		## printed reads as though it came from HERE -- and a path like
 		## /LINKS/default/my-tm.conf exists on both machines, so there is nothing
@@ -6783,7 +6842,7 @@ install_remote() {
 ## link like /LINKS/sbin/my-tm needs.
 remote_find_my_tm() {           # <host>
 	# shellcheck disable=SC2029  # the list is expanded HERE, on purpose
-	ssh -o BatchMode=yes -o ConnectTimeout="${SSH_CONNECT_TIMEOUT:-3}" "$1" \
+	ssh_batch "$1" \
 		"for p in ${REMOTE_MY_TM_PATHS:-}; do [ -x \"\$p\" ] && { printf '%s\\n' \"\$p\"; exit 0; }; done; exit 1" \
 		2>/dev/null
 }
@@ -6809,7 +6868,7 @@ uninstall_remote() {
 		_ur_cmd="$_ur_dir/my-tm --uninstall go"
 		minor "leaving $_ur_dir/my-tm in place -- it is $_ur_h's own, not one --install copied"
 	fi
-	run ssh "$_ur_h" "$_ur_cmd" ||
+	run ssh_attended "$_ur_h" "$_ur_cmd" ||
 		warn "$_ur_h: remote --uninstall failed -- any message above it is ${_ur_h}'s my-tm"
 	if [ -n "${_ur_loc:-}" ] && [ -n "$(loc_install_dir "$_ur_loc")" ]; then
 		locations_writable "--uninstall $_ur_h"
@@ -7195,6 +7254,9 @@ OPTIONS
   -A|--all               no limits: all locations / all rows / all snapshots
   -L|--limit <N>         stop after N rows
   -J|--json              machine-readable output
+  --cached               --ls answers from what is already known, and opens
+                         nothing: no mount, no attach, no scan. What a status on
+                         another Mac asks, so its "instant" costs nothing here
   -f|--force             overwrite an existing destination (--cp),
                          force a busy unmount (--umount)
   -V|--verbose           echo each tmutil / mount_apfs / find command before it runs
@@ -7236,6 +7298,83 @@ rung() {
 }
 
 ## classify_one <word> -> "id|loc|glob|path <TAB> value"
+## The registered handle nearest a word that is not one, if it is near enough
+## to be a slip of the finger: at most two edits, and fewer than the word is
+## long -- "hore" is "horse", "x" is nobody.
+loc_nearest() {                 # <word>
+	locations_all | LC_ALL=C awk -F'\t' -v w="$1" '
+		function lev(a, b,    i, j, la, lb, c, d, x) {
+			la = length(a); lb = length(b)
+			for (j = 0; j <= lb; j++) d[0, j] = j
+			for (i = 1; i <= la; i++) {
+				d[i, 0] = i
+				for (j = 1; j <= lb; j++) {
+					c = (substr(a, i, 1) == substr(b, j, 1)) ? 0 : 1
+					x = d[i-1, j] + 1
+					if (d[i, j-1] + 1 < x) x = d[i, j-1] + 1
+					if (d[i-1, j-1] + c < x) x = d[i-1, j-1] + c
+					d[i, j] = x
+				}
+			}
+			return d[la, lb]
+		}
+		$1 != "" { e = lev(w, $1); if (best == "" || e < best) { best = e; h = $1 } }
+		END { if (best != "" && best <= 2 && best < length(w)) print h }'
+}
+
+## One wording for a location that does not exist, wherever it is asked --
+## with the handle that was probably meant, when there is one.
+no_such_location() {            # <word>
+	_nsl=$(loc_nearest "$1")
+	if [ -n "$_nsl" ]; then
+		printf "'%s': no such location -- did you mean '%s'? (%s --status lists them)" "$1" "$_nsl" "$US"
+	else
+		printf "'%s': no such location (%s --status lists them)" "$1" "$US"
+	fi
+}
+
+## A command typed without its dashes. Asked only of a word nothing else
+## claimed -- a snapshot ID or a location keeps its meaning, so a store named
+## "health" is still listed by `my-tm health`.
+## 0: a command that only reads, run on the word; 2: a command that changes
+## things or mounts, named but never run on a guess; 1: not a command at all.
+## The commands are read from --help's own list, so a new one is known here
+## the moment it is documented.
+bare_command() {                # <word> -> --command
+	case "$1" in
+		list|ls)     printf -- '--ls\n';     return 0 ;;
+		status)      printf -- '--status\n'; return 0 ;;
+		find|search) printf -- '--find\n';   return 0 ;;
+		lookup)      printf -- '--lookup\n'; return 0 ;;
+		show)        printf -- '--show\n';   return 0 ;;
+		health)      printf -- '--health\n'; return 0 ;;
+	esac
+	case " $(usage | sed -n '1,/^OPTIONS/p' | sed -nE 's/^ *--([a-z][a-z-]*).*/\1/p' | tr '\n' ' ') " in
+		*" $1 "*) printf -- '--%s\n' "$1"; return 2 ;;
+	esac
+	return 1
+}
+
+## Run a command a bare word named, saying what it was taken for.
+dispatch_bare_command() {       # <word> <--command> [<arg>]
+	minor "'$1' taken as $2"
+	case "$2" in
+		--ls)     cmd_ls ${3:+"$3"} ;;
+		--status) cmd_status ${3:+"$3"} ;;
+		--health) cmd_health ${3:+"$3"} ;;
+		--find)   [ -n "${3:-}" ] || err "--find needs a <GLOB>"; cmd_find "$3" ;;
+		--lookup) [ -n "${3:-}" ] || err "--lookup needs a <PATH>"; cmd_lookup "$3" ;;
+		--show)   [ -n "${3:-}" ] || err "--show needs an <ID>"; cmd_show "$3" ;;
+	esac
+}
+
+## Is this word already something -- a snapshot ID or a location -- and so NOT
+## to be read as a command?
+word_is_claimed() {
+	{ is_id_word "$1" && resolve_id "$1" >/dev/null 2>&1; } && return 0
+	loc_resolve "$1" >/dev/null 2>&1
+}
+
 classify_one() {
 	_w="$1"
 	if is_id_word "$_w" && resolve_id "$_w" >/dev/null 2>&1; then
@@ -7283,6 +7422,23 @@ classify_one() {
 
 ## the smart form: up to two bare words, in either order
 dispatch_bare() {
+	## A command without its dashes, in either position: `my-tm list horse`
+	## and `my-tm horse list` both mean --ls horse. Without this, `list` was a
+	## name to SEARCH for, and the search printed every path containing it.
+	if [ "$#" -ge 1 ] && ! word_is_claimed "$1"; then
+		if _bc=$(bare_command "$1"); then
+			dispatch_bare_command "$1" "$_bc" "${2:-}"; return $?
+		elif [ "$?" = "2" ]; then
+			err "'$1' changes things or mounts, so it is not run on a guess -- say it with its dashes: $US $_bc ..."
+		fi
+	fi
+	if [ "$#" -ge 2 ] && ! word_is_claimed "$2"; then
+		if _bc=$(bare_command "$2"); then
+			dispatch_bare_command "$2" "$_bc" "$1"; return $?
+		elif [ "$?" = "2" ]; then
+			err "'$2' changes things or mounts, so it is not run on a guess -- say it with its dashes: $US $_bc ..."
+		fi
+	fi
 	_c1=$(classify_one "$1")
 	_t1=$(printf '%s' "$_c1" | awk -F'\t' '{print $1}')
 	_v1=$(printf '%s' "$_c1" | awk -F'\t' '{print $2}')
@@ -7321,7 +7477,13 @@ dispatch_bare() {
 			_in=$(printf '%s' "$_hit" | awk -F'\t' '{print $1}')
 			err "$_v1 is a snapshot of '$_in', not of '$_v2'."
 			;;
-		*) err "cannot make sense of '$1' and '$2' together. See --help" ;;
+		*)
+			_bh=""
+			for _bw in "$1" "$2"; do
+				_bn=$(loc_nearest "$_bw")
+				[ -n "$_bn" ] && [ "$_bn" != "$_bw" ] && _bh="$_bh -- '$_bw': did you mean '$_bn'?"
+			done
+			err "cannot make sense of '$1' and '$2' together$_bh See --help" ;;
 	esac
 	return $?
 }
@@ -7358,6 +7520,7 @@ main() {
 				esac
 				;;
 			-A|--all) OPT_ALL=1 ;;
+			--cached) OPT_CACHED=1 ;;
 			-J|--json) JSON=1 ;;
 			-f|--force) FORCE=1 ;;
 			-L|--limit) LIMIT="${1:-}"; shift; _i=$(( _i + 1 )) ;;
@@ -9669,6 +9832,161 @@ t_test_index_increment_only_new() {
 ## Adversarial: a row that HAS a cached table must keep its plain "?" and cost
 ## no footnote, or every away-disk grows a pointless number; and the numbers in
 ## the cells must match the answers under the table when there are several.
+## D. my-tm's ssh became the connection MASTER (the user's ssh config says
+## ControlMaster auto, with no ControlPersist); the user then opened their own
+## ssh to that host, which rode on it, and a master cannot exit while a session
+## rides on it -- a status sat for ten minutes after ada had long finished.
+## Checked two ways: every ssh/scp line in the source carries the option (so a
+## new call cannot slip in beside the helpers), and every call really made has it.
+t_test_ssh_never_becomes_a_master() {
+	printf '\nNo ssh my-tm starts becomes a connection master\n'
+	_sm_t=$(grep -n '^t_setup()' "$T_MYTM" | cut -d: -f1)
+	_sm_bad=$(awk -v t="$_sm_t" '
+		NR >= t { exit }
+		/^[[:space:]]*#/ { next }
+		/(^|[{;&|(]|if |run |! )[[:space:]]*(ssh|scp)[[:space:]]/ {
+			line = $0; n = NR
+			while (line ~ /\\$/ && (getline nx) > 0) line = line nx
+			if (line !~ /ControlMaster=no/) print n ": " line
+		}' "$T_MYTM")
+	t_eq "every ssh and scp in the source is kept from becoming a master" "$_sm_bad" ""
+
+	: >"$(t_calls)"
+	( RUN_CACHE=0; remote_reachable host1 ) >/dev/null 2>&1
+	( remote_find_my_tm host1 ) >/dev/null 2>&1
+	( remote_run remote --ls /x ) >/dev/null 2>&1
+	_sm_made=$(grep '^ssh ' "$(t_calls)")
+	t_ne "(the calls were made)" "$(printf '%s\n' "$_sm_made" | count_lines)" "0"
+	t_eq "every ssh actually run carries ControlMaster=no" \
+		"$(printf '%s\n' "$_sm_made" | grep -vc 'ControlMaster=no')" "0"
+	t_eq "and none of them reads the terminal" \
+		"$(printf '%s\n' "$_sm_made" | grep -vc -- '-n ')" "0"
+}
+
+## C. A status on horse asked ada to --ls a sparsebundle there, which opened it:
+## the "instant" status waited 2m46s. A status asks for the far side's CACHED
+## table only; anything else that asks may still open it.
+t_test_status_asks_remotes_for_their_cache() {
+	printf '\nA status never makes another Mac open a store\n'
+	_sc_stub="$(t_stub_dir)/ssh"
+	cp "$_sc_stub" "$T_ROOT/ssh.orig"
+	## this test empties the snapshot cache to make each read go to the
+	## remote; the tests after it depend on what was in it, so it goes back
+	_sc_cf=$(snapshots_cache_file)
+	rm -f "$T_ROOT/cache.save"
+	[ -f "$_sc_cf" ] && cp -p "$_sc_cf" "$T_ROOT/cache.save"
+	{
+		printf '#!/bin/sh\n'
+		printf 'printf "ssh %%s\\n" "$*" >>"%s"\n' "$(t_calls)"
+		printf '%s\n' 'case "$*" in *" true") exit 0 ;; esac'
+		printf '%s\n' 'printf "[\n  {\"location\": \"x\", \"snapshot\": \"2026-02-03-040506\"}\n]\n"'
+		printf 'exit 0\n'
+	} >"$_sc_stub"
+	chmod 0755 "$_sc_stub"
+
+	: >"$(t_calls)"
+	rm -f "$(snapshots_cache_file)"
+	cmd_status >/dev/null 2>&1
+	t_match "a status asks the remote for its cached table" \
+		"$(grep ' --ls ' "$(t_calls)")" "[-][-]cached [-][-]ls"
+
+	## the other way round: a plain --ls of the remote may open it -- asked for
+	: >"$(t_calls)"
+	rm -f "$(snapshots_cache_file)"
+	( STATUS_READ=0; cmd_ls remote ) >/dev/null 2>&1
+	t_eq "an explicit --ls of the remote does not restrict it" \
+		"$(grep ' --ls ' "$(t_calls)" | grep -c -- '--cached')" "0"
+
+	cp "$T_ROOT/ssh.orig" "$_sc_stub"; chmod 0755 "$_sc_stub"; rm -f "$T_ROOT/ssh.orig"
+
+	## and the answering side opens nothing: an image with a cached table is
+	## listed from it, and hdiutil is never asked to attach anything
+	_sc_img="$T_ROOT/cachedonly.sparsebundle"; mkdir -p "$_sc_img/bands"
+	: >"$_sc_img/Info.plist"
+	_sc_save=$(cat "$T_ROOT/cache/locations.tsv")
+	printf 'cimg\t%s\t\n' "$_sc_img" >>"$T_ROOT/cache/locations.tsv"
+	locations_run_cache_drop
+	printf 'cimg\t2026-01-01-000000\t1767225600\tcimg01\t-\t-\t-\t-\t-\tok\tData\n' | t_cache_add
+	## STALE, so that anything but --cached would go and open the image to
+	## rescan it -- a fresh cache is answered from without opening anyway, and
+	## would prove nothing about --cached
+	touch -t 202001010000 "$(snapshots_cache_file)"
+	_sc_h="$(t_stub_dir)/hdiutil"; cp "$_sc_h" "$T_ROOT/hdiutil.orig"
+	{ printf '#!/bin/sh\n'; printf 'printf "hdiutil %%s\\n" "$*" >>"%s"\n' "$(t_calls)"; printf 'exit 1\n'; } >"$_sc_h"
+	chmod 0755 "$_sc_h"
+	: >"$(t_calls)"
+	## the control: without --cached the stale table IS rescanned, which here
+	## means asking hdiutil to attach -- else the next check proves nothing
+	( OPT_CACHED=0; cmd_ls cimg ) >/dev/null 2>&1
+	t_ne "(without --cached, the stale image is opened to rescan it)" \
+		"$(grep -c 'hdiutil attach' "$(t_calls)")" "0"
+	touch -t 202001010000 "$(snapshots_cache_file)"
+	: >"$(t_calls)"
+	_sc_out=$( ( OPT_CACHED=1; cmd_ls cimg ) 2>&1 )
+	t_eq "--cached attaches nothing" "$(grep -c 'hdiutil attach' "$(t_calls)")" "0"
+	t_match "and answers from the cache" "$_sc_out" "cimg01"
+	cp "$T_ROOT/hdiutil.orig" "$_sc_h"; chmod 0755 "$_sc_h"; rm -f "$T_ROOT/hdiutil.orig"
+	printf '%s\n' "$_sc_save" >"$T_ROOT/cache/locations.tsv"
+	locations_run_cache_drop
+	rm -rf "$_sc_img"
+	if [ -f "$T_ROOT/cache.save" ]; then mv -f "$T_ROOT/cache.save" "$_sc_cf"; else rm -f "$_sc_cf"; fi
+}
+
+## A. --find added THIS Mac's live-disk database to every location's search. On
+## ada, a search in horse's store -- never indexed there -- listed ada's own
+## /Applications as horse's history: an answer that was confidently wrong.
+t_test_find_searches_only_the_stores_index() {
+	printf '\nA store is searched through its own index, never this Mac'"'"'s live disk\n'
+	t_eq "a backup store is not given the live-disk database" \
+		"$(index_dbs store | count_match '/var/db/locate.database')" "0"
+	if [ -f /var/db/locate.database ]; then
+		t_eq "local, the live disk, is" \
+			"$(index_dbs local | count_match '/var/db/locate.database')" "1"
+	else
+		t_skip "local gets the live-disk database" "/var/db/locate.database not present"
+	fi
+	rm -f "$(index_dir)"/store.*db "$(index_dir)/store.db"
+	_fs_out=$(cmd_find 'Info.plist' store 2>&1)
+	t_match "a store with no index says it was not searched" "$_fs_out" "not indexed here, so not searched: store"
+	t_eq "and lists nothing as if it had been" \
+		"$(printf '%s\n' "$_fs_out" | count_match '^ /')" "0"
+}
+
+## B. `my-tm list horse`: "list" was taken as a NAME to search for, so my-tm
+## printed 83,254 paths containing it. A command word without its dashes runs
+## the command when it only reads, and is refused -- named -- when it changes
+## things. Adversarial: a location that happens to be named like a command
+## keeps its meaning, and a real search for a plain name still searches.
+t_test_bare_command_words() {
+	printf '\nA command typed without its dashes is read as that command\n'
+	_bw_out=$(dispatch_bare list store 2>&1)
+	t_match "'list store' lists the store" "$_bw_out" "'list' taken as --ls"
+	t_match "(it is the --ls table)" "$_bw_out" "SNAPSHOT"
+	t_match "'store list' means the same" "$(dispatch_bare store list 2>&1)" "'list' taken as --ls"
+	_bw_rm=$( ( dispatch_bare rm store ) 2>&1 )
+	t_match "a command that changes things is not run on a guess" "$_bw_rm" "not run on a guess"
+	t_match "and it names the real command" "$_bw_rm" "[-][-]rm"
+
+	## a word that already means something keeps that meaning
+	_bw_save=$(cat "$T_ROOT/cache/locations.tsv")
+	printf 'health\t%s/store\t\n' "$T_ROOT" >>"$T_ROOT/cache/locations.tsv"
+	locations_run_cache_drop
+	t_eq "a location named 'health' is listed, not taken as --health" \
+		"$(dispatch_bare health 2>&1 | count_match 'taken as')" "0"
+	printf '%s\n' "$_bw_save" >"$T_ROOT/cache/locations.tsv"
+	locations_run_cache_drop
+
+	## a plain name that is no command is still a search
+	t_eq "a plain name is still searched for" \
+		"$(dispatch_bare some-file-name 2>&1 | count_match 'taken as')" "0"
+
+	## the near miss
+	t_match "a location one letter off is named" "$( ( cmd_ls stroe ) 2>&1 )" "did you mean 'store'"
+	t_eq "a word nowhere near one is not given a guess" \
+		"$( ( cmd_ls zzzzzzzz ) 2>&1 | count_match 'did you mean')" "0"
+	t_match "and 'list stroe' gets there too" "$( ( dispatch_bare list stroe ) 2>&1 )" "did you mean 'store'"
+}
+
 ## "Every dash is explained" is a promise that rots the moment a column is
 ## added, so it is checked rather than remembered: every cell that is just "-"
 ## must be answered, either by its row's number or by a footer line naming that
@@ -11565,6 +11883,10 @@ run_tests() {
 	t_test_cache_excluded
 	t_test_config_search_order
 	t_test_attach_progress
+	t_test_ssh_never_becomes_a_master
+	t_test_status_asks_remotes_for_their_cache
+	t_test_find_searches_only_the_stores_index
+	t_test_bare_command_words
 	t_test_every_dash_is_explained
 	t_test_add_caches_what_it_opened
 	t_test_status_footnotes

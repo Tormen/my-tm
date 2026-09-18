@@ -190,6 +190,28 @@ always a name, `~/a/invoice*.pdf` a name anchored to that directory;
 command you would have typed. Relative paths resolve against `$PWD` first; give
 `--find` an `<ID>` to search the relative form *inside* a snapshot instead.
 
+**A command typed without its dashes is that command** — asked only of a word
+the ladder's first two rungs did not claim, so a snapshot ID or a location
+keeps its meaning (a store named `health` is still listed by `my-tm health`).
+Commands that only read run on the word, and say what they took it for:
+
+```text
+$ my-tm list horse              # same as: my-tm horse list
+    > 'list' taken as --ls
+```
+
+`ls`/`list`, `status`, `find`/`search`, `lookup`, `show` and `health` run this
+way. Every other command — the ones that change things or mount — is named and
+refused rather than run on a guess (`'rm' changes things or mounts, so it is
+not run on a guess -- say it with its dashes: my-tm --rm ...`). Without this
+rule, `list` fell through to rung 6 and was searched for as a name, and the
+search printed every path containing it.
+
+**A location name that is one slip off is named, not just refused:**
+`'hore': no such location -- did you mean 'horse'?` — at most two edits, and
+never a guess for a word nowhere near any handle. Every command that takes a
+location answers in that one wording.
+
 A second bare word refines, **in either order** — each bare word is classified
 independently, so `my-tm <PATH> <LOCATION>` and `my-tm <LOCATION> <PATH>` mean
 the same thing: limit to that location. `<ID> <PATH>` (or `<PATH> <ID>`)
@@ -400,7 +422,8 @@ several databases at once, with globs. No dependency, no daemon, no new format.
 *(Verified on macOS 26 before this design was written.)*
 
 ```text
-$CACHE_DIR/index/system.db     -> the live volume: reuse /var/db/locate.database (free)
+$CACHE_DIR/index/system.db     -> the live volume: reuse /var/db/locate.database (free),
+                                  searched for `local` ONLY -- see below
 $CACHE_DIR/index/<loc>.db      -> consolidated union of paths seen in that history
 $CACHE_DIR/index/<loc>.inc.NN.db -> per-snapshot increments (new paths only), folded in on consolidation
 $CACHE_DIR/index/<loc>.covered -> snapshot IDs already indexed
@@ -523,6 +546,13 @@ $CACHE_DIR/index/<loc>.versions/ -> the version store: a baseline plus one
   harmless to a query — they only cost space until the next consolidation,
   which is the usual log-structured trade and the reason an `--index` run never
   has to read the existing index first.
+* **A store is searched through its own index, or not at all.** The system
+  database is THIS Mac's live disk, so it answers for `local` and nothing else.
+  It used to be added to every location's search: on ada, a search in horse's
+  store — which ada had never indexed — listed ada's own `/Applications` as
+  horse's history. A store with no index now says so instead of answering:
+  `not indexed here, so not searched: horse -- index one: my-tm --index <LOCATION>`,
+  and the same line follows a result list when some locations were not searched.
 * **my-tm tells you when it is behind**: a `--find` that comes up empty says
   `index covers 12/412 snapshots (my-tm --index backup)` instead of claiming the
   file never existed.
@@ -1077,11 +1107,35 @@ location. Assuming reachability was worse than the round trip: `--health` used
 to report *"no snapshots found"* for a Mac that was merely switched off, which
 reads as data loss.
 
-**Every ssh my-tm makes is on the same terms**, the command calls included:
-`BatchMode` (never a password prompt nobody is there to answer) and
-`SSH_CONNECT_TIMEOUT`. The reachability probe had both while the command call
-beside it had neither, so a host that accepted the connection and then went
-quiet hung with nothing on screen.
+**Every ssh and scp my-tm makes takes its options from one place**, so no call
+can drift from the others (the reachability probe once had `BatchMode` while
+the command call beside it did not):
+
+* `ControlMaster=no` on all of them — each may *use* a shared connection but
+  never *becomes* one. With `ControlMaster auto` in an ssh config and no
+  `ControlPersist`, the first `ssh ada` becomes the master and stays in the
+  foreground, and a master cannot exit while another session rides on it: a
+  status on horse sat for ten minutes because the user had meanwhile opened
+  their own `ssh ada`, long after ada had answered.
+* the unattended ones — the probe, `--add`'s check, finding my-tm on the
+  host, every command call, copying the index back — also get `BatchMode`
+  (never a password prompt nobody answers), `SSH_CONNECT_TIMEOUT`, and `-n`
+  (they never read your terminal).
+* `--install` and `--uninstall` on a host are attended: those may ask.
+
+Independently of my-tm, `ControlPersist 10m` beside `ControlMaster auto` in
+`~/.ssh/config` (yours and root's) stops ANY tool's ssh from becoming a
+foreground master; my-tm just does not rely on it.
+
+**A status never makes another Mac open a store.** A status asks the far side
+for its table with `--cached`, which answers from what that Mac already knows
+and opens nothing — no mount, no attach, no scan. Asking it to `--ls` instead
+made ada attach a 4 T sparsebundle for a status line on horse: 2m46s for a
+command that is meant to be instant. An explicit `my-tm --ls horse@ada` still
+opens it, because there you asked for it. What ada has not read yet shows as a
+footnote naming that command. `--cached` goes before `--ls` on the wire, so a
+far side too old to know it refuses the call rather than opening the store —
+both Macs need this build for the row to fill.
 
 **What the remote is doing shows up here.** The far side does the slow work —
 attaching a sparsebundle there takes minutes — and its progress used to be
