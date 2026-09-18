@@ -271,19 +271,23 @@ is -- a free space from two weeks ago is a different claim from today's:
 
 A destination that is away and was never measured has no number to remember,
 so it keeps a footnote instead of an invented `??`. A row with nothing
-in it at all carries a **number** instead, answered under the table — why there
-is nothing, and the command that fills it in:
+in it at all carries a **superscript number** instead, answered under the
+table — why there is nothing, and the command that fills it in:
 
 ```text
  LOC     DESTINATION                     SNAPS  SPAN  LAST  USED/FREE    INDEXED
- horse   /Volumes/backup/timeMachine/ho      -  -     -(1)  9.65T/4.90T  no
- local   / + /System/Volumes/Data            -  -     -(2)            -  no
- --> (1) horse: nothing has been read from it yet, and a status never attaches a
-         sparsebundle -- it would take minutes. Read it once with: my-tm --ls horse
- --> (2) local: this Mac keeps no local snapshots right now -- Time Machine makes
-         them while backing THIS Mac up, so a Mac that is only a backup TARGET has
-         none. Check with: tmutil destinationinfo
+ horse   /Volumes/backup/timeMachine/ho      -  -     -¹    9.65T/4.90T  no
+ local   / + /System/Volumes/Data            -  -     -²             -²  no
+ --> ¹ horse: nothing has been read from it yet, and a status never attaches a
+       sparsebundle -- it would take minutes. Read it once with: my-tm --ls horse
+ --> ² local: this Mac keeps no local snapshots right now -- Time Machine makes
+       them while backing THIS Mac up, so a Mac that is only a backup TARGET has
+       none. Check with: tmutil destinationinfo
 ```
+
+A mark takes one column per digit, where `(1)` took three. Columns are sized
+by CHARACTERS, not bytes, so a multi-byte mark -- or a destination path with an
+umlaut -- stays in line with the rows around it.
 
 `-` on its own would say none of that: empty, unreadable and never opened look
 identical, and the reader is left to guess which. The cases answered are a

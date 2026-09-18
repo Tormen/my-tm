@@ -3676,10 +3676,26 @@ index_mark_covered() {
 ## AND no free space, and saying so twice in one line is noise. Reasons given
 ## for the same row are joined into its one note.
 ## Never a subshell: the numbering has to survive back into the row loop.
+## A footnote number as superscript digits: "-¹" in the cell, "¹ horse: ..."
+## under the table -- one column per digit, where "(1)" took three.
+superscript() {                 # <number>
+	_ss_n="$1"; _ss_o=""
+	while [ -n "$_ss_n" ]; do
+		case "$_ss_n" in
+			0*) _ss_o="${_ss_o}⁰" ;; 1*) _ss_o="${_ss_o}¹" ;; 2*) _ss_o="${_ss_o}²" ;;
+			3*) _ss_o="${_ss_o}³" ;; 4*) _ss_o="${_ss_o}⁴" ;; 5*) _ss_o="${_ss_o}⁵" ;;
+			6*) _ss_o="${_ss_o}⁶" ;; 7*) _ss_o="${_ss_o}⁷" ;; 8*) _ss_o="${_ss_o}⁸" ;;
+			9*) _ss_o="${_ss_o}⁹" ;;
+		esac
+		_ss_n=${_ss_n#?}
+	done
+	printf '%s' "$_ss_o"
+}
+
 status_footnote() {             # <text>; sets FN_MARK, appends to this row's note
 	if [ -z "${FN_MARK:-}" ]; then
 		STATUS_FN_N=$(( ${STATUS_FN_N:-0} + 1 ))
-		FN_MARK="($STATUS_FN_N)"
+		FN_MARK=$(superscript "$STATUS_FN_N")
 		FN_ROW="$1"
 	else
 		FN_ROW="$FN_ROW · $1"
@@ -3997,21 +4013,30 @@ _EOF
 ## 202.8x! -- pushed every column after it out of line, on exactly the row
 ## that deserved attention. SPEC holds one letter per column: l or r.
 table_align() {
-	awk -F'\t' -v spec="$1" '
+	## Widths are counted in CHARACTERS. This awk counts bytes, in every
+	## locale, so a cell holding a footnote mark "¹" (2 bytes) or a path with
+	## an umlaut was padded short and pushed its row out of line. A UTF-8
+	## continuation byte (0x80-0xBF) takes no column of its own, so it is not
+	## counted -- and the padding is written by hand, since printf's %-Ns
+	## would count bytes again.
+	LC_ALL=C awk -F'\t' -v spec="$1" '
+		function dw(s,    t) { t = s; return length(s) - gsub(/[\200-\277]/, "", t) }
+		function sp(k,    p) { p = ""; while (k-- > 0) p = p " "; return p }
 		{
 			n[NR] = NF
 			for (i = 1; i <= NF; i++) {
 				c[NR, i] = $i
-				if (length($i) > w[i]) w[i] = length($i)
+				if (dw($i) > w[i]) w[i] = dw($i)
 			}
 		}
 		END {
 			for (r = 1; r <= NR; r++) {
 				line = ""
 				for (i = 1; i <= n[r]; i++) {
-					if (substr(spec, i, 1) == "r") cell = sprintf("%" w[i] "s", c[r, i])
+					fill = sp(w[i] - dw(c[r, i]))
+					if (substr(spec, i, 1) == "r") cell = fill c[r, i]
 					else if (i == n[r]) cell = c[r, i]
-					else cell = sprintf("%-" w[i] "s", c[r, i])
+					else cell = c[r, i] fill
 					line = line (i > 1 ? "  " : " ") cell
 				}
 				print line
@@ -7710,6 +7735,11 @@ t_match() {
 
 t_stub_dir() { printf '%s/stub\n' "$T_ROOT"; }
 
+## superscript footnote marks back to "(n)", so a test pattern stays readable
+t_unsup() {
+	perl -CSD -Mutf8 -pe 's/([⁰¹²³⁴⁵⁶⁷⁸⁹]+)/"(" . ($1 =~ tr{⁰¹²³⁴⁵⁶⁷⁸⁹}{0123456789}r) . ")"/ge'
+}
+
 ## Append rows to the snapshot cache the way my-tm does, so its integrity
 ## header stays correct -- appending raw lines is exactly the damage the
 ## checksum exists to catch.
@@ -9892,6 +9922,26 @@ t_test_index_increment_only_new() {
 ## Adversarial: a row that HAS a cached table must keep its plain "?" and cost
 ## no footnote, or every away-disk grows a pointless number; and the numbers in
 ## the cells must match the answers under the table when there are several.
+## Footnote marks are superscript digits ("-¹", "¹ horse: ..."), and they
+## exposed a real bug: this awk counts BYTES, so a 2-byte "¹" -- or a path
+## with an umlaut -- was padded one column short and pushed its row out of
+## line. Adversarial: every line must come out the same width in CHARACTERS
+## when the last column is the same, whatever multi-byte cell sits before it.
+t_test_superscript_marks_and_alignment() {
+	printf '\nFootnote marks are superscript, and the table stays aligned\n'
+	t_eq "numbers become superscript digits" "$(superscript 1) $(superscript 12) $(superscript 90)" "¹ ¹² ⁹⁰"
+	_sa_raw=$(cmd_status 2>&1)
+	t_match "a cell carries a superscript mark" "$_sa_raw" "[-]¹"
+	t_match "and its answer starts with it" "$_sa_raw" "^ --> ¹ "
+	t_eq "no (n) is left" "$(printf '%s\n' "$_sa_raw" | count_match '[-]([0-9])')" "0"
+
+	_sa_tbl=$(printf 'A\tLAST\tDEST\tE\nx\t-\t/Volumes/plain\tz\nyy\t-¹\t/Volumes/Größe\tz\nzz\t26d?\t/Volumes/Ω\tz\n' | table_align "lrll")
+	_sa_w=$(printf '%s\n' "$_sa_tbl" | perl -CSD -ne 'chomp; print length($_), "\n"' | sort -u | tr '\n' ' ')
+	t_eq "every row is the same width in characters" "$(printf '%s' "$_sa_w" | wc -w | tr -d ' ')" "1"
+	t_eq "(and the multi-byte cells really were there)" \
+		"$(printf '%s\n' "$_sa_tbl" | count_match 'Größe')" "1"
+}
+
 ## A detached disk's USED/FREE said "cannot be measured" while the footer, two
 ## lines down, still quoted its free space from the usage series. The cell now
 ## shows that last measurement marked "??", and the legend says what "??" and
@@ -9901,7 +9951,7 @@ t_test_status_remembered_space() {
 	printf '\nA detached disk shows its space as last measured, marked ??\n'
 	_rs_uf="$(cache_write_dir)/usage.ejectedstore.tsv"
 	rm -f "$_rs_uf"
-	_rs_out=$(cmd_status 2>&1)
+	_rs_out=$(cmd_status 2>&1 | t_unsup)
 	t_eq "never measured: no ?? is invented" \
 		"$(printf '%s\n' "$_rs_out" | awk '/^ ejectedstore /' | count_match '[?][?]')" "0"
 	t_match "and the cell keeps its note" "$(printf '%s\n' "$_rs_out" | awk '/^ ejectedstore /')" "[-]([0-9])"
@@ -10124,7 +10174,7 @@ t_test_bare_command_words() {
 ## answer fails here rather than in front of the reader.
 t_test_every_dash_is_explained() {
 	printf '\nEvery "-" in the table is answered somewhere\n'
-	_ed_out=$(cmd_status 2>&1)
+	_ed_out=$(cmd_status 2>&1 | t_unsup)
 	_ed_tbl=$(printf '%s\n' "$_ed_out" | sed -n '2,$p' | sed -n '/^ -->/q;p')
 	_ed_head=$(printf '%s\n' "$_ed_out" | sed -n '1p')
 	_ed_notes=$(printf '%s\n' "$_ed_out" | sed -n 's/^ --> //p')
@@ -10187,7 +10237,7 @@ t_test_status_footnotes() {
 	printf '\nAn empty row says why, and what to do about it\n'
 	_sf_save=$(cat "$T_ROOT/cache/locations.tsv")
 
-	_sf_out=$(cmd_status 2>&1)
+	_sf_out=$(cmd_status 2>&1 | t_unsup)
 	## the fixture's ssh location cannot be reached, and its store was never read
 	t_match "an empty row points at a note" "$_sf_out" "remote .*-(1)"
 	t_match "which says why there is nothing" "$_sf_out" "(1) remote: host1 is not answering"
@@ -10208,7 +10258,7 @@ t_test_status_footnotes() {
 	printf 'awaystore\t/Volumes/NotHereAtAll\t\n' >>"$T_ROOT/cache/locations.tsv"
 	locations_run_cache_drop
 	printf 'awaystore\t2026-01-01-000000\t1767225600\taway77\t-\t-\t-\t-\t-\tok\tData\n' | t_cache_add
-	_sf_out2=$(cmd_status 2>&1)
+	_sf_out2=$(cmd_status 2>&1 | t_unsup)
 	t_match "a known-but-absent store is marked, not footnoted" "$_sf_out2" "awaystore .*[0-9][0-9]*d?"
 	t_eq "and gets no note of its own" \
 		"$(printf '%s\n' "$_sf_out2" | count_match 'awaystore: the destination is not attached')" "0"
@@ -10219,7 +10269,7 @@ t_test_status_footnotes() {
 	mkdir -p "$T_ROOT/nother.sparsebundle"
 	: >"$T_ROOT/nother.sparsebundle/Info.plist"
 	locations_run_cache_drop
-	_sf_out3=$(cmd_status 2>&1)
+	_sf_out3=$(cmd_status 2>&1 | t_unsup)
 	t_match "an unopened sparsebundle says a status never attaches one" \
 		"$_sf_out3" "never attaches a sparsebundle"
 	t_match "and names the command that reads it once" "$_sf_out3" "[-][-]ls bundle"
@@ -12013,6 +12063,7 @@ run_tests() {
 	t_test_cache_excluded
 	t_test_config_search_order
 	t_test_attach_progress
+	t_test_superscript_marks_and_alignment
 	t_test_status_remembered_space
 	t_test_suite_never_notifies_a_person
 	t_test_ssh_never_becomes_a_master
