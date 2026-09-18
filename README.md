@@ -1117,6 +1117,10 @@ the command call beside it did not):
   foreground, and a master cannot exit while another session rides on it: a
   status on horse sat for ten minutes because the user had meanwhile opened
   their own `ssh ada`, long after ada had answered.
+* `ClearAllForwardings=yes` on all of them too — the port forwards in an ssh
+  config (ada's: VNC on 5900, SOCKS on 6789) belong to your own logins. A
+  my-tm connection neither takes those ports while it runs nor prints
+  `bind [127.0.0.1]:5900: Address already in use` because your session has them.
 * the unattended ones — the probe, `--add`'s check, finding my-tm on the
   host, every command call, copying the index back — also get `BatchMode`
   (never a password prompt nobody answers), `SSH_CONNECT_TIMEOUT`, and `-n`

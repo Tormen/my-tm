@@ -4543,6 +4543,15 @@ abs_path() {
 
 notify() {
 	_title="my-tm"; _msg="$1"
+	## The test suite's notifications go to its own log and never to a person.
+	## Run without a terminal -- from an agent, from cron -- its health checks
+	## are "headless", and its fake stores (a newest backup 652h old, on
+	## purpose) sent a dozen real alerts that made no sense to the reader.
+	## Exported by the suite, so the my-tm processes it starts obey it too.
+	if [ -n "${MY_TM_NOTIFY_LOG:-}" ]; then
+		printf '%s\n' "$_msg" >>"$MY_TM_NOTIFY_LOG" 2>/dev/null
+		return 0
+	fi
 	if [ -n "$NOTIFY_CMD" ] && [ -x "$NOTIFY_CMD" ]; then
 		"$NOTIFY_CMD" -- "$_msg" >/dev/null 2>&1 && return 0
 		dbg "NOTIFY_CMD failed, falling back to osascript"
@@ -5110,19 +5119,25 @@ index_remote() {
 ## master cannot exit while another session rides on it -- a status waited ten
 ## minutes for the user to log out of an unrelated ssh to ada.
 ##
+## ClearAllForwardings on all of them: the port forwards in an ssh config
+## (ada's has VNC on 5900 and a SOCKS port) are for the user's own logins. A
+## tool's connection must neither take those ports while it runs nor print
+## "bind [127.0.0.1]:5900: Address already in use" because the user's session
+## already has them.
+##
 ## Unattended calls (a probe, a question, a command that sends nothing) also
 ## never prompt, give up on a host that does not answer, and never read the
 ## terminal. Attended ones (--install, --uninstall) may ask: the reader is there.
 ssh_batch() {
 	ssh -n -o BatchMode=yes -o ConnectTimeout="${SSH_CONNECT_TIMEOUT:-3}" \
-		-o ControlMaster=no "$@"
+		-o ControlMaster=no -o ClearAllForwardings=yes "$@"
 }
 scp_batch() {
 	scp -o BatchMode=yes -o ConnectTimeout="${SSH_CONNECT_TIMEOUT:-3}" \
-		-o ControlMaster=no "$@"
+		-o ControlMaster=no -o ClearAllForwardings=yes "$@"
 }
-ssh_attended() { ssh -o ControlMaster=no "$@"; }
-scp_attended() { scp -o ControlMaster=no "$@"; }
+ssh_attended() { ssh -o ControlMaster=no -o ClearAllForwardings=yes "$@"; }
+scp_attended() { scp -o ControlMaster=no -o ClearAllForwardings=yes "$@"; }
 
 remote_run() {                  # <handle> <args...>
 	_rr_h="$1"; shift
@@ -7693,6 +7708,16 @@ exit 0
 _EOF
 	## no host is reachable in the suite: a real ssh would wait out the
 	## timeout, or worse, actually connect to something
+	## Nothing the suite does may reach a person: every notification goes to
+	## this log (see notify), and osascript -- the fallback notifier -- is a
+	## stub that only records, in case anything ever bypasses the switch.
+	MY_TM_NOTIFY_LOG="$T_ROOT/notify.log"; export MY_TM_NOTIFY_LOG
+	cat >"$_s/osascript" <<_EOF
+#!/bin/sh
+printf 'osascript %s\n' "\$*" >>"$(t_calls)"
+exit 0
+_EOF
+	chmod 0755 "$_s/osascript"
 	cat >"$_s/ssh" <<_EOF
 #!/bin/sh
 printf 'ssh %s\n' "\$*" >>"$(t_calls)"
@@ -9046,7 +9071,10 @@ t_test_index_timing() {
 t_test_headless_health_notifies() {
 	printf '\nA health run nobody is watching says so where it will be seen\n'
 	_hn_nc="$NOTIFY_CMD"; _hn_w="${HEADLESS_NOTIFY_HEALTH_WARNINGS:-1}"
-	_hn_log="$T_ROOT/notify.log"
+	## this test checks the NOTIFY_CMD path itself, through its own stub, so
+	## the suite-wide switch is lifted for it and put back after
+	_hn_sw="${MY_TM_NOTIFY_LOG:-}"; unset MY_TM_NOTIFY_LOG
+	_hn_log="$T_ROOT/notify.hn.log"
 	NOTIFY_CMD="$T_ROOT/notify.sh"
 	# shellcheck disable=SC2016  # writing a script: $2 is the STUB's argument
 	{ printf '#!/bin/sh\n'; printf 'printf "%%s\\n" "$2" >>"%s"\n' "$_hn_log"; } >"$NOTIFY_CMD"
@@ -9117,6 +9145,7 @@ t_test_headless_health_notifies() {
 
 	rm -f "$NOTIFY_CMD" "$_hn_log"
 	NOTIFY_CMD="$_hn_nc"; HEADLESS_NOTIFY_HEALTH_WARNINGS="$_hn_w"
+	MY_TM_NOTIFY_LOG="$_hn_sw"; export MY_TM_NOTIFY_LOG
 }
 
 ## ssh locations. Adversarial: a host that is simply switched off must not read
@@ -9832,6 +9861,39 @@ t_test_index_increment_only_new() {
 ## Adversarial: a row that HAS a cached table must keep its plain "?" and cost
 ## no footnote, or every away-disk grows a pointless number; and the numbers in
 ## the cells must match the answers under the table when there are several.
+## REGRESSION: the suite, run without a terminal (by an agent, by cron), sent
+## REAL notifications about its fake stores -- a dozen alerts that a newest
+## backup was 652h old, which the fixture's is on purpose, and that
+## /tmp/my-tm.test.*/cache was not excluded from Time Machine. Adversarial:
+## the notifier is a sentinel that records being called, and the osascript
+## fallback is watched too.
+t_test_suite_never_notifies_a_person() {
+	printf '\nThe test suite never notifies a person\n'
+	_sn_sent="$T_ROOT/sentinel.called"; rm -f "$_sn_sent"
+	_sn_nc="$NOTIFY_CMD"
+	NOTIFY_CMD="$T_ROOT/sentinel.sh"
+	printf '#!/bin/sh\necho called >>"%s"\n' "$_sn_sent" >"$NOTIFY_CMD"
+	chmod 0755 "$NOTIFY_CMD"
+	: >"$MY_TM_NOTIFY_LOG"
+	# shellcheck disable=SC2329  # the redefinition is what forces "headless"
+	( health_is_headless() { return 0; }
+	  HEALTH_RC=2; HEALTH_PROBLEMS=1; HEALTH_FIRST_FAIL="store: newest backup is 652h old"
+	  health_notify_headless )
+	t_eq "a headless health run inside the suite reaches no notifier" \
+		"$([ -f "$_sn_sent" ] && echo called || echo quiet)" "quiet"
+	t_match "it lands in the suite's own log instead" "$(cat "$MY_TM_NOTIFY_LOG")" "652h old"
+	# shellcheck disable=SC2016  # single quotes on purpose: the CHILD shell must expand it
+	t_eq "the switch is exported, so a my-tm the suite starts obeys it too" \
+		"$(dash -c 'printf %s "${MY_TM_NOTIFY_LOG:-}"')" "$MY_TM_NOTIFY_LOG"
+
+	## and with no notifier configured, the osascript fallback stays silent too
+	NOTIFY_CMD=""
+	: >"$(t_calls)"
+	notify "fallback check" >/dev/null 2>&1
+	t_eq "nor does the osascript fallback run" "$(grep -c '^osascript' "$(t_calls)")" "0"
+	NOTIFY_CMD="$_sn_nc"; rm -f "$T_ROOT/sentinel.sh" "$_sn_sent"
+}
+
 ## D. my-tm's ssh became the connection MASTER (the user's ssh config says
 ## ControlMaster auto, with no ControlPersist); the user then opened their own
 ## ssh to that host, which rode on it, and a master cannot exit while a session
@@ -9847,9 +9909,9 @@ t_test_ssh_never_becomes_a_master() {
 		/(^|[{;&|(]|if |run |! )[[:space:]]*(ssh|scp)[[:space:]]/ {
 			line = $0; n = NR
 			while (line ~ /\\$/ && (getline nx) > 0) line = line nx
-			if (line !~ /ControlMaster=no/) print n ": " line
+			if (line !~ /ControlMaster=no/ || line !~ /ClearAllForwardings=yes/) print n ": " line
 		}' "$T_MYTM")
-	t_eq "every ssh and scp in the source is kept from becoming a master" "$_sm_bad" ""
+	t_eq "every ssh and scp in the source is kept from becoming a master, and from the user's forwards" "$_sm_bad" ""
 
 	: >"$(t_calls)"
 	( RUN_CACHE=0; remote_reachable host1 ) >/dev/null 2>&1
@@ -9861,6 +9923,10 @@ t_test_ssh_never_becomes_a_master() {
 		"$(printf '%s\n' "$_sm_made" | grep -vc 'ControlMaster=no')" "0"
 	t_eq "and none of them reads the terminal" \
 		"$(printf '%s\n' "$_sm_made" | grep -vc -- '-n ')" "0"
+	## ada's ssh config forwards VNC (5900) and a SOCKS port: a tool's call
+	## must neither take them nor fail on them
+	t_eq "and none sets up the user's port forwards" \
+		"$(printf '%s\n' "$_sm_made" | grep -vc 'ClearAllForwardings=yes')" "0"
 }
 
 ## C. A status on horse asked ada to --ls a sparsebundle there, which opened it:
@@ -11883,6 +11949,7 @@ run_tests() {
 	t_test_cache_excluded
 	t_test_config_search_order
 	t_test_attach_progress
+	t_test_suite_never_notifies_a_person
 	t_test_ssh_never_becomes_a_master
 	t_test_status_asks_remotes_for_their_cache
 	t_test_find_searches_only_the_stores_index
