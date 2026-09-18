@@ -3804,7 +3804,7 @@ _EOF
 			_rows=$(snapshots_cached_only "$_h")
 			if [ -n "$_rows" ]; then
 				_mark="?"
-				status_qmark "?" "the table as last read -- the sparsebundle is not attached, and a status never attaches one. To see it live: $US --ls $_h$(status_open_cost "$_t")"
+				status_qmark "?" "the table as last read -- the sparsebundle is not attached. To see it live: $US --ls $_h$(status_open_cost "$_t")"
 			else
 				status_footnote "nothing has been read from it yet, and a status never attaches a sparsebundle -- it would take minutes. Read it once with: $US --ls $_h$(status_open_cost "$_t")"
 				_mark="$FN_MARK"
@@ -9990,8 +9990,11 @@ t_test_status_marks_guide_the_reader() {
 	printf 'liveimg\t%s\t\n' "$_mg_img" >>"$T_ROOT/cache/locations.tsv"
 	locations_run_cache_drop
 	printf 'liveimg\t2025-01-01-000000\t1735689600\tlive01\t-\t-\t-\t-\t-\tok\tData\n' | t_cache_add
-	_mg_det=$(cmd_status 2>&1 | awk '/^liveimg /')
+	_mg_detall=$(cmd_status 2>&1)
+	_mg_det=$(printf '%s\n' "$_mg_detall" | awk '/^liveimg /')
 	t_match "(detached, it is the table as last read: ?)" "$_mg_det" "[0-9]d[?]"
+	t_match "its ? line goes straight from the cause to the remedy" "$_mg_detall" \
+		"^? liveimg: the table as last read -- the sparsebundle is not attached[.] To see it live: "
 	# shellcheck disable=SC2329  # the redefinition is what makes it "attached"
 	_mg_att=$( ( image_mountpoint() { printf '%s\n' "$T_ROOT/store"; }
 	             image_attach() { printf '%s\n' "$T_ROOT/store"; }
