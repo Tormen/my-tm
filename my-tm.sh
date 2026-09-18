@@ -1725,7 +1725,13 @@ snapshots_get() {
 	## trusted for an hour: Time Machine adds and thins snapshots constantly,
 	## and "newest backup" is the number this tool exists to get right. An
 	## image is exempt -- validating it would mean attaching it over a share.
-	if [ "$_fresh" = "1" ] && [ "$(loc_kind "$_h")" = "disk" ] && loc_reachable "$_h"; then
+	## An image is exempt only while it is NOT attached -- checking it would
+	## mean attaching it. Once it is attached (by a command, or by the Mac that
+	## backs up into it) the check costs what a disk's does, and a status that
+	## shows it without "?" must be showing what is really there.
+	if [ "$_fresh" = "1" ] && loc_reachable "$_h" &&
+	   { [ "$(loc_kind "$_h")" = "disk" ] ||
+	     { [ "$(loc_kind "$_h")" = "image" ] && image_mountpoint "$(loc_target "$_h")" >/dev/null 2>&1; }; }; then
 		_live=$(snap_names "$_h" | LC_ALL=C sort)
 		_have=$(cache_read_checked "$_cf" 2>/dev/null |
 			awk -F'\t' -v l="$_h" '$1 == l {print $2}' | LC_ALL=C sort)
@@ -3717,11 +3723,24 @@ usage_last() {                  # <handle>
 
 ## called once the row is built, with the handle the reasons belong to
 status_footnote_flush() {       # <handle>
+	if [ -n "${Q_ROW:-}" ]; then
+		STATUS_Q_TEXT="${STATUS_Q_TEXT:-}$Q_MARKS $1: $Q_ROW
+"
+	fi
+	Q_ROW=""; Q_MARKS=""
 	[ -n "${FN_ROW:-}" ] || return 0
 	STATUS_FN_TEXT="${STATUS_FN_TEXT:-}$FN_MARK $1: $FN_ROW
 "
 	FN_ROW=""
 	return 0
+}
+
+## A "?" or "??" is not an unknown -- it is a real value that is not today's --
+## but the reader still needs to know what brings today's back. One line per
+## row, naming the marks it carries and what removes them.
+status_qmark() {                # <marks> <text>
+	case " ${Q_MARKS:-} " in *" $1 "*) : ;; *) Q_MARKS="${Q_MARKS:+$Q_MARKS }$1" ;; esac
+	Q_ROW="${Q_ROW:+$Q_ROW · }$2"
 }
 
 ## How long opening this store took the last time anyone did, if it is known --
@@ -3762,7 +3781,7 @@ _EOF
 	## also gathers the per-location index lines printed below the table.
 	_tbl="LOC	DESTINATION	SNAPS	SPAN	LAST	USED/FREE	INDEXED	INDEX	PER SNAP"
 	_now=$(now_epoch)
-	STATUS_FN_N=0; STATUS_FN_TEXT=""; _qq_rows=""
+	STATUS_FN_N=0; STATUS_FN_TEXT=""; STATUS_Q_TEXT=""
 	## every read this status makes of ANOTHER Mac asks for that Mac's cached
 	## table only (remote_snap_names): a status opens nothing, here or there
 	STATUS_READ=1
@@ -3774,13 +3793,18 @@ _EOF
 		[ "$_t" = "local" ] && _dest="/ + /System/Volumes/Data"
 		_snaps="-"; _span="-"; _last="-"; _space="-"; _mark=""
 
-		FN_MARK=""; FN_ROW=""
-		if [ "$(loc_kind "$_h")" = "image" ]; then
+		FN_MARK=""; FN_ROW=""; Q_MARKS=""; Q_ROW=""
+		if [ "$(loc_kind "$_h")" = "image" ] && image_mountpoint "$_t" >/dev/null 2>&1; then
+			## ALREADY attached -- by a command, or the Mac backing up into it --
+			## so it is read live like a disk: nothing is opened for this line
+			_rows=$(snapshots_get "$_h")
+		elif [ "$(loc_kind "$_h")" = "image" ]; then
 			## an image is reported from what has already been read, never by
 			## attaching it here (see above)
 			_rows=$(snapshots_cached_only "$_h")
 			if [ -n "$_rows" ]; then
 				_mark="?"
+				status_qmark "?" "the table as last read -- the sparsebundle is not attached, and a status never attaches one. To see it live: $US --ls $_h$(status_open_cost "$_t")"
 			else
 				status_footnote "nothing has been read from it yet, and a status never attaches a sparsebundle -- it would take minutes. Read it once with: $US --ls $_h$(status_open_cost "$_t")"
 				_mark="$FN_MARK"
@@ -3791,9 +3815,9 @@ _EOF
 				if is_remote_target "$_t"; then
 					status_footnote "$(remote_host "$_t") has not read it yet, and a status never makes it open the store -- it could take minutes there. Read it once with: $US --ls $_h"
 				elif [ "$_t" = "local" ]; then
-					status_footnote "this Mac keeps no local snapshots right now -- Time Machine makes them while backing THIS Mac up, so a Mac that is only a backup TARGET has none. Check with: tmutil destinationinfo"
+					status_footnote "this Mac keeps no local snapshots right now -- Time Machine makes them only while backing THIS Mac up, and a Mac that is just a backup target has none. my-tm can take them itself: $US --local-snap takes one now, LOCAL_SNAP_INTERVAL=1h in the config keeps taking them"
 				else
-					status_footnote "the store is readable but holds no backups yet -- Time Machine has not written one here"
+					status_footnote "the store is readable but holds no backups yet -- Time Machine has not written one here. $US --backup runs one"
 				fi
 				_mark="$FN_MARK"
 			fi
@@ -3804,6 +3828,11 @@ _EOF
 			_rows=$(snapshots_cached_only "$_h")
 			if [ -n "$_rows" ]; then
 				_mark="?"
+				if is_remote_target "$_t"; then
+					status_qmark "?" "the table as last read -- $(remote_host "$_t") is not answering; it is read live again as soon as it is"
+				else
+					status_qmark "?" "the table as last read -- the destination is not attached; attach it (or mount it) and it is read live"
+				fi
 			elif is_remote_target "$_t"; then
 				status_footnote "$(remote_host "$_t") is not answering, and nothing was ever read from it -- try again when that Mac is up, or: $US --ls $_h"
 				_mark="$FN_MARK"
@@ -3831,8 +3860,15 @@ _EOF
 			_free=$(human_bytes "${_space##*/}")
 			_space="$_used/$_free"
 		elif [ "$_t" = "local" ]; then
-			status_footnote "local snapshots live on the volumes they are taken of, so there is no disk of its own to measure -- the boot volume's space is not what they cost"
-			_space="-$FN_MARK"
+			## local snapshots live ON the Data volume, and its free space is what
+			## decides how long macOS keeps them -- they are purged as it fills
+			_space=$(df -k /System/Volumes/Data 2>/dev/null | awk 'NR == 2 {printf "%s/%s\n", $3 * 1024, $4 * 1024}')
+			if [ -n "$_space" ]; then
+				_space="$(human_bytes "${_space%%/*}")/$(human_bytes "${_space##*/}")"
+			else
+				status_footnote "the Data volume its snapshots live on could not be measured (df /System/Volumes/Data)"
+				_space="-$FN_MARK"
+			fi
 		elif is_remote_target "$_t"; then
 			status_footnote "its free space is $(remote_host "$_t")'s to report -- ask it there: ssh $(remote_host "$_t") my-tm"
 			_space="-$FN_MARK"
@@ -3841,9 +3877,13 @@ _EOF
 			## number, not a live one -- and said so under the table, with WHEN,
 			## because a two-week-old free space is a different claim from today's.
 			_space="$(human_bytes "$(printf '%s' "$_ul" | cut -f2)")/$(human_bytes "$(printf '%s' "$_ul" | cut -f3)")??"
-			_qq_rows="${_qq_rows:-} $_h ($(human_age $(( _now - $(printf '%s' "$_ul" | cut -f1) ))) ago)"
+			status_qmark "??" "the space as measured $(human_age $(( _now - $(printf '%s' "$_ul" | cut -f1) ))) ago -- attach the destination and it is measured live"
+		elif [ -n "${FN_MARK:-}" ]; then
+			## the row's note already says the destination is away, which is all
+			## there is to say about its space too -- the cell shares the mark
+			_space="-$FN_MARK"
 		else
-			status_footnote "its free space cannot be measured while the destination is away, and it never was"
+			status_footnote "its free space cannot be measured while the destination is away, and it never was -- attach it once and it is remembered"
 			_space="-$FN_MARK"
 		fi
 		## INDEXED answers two questions at once: whether this location is
@@ -3905,7 +3945,7 @@ $_h index: $_ixs"
 		fi
 		status_footnote_flush "$_h"
 		_tbl="$_tbl
-$_h	$(printf '%s' "$_dest" | cut -c1-30)	$_snaps	$_span	$_last$_mark	$_space	$_ixd	$_ixsz	$_ixper"
+$_h	$_dest	$_snaps	$_span	$_last$_mark	$_space	$_ixd	$_ixsz	$_ixper"
 	done <<_EOF
 $_locs
 _EOF
@@ -3914,21 +3954,17 @@ _EOF
 	## the marks in the table, answered: "?" is a table remembered from when the
 	## destination was last seen, "??" a free space remembered the same way --
 	## both are real numbers, just not today's, and the reader is told whose
-	_legend=""
-	printf '%s\n' "$_tbl" | LC_ALL=C awk -F'\t' '{for (i = 1; i <= NF; i++) if ($i ~ /[^?]\?$/) f = 1} END {exit(f ? 0 : 1)}' &&
-		_legend="? a table remembered from when the destination was last seen"
-	[ -n "${_qq_rows:-}" ] &&
-		_legend="${_legend:+$_legend · }?? space as last measured, the destination being away:$_qq_rows"
-	[ -n "$_legend" ] && note "$_legend"
-	## the numbers in the table, answered: why there is nothing, and what fills it
-	if [ -n "${STATUS_FN_TEXT:-}" ]; then
-		while IFS= read -r _fn_line; do
-			[ -n "$_fn_line" ] || continue
-			note "$_fn_line"
-		done <<_FNEOF
-$STATUS_FN_TEXT
+	## Under the table, each line starts with the mark it answers -- "?", "??"
+	## or a superscript number -- so the eye goes from the cell straight to its
+	## answer; a "-->" in front only stood between them. Each says what the
+	## mark means for that row AND what removes it.
+	## (the same stream as note(), which the footer lines around them use)
+	while IFS= read -r _fn_line; do
+		[ -n "$_fn_line" ] || continue
+		printf ' %s\n' "$_fn_line"
+	done <<_FNEOF
+$STATUS_Q_TEXT$STATUS_FN_TEXT
 _FNEOF
-	fi
 
 	## locations the jobs cannot see into, each named once with the setting that
 	## would change it -- nothing for any other location
@@ -7735,6 +7771,11 @@ t_match() {
 
 t_stub_dir() { printf '%s/stub\n' "$T_ROOT"; }
 
+## Lines matching an extended REGEX. count_match is a FIXED string -- index() --
+## and six assertions written as if it took a regex could never match, so the
+## five that expected 0 passed whatever the code did.
+t_count_re() { awk -v p="$1" '$0 ~ p { n++ } END { print n + 0 }'; }
+
 ## superscript footnote marks back to "(n)", so a test pattern stays readable
 t_unsup() {
 	perl -CSD -Mutf8 -pe 's/([⁰¹²³⁴⁵⁶⁷⁸⁹]+)/"(" . ($1 =~ tr{⁰¹²³⁴⁵⁶⁷⁸⁹}{0123456789}r) . ")"/ge'
@@ -9922,6 +9963,45 @@ t_test_index_increment_only_new() {
 ## Adversarial: a row that HAS a cached table must keep its plain "?" and cost
 ## no footnote, or every away-disk grows a pointless number; and the numbers in
 ## the cells must match the answers under the table when there are several.
+## What the reader asked of the status table: the DESTINATION in full (it was
+## cut at 30 characters), the answers under the table starting with their mark
+## instead of "-->", and each mark saying what removes it. Two marks that had
+## a way out are gone altogether: an image that is ALREADY attached is read
+## live (nothing is opened for that), and `local`'s space is the Data volume
+## its snapshots live on, not a footnote on every Mac.
+t_test_status_marks_guide_the_reader() {
+	printf '\nThe status table is whole, and every mark says what removes it\n'
+	_mg_save=$(cat "$T_ROOT/cache/locations.tsv")
+	_mg_long="/Volumes/a-destination-name-well-over-thirty-characters/deep"
+	printf 'longdest\t%s\t\n' "$_mg_long" >>"$T_ROOT/cache/locations.tsv"
+	locations_run_cache_drop
+	_mg_out=$(cmd_status 2>&1)
+	t_match "a long destination is shown in full" "$_mg_out" "$_mg_long"
+	t_eq "no answer under the table starts with -->" \
+		"$(printf '%s\n' "$_mg_out" | grep -cE '^ --> ([?]|[¹²³⁴⁵⁶⁷⁸⁹⁰])')" "0"
+	t_ne "local shows the Data volume's space, not a mark" \
+		"$(printf '%s\n' "$_mg_out" | awk '/^ local /' | t_count_re '/[0-9.]+[KMGT]')" "0"
+	printf '%s\n' "$_mg_save" >"$T_ROOT/cache/locations.tsv"
+	locations_run_cache_drop
+
+	## an image already attached is read live: no "?" for it
+	_mg_img="$T_ROOT/live.sparsebundle"; mkdir -p "$_mg_img"; : >"$_mg_img/Info.plist"
+	printf 'liveimg\t%s\t\n' "$_mg_img" >>"$T_ROOT/cache/locations.tsv"
+	locations_run_cache_drop
+	printf 'liveimg\t2025-01-01-000000\t1735689600\tlive01\t-\t-\t-\t-\t-\tok\tData\n' | t_cache_add
+	_mg_det=$(cmd_status 2>&1 | awk '/^ liveimg /')
+	t_match "(detached, it is the table as last read: ?)" "$_mg_det" "[0-9]d[?]"
+	# shellcheck disable=SC2329  # the redefinition is what makes it "attached"
+	_mg_att=$( ( image_mountpoint() { printf '%s\n' "$T_ROOT/store"; }
+	             image_attach() { printf '%s\n' "$T_ROOT/store"; }
+	             cmd_status ) 2>&1 | awk '/^ liveimg /')
+	t_eq "attached, it is read live: no ?" "$(printf '%s' "$_mg_att" | t_count_re '[0-9][dhm][?]')" "0"
+	t_match "(and the live table is really there)" "$_mg_att" "2026-08-20"
+	printf '%s\n' "$_mg_save" >"$T_ROOT/cache/locations.tsv"
+	locations_run_cache_drop
+	rm -rf "$_mg_img"
+}
+
 ## Footnote marks are superscript digits ("-¹", "¹ horse: ..."), and they
 ## exposed a real bug: this awk counts BYTES, so a 2-byte "¹" -- or a path
 ## with an umlaut -- was padded one column short and pushed its row out of
@@ -9932,8 +10012,8 @@ t_test_superscript_marks_and_alignment() {
 	t_eq "numbers become superscript digits" "$(superscript 1) $(superscript 12) $(superscript 90)" "¹ ¹² ⁹⁰"
 	_sa_raw=$(cmd_status 2>&1)
 	t_match "a cell carries a superscript mark" "$_sa_raw" "[-]¹"
-	t_match "and its answer starts with it" "$_sa_raw" "^ --> ¹ "
-	t_eq "no (n) is left" "$(printf '%s\n' "$_sa_raw" | count_match '[-]([0-9])')" "0"
+	t_match "and its answer starts with it" "$_sa_raw" "^ ¹ "
+	t_eq "no (n) is left" "$(printf '%s\n' "$_sa_raw" | t_count_re '-[(][0-9]+[)]')" "0"
 
 	_sa_tbl=$(printf 'A\tLAST\tDEST\tE\nx\t-\t/Volumes/plain\tz\nyy\t-¹\t/Volumes/Größe\tz\nzz\t26d?\t/Volumes/Ω\tz\n' | table_align "lrll")
 	_sa_w=$(printf '%s\n' "$_sa_tbl" | perl -CSD -ne 'chomp; print length($_), "\n"' | sort -u | tr '\n' ' ')
@@ -9953,7 +10033,7 @@ t_test_status_remembered_space() {
 	rm -f "$_rs_uf"
 	_rs_out=$(cmd_status 2>&1 | t_unsup)
 	t_eq "never measured: no ?? is invented" \
-		"$(printf '%s\n' "$_rs_out" | awk '/^ ejectedstore /' | count_match '[?][?]')" "0"
+		"$(printf '%s\n' "$_rs_out" | awk '/^ ejectedstore /' | t_count_re '[?][?]')" "0"
 	t_match "and the cell keeps its note" "$(printf '%s\n' "$_rs_out" | awk '/^ ejectedstore /')" "[-]([0-9])"
 
 	need_dir "$(dirname "$_rs_uf")"
@@ -9961,15 +10041,24 @@ t_test_status_remembered_space() {
 	_rs_out=$(cmd_status 2>&1)
 	_rs_row=$(printf '%s\n' "$_rs_out" | awk '/^ ejectedstore /')
 	t_match "measured before: the value is shown, marked ??" "$_rs_row" "/[0-9.]*[KMGT][?][?]"
-	t_match "the legend says what ?? means" "$_rs_out" "?? space as last measured"
-	t_match "and how old that measurement is" "$_rs_out" "ejectedstore (1d ago)"
+	t_match "a line says what the ?? means for that row" "$_rs_out" "^ ?? ejectedstore: the space as measured"
+	t_match "and how old that measurement is" "$_rs_out" "measured 1d ago"
+	t_match "and what removes it" "$_rs_out" "attach the destination and it is measured live"
 
 	## a remembered TABLE is marked ? -- and that is explained too
 	_rs_save=$(cat "$T_ROOT/cache/locations.tsv")
 	printf 'awaystore\t/Volumes/NotHereAtAll\t\n' >>"$T_ROOT/cache/locations.tsv"
 	locations_run_cache_drop
 	printf 'awaystore\t2026-01-01-000000\t1767225600\taway77\t-\t-\t-\t-\t-\tok\tData\n' | t_cache_add
-	t_match "a ? in the table is explained too" "$(cmd_status 2>&1)" "? a table remembered"
+	_rs_q=$(cmd_status 2>&1)
+	## a detached disk with a remembered table but no space ever measured: the
+	## other branch -- its space gets a note of its own, still never a "??"
+	t_eq "remembered table, space never measured: still no ?? invented" \
+		"$(printf '%s\n' "$_rs_q" | t_unsup | awk '/^ awaystore /' | t_count_re '[?][?]')" "0"
+	t_match "(its space has a note of its own)" \
+		"$(printf '%s\n' "$_rs_q" | t_unsup | awk '/^ awaystore /')" "[-][(][0-9][0-9]*[)]"
+	t_match "a ? in the table is explained too, on a line of its own" "$_rs_q" "^ ? awaystore: the table as last read"
+	t_match "with what removes it" "$_rs_q" "attach it (or mount it) and it is read live"
 	printf '%s\n' "$_rs_save" >"$T_ROOT/cache/locations.tsv"
 	locations_run_cache_drop
 	rm -f "$_rs_uf"
@@ -10129,7 +10218,7 @@ t_test_find_searches_only_the_stores_index() {
 	_fs_out=$(cmd_find 'Info.plist' store 2>&1)
 	t_match "a store with no index says it was not searched" "$_fs_out" "not indexed here, so not searched: store"
 	t_eq "and lists nothing as if it had been" \
-		"$(printf '%s\n' "$_fs_out" | count_match '^ /')" "0"
+		"$(printf '%s\n' "$_fs_out" | t_count_re '^ /')" "0"
 }
 
 ## B. `my-tm list horse`: "list" was taken as a NAME to search for, so my-tm
@@ -10175,7 +10264,7 @@ t_test_bare_command_words() {
 t_test_every_dash_is_explained() {
 	printf '\nEvery "-" in the table is answered somewhere\n'
 	_ed_out=$(cmd_status 2>&1 | t_unsup)
-	_ed_tbl=$(printf '%s\n' "$_ed_out" | sed -n '2,$p' | sed -n '/^ -->/q;p')
+	_ed_tbl=$(printf '%s\n' "$_ed_out" | sed -n '2,$p' | sed -nE '/^ (-->|[?]|\([0-9]+\))/q;p')
 	_ed_head=$(printf '%s\n' "$_ed_out" | sed -n '1p')
 	_ed_notes=$(printf '%s\n' "$_ed_out" | sed -n 's/^ --> //p')
 
@@ -10201,7 +10290,7 @@ t_test_every_dash_is_explained() {
 
 	## and the promise the other way: a row that is fully known carries no number
 	t_eq "a location with everything known has no number" \
-		"$(printf '%s\n' "$_ed_tbl" | awk '/^ store /' | count_match '([0-9])')" "0"
+		"$(printf '%s\n' "$_ed_tbl" | awk '/^ store /' | t_count_re '[(][0-9]+[)]')" "0"
 }
 
 ## --add opened the store to identify it -- for a sparsebundle that is minutes
@@ -10247,7 +10336,7 @@ t_test_status_footnotes() {
 
 	## every number in the table is answered under it, and only once
 	_sf_marks=$(printf '%s\n' "$_sf_out" | sed -nE 's/.*-\(([0-9]+)\).*/\1/p' | sort -u | tr '\n' ' ')
-	_sf_notes=$(printf '%s\n' "$_sf_out" | sed -nE 's/^ --> \(([0-9]+)\) .*/\1/p' | sort -u | tr '\n' ' ')
+	_sf_notes=$(printf '%s\n' "$_sf_out" | sed -nE 's/^ \(([0-9]+)\) .*/\1/p' | sort -u | tr '\n' ' ')
 	t_eq "every number in the table has an answer under it" "$_sf_marks" "$_sf_notes"
 	t_ne "and there is at least one" "$_sf_marks" ""
 
@@ -12063,6 +12152,7 @@ run_tests() {
 	t_test_cache_excluded
 	t_test_config_search_order
 	t_test_attach_progress
+	t_test_status_marks_guide_the_reader
 	t_test_superscript_marks_and_alignment
 	t_test_status_remembered_space
 	t_test_suite_never_notifies_a_person

@@ -266,8 +266,18 @@ is -- a free space from two weeks ago is a different claim from today's:
 
 ```text
  horse   /Volumes/TimeMachine.Horse   71  2025-09-28..2026-09-17   1d?  3.59T/1.86T??  16/71
- --> ? a table remembered from when the destination was last seen · ?? space as last measured, the destination being away: horse (1d ago)
+ ? ?? horse: the table as last read -- the destination is not attached; attach it (or mount it) and it is read live · the space as measured 1d ago -- attach the destination and it is measured live
 ```
+
+Every line under the table **starts with the mark it answers** — `?`, `??`
+or a superscript number — so the eye goes from the cell straight to its
+answer, and every one says **what removes the mark**: attach the disk, run
+`my-tm --ls <LOC>` once, `my-tm --local-snap`, `my-tm --backup`, and so on.
+A mark with a way out gets one: an image that is already attached (by a
+command, or by the Mac backing up into it) is read live and carries no `?` —
+its cached table is checked against it like a disk's — and `local`'s
+USED/FREE is the Data volume its snapshots live on, whose free space is what
+decides how long macOS keeps them. The DESTINATION column is never cut short.
 
 A destination that is away and was never measured has no number to remember,
 so it keeps a footnote instead of an invented `??`. A row with nothing
@@ -277,12 +287,12 @@ table — why there is nothing, and the command that fills it in:
 ```text
  LOC     DESTINATION                     SNAPS  SPAN  LAST  USED/FREE    INDEXED
  horse   /Volumes/backup/timeMachine/ho      -  -     -¹    9.65T/4.90T  no
- local   / + /System/Volumes/Data            -  -     -²             -²  no
- --> ¹ horse: nothing has been read from it yet, and a status never attaches a
-       sparsebundle -- it would take minutes. Read it once with: my-tm --ls horse
- --> ² local: this Mac keeps no local snapshots right now -- Time Machine makes
-       them while backing THIS Mac up, so a Mac that is only a backup TARGET has
-       none. Check with: tmutil destinationinfo
+ local   / + /System/Volumes/Data            -  -     -²     1.38T/417.0G  no
+ ¹ horse: nothing has been read from it yet, and a status never attaches a
+   sparsebundle -- it would take minutes. Read it once with: my-tm --ls horse
+ ² local: this Mac keeps no local snapshots right now -- Time Machine makes them
+   only while backing THIS Mac up. my-tm can take them itself: my-tm --local-snap
+   takes one now, LOCAL_SNAP_INTERVAL=1h in the config keeps taking them
 ```
 
 A mark takes one column per digit, where `(1)` took three. Columns are sized
