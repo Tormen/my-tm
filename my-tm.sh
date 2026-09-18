@@ -3644,15 +3644,31 @@ index_mark_covered() {
 ## --status
 #############################################################################
 
-## An empty row is a question -- why is there nothing, and what can I do about
-## it -- and a bare "-" answers neither. The cell carries a number, the answer
-## goes under the table: what is missing, why, and the command that fills it.
+## An empty cell is a question -- why is there nothing, and what can I do about
+## it -- and a bare "-" answers neither. Every unexplained "-" in a row carries
+## that row's number, and the answer goes under the table.
+##
+## ONE number per row, not per cell: a store that is not here has no snapshots
+## AND no free space, and saying so twice in one line is noise. Reasons given
+## for the same row are joined into its one note.
 ## Never a subshell: the numbering has to survive back into the row loop.
-status_footnote() {             # <text>; sets FN_MARK
-	STATUS_FN_N=$(( ${STATUS_FN_N:-0} + 1 ))
-	FN_MARK="($STATUS_FN_N)"
-	STATUS_FN_TEXT="${STATUS_FN_TEXT:-}($STATUS_FN_N) $1
+status_footnote() {             # <text>; sets FN_MARK, appends to this row's note
+	if [ -z "${FN_MARK:-}" ]; then
+		STATUS_FN_N=$(( ${STATUS_FN_N:-0} + 1 ))
+		FN_MARK="($STATUS_FN_N)"
+		FN_ROW="$1"
+	else
+		FN_ROW="$FN_ROW · $1"
+	fi
+}
+
+## called once the row is built, with the handle the reasons belong to
+status_footnote_flush() {       # <handle>
+	[ -n "${FN_ROW:-}" ] || return 0
+	STATUS_FN_TEXT="${STATUS_FN_TEXT:-}$FN_MARK $1: $FN_ROW
 "
+	FN_ROW=""
+	return 0
 }
 
 ## How long opening this store took the last time anyone did, if it is known --
@@ -3702,7 +3718,7 @@ _EOF
 		[ "$_t" = "local" ] && _dest="/ + /System/Volumes/Data"
 		_snaps="-"; _span="-"; _last="-"; _space="-"; _mark=""
 
-		FN_MARK=""
+		FN_MARK=""; FN_ROW=""
 		if [ "$(loc_kind "$_h")" = "image" ]; then
 			## an image is reported from what has already been read, never by
 			## attaching it here (see above)
@@ -3710,16 +3726,16 @@ _EOF
 			if [ -n "$_rows" ]; then
 				_mark="?"
 			else
-				status_footnote "$_h: nothing has been read from it yet, and a status never attaches a sparsebundle -- it would take minutes. Read it once with: $US --ls $_h$(status_open_cost "$_t")"
+				status_footnote "nothing has been read from it yet, and a status never attaches a sparsebundle -- it would take minutes. Read it once with: $US --ls $_h$(status_open_cost "$_t")"
 				_mark="$FN_MARK"
 			fi
 		elif loc_ready "$_h"; then
 			_rows=$(snapshots_get "$_h")
 			if [ -z "$_rows" ]; then
 				if [ "$_t" = "local" ]; then
-					status_footnote "$_h: this Mac keeps no local snapshots right now -- Time Machine makes them while backing THIS Mac up, so a Mac that is only a backup TARGET has none. Check with: tmutil destinationinfo"
+					status_footnote "this Mac keeps no local snapshots right now -- Time Machine makes them while backing THIS Mac up, so a Mac that is only a backup TARGET has none. Check with: tmutil destinationinfo"
 				else
-					status_footnote "$_h: the store is readable but holds no backups yet -- Time Machine has not written one here"
+					status_footnote "the store is readable but holds no backups yet -- Time Machine has not written one here"
 				fi
 				_mark="$FN_MARK"
 			fi
@@ -3731,10 +3747,10 @@ _EOF
 			if [ -n "$_rows" ]; then
 				_mark="?"
 			elif is_remote_target "$_t"; then
-				status_footnote "$_h: $(remote_host "$_t") is not answering, and nothing was ever read from it -- try again when that Mac is up, or: $US --ls $_h"
+				status_footnote "$(remote_host "$_t") is not answering, and nothing was ever read from it -- try again when that Mac is up, or: $US --ls $_h"
 				_mark="$FN_MARK"
 			else
-				status_footnote "$_h: the destination is not attached and nothing was ever read from it -- plug it in (or mount it), then: $US --ls $_h"
+				status_footnote "the destination is not attached and nothing was ever read from it -- plug it in (or mount it), then: $US --ls $_h"
 				_mark="$FN_MARK"
 			fi
 		fi
@@ -3748,11 +3764,23 @@ _EOF
 			_span=$(printf '%s' "$_span" | cut -c1-24)
 			[ -n "$_lastep" ] && _last=$(human_age $(( _now - _lastep )))
 		fi
+		## USED/FREE is the DESTINATION's volume. There are two honest reasons
+		## for it to be empty and they are different problems: a location with
+		## no volume of its own, and one whose disk is not here to be measured.
 		if [ "$_t" != "local" ] && [ -d "$_t" ]; then
 			_space=$(df -k "$_t" 2>/dev/null | awk 'NR == 2 {printf "%s/%s\n", $3 * 1024, $4 * 1024}')
 			_used=$(human_bytes "${_space%%/*}")
 			_free=$(human_bytes "${_space##*/}")
 			_space="$_used/$_free"
+		elif [ "$_t" = "local" ]; then
+			status_footnote "local snapshots live on the volumes they are taken of, so there is no disk of its own to measure -- the boot volume's space is not what they cost"
+			_space="-$FN_MARK"
+		elif is_remote_target "$_t"; then
+			status_footnote "its free space is $(remote_host "$_t")'s to report -- ask it there: ssh $(remote_host "$_t") my-tm"
+			_space="-$FN_MARK"
+		else
+			status_footnote "its free space cannot be measured while the destination is away"
+			_space="-$FN_MARK"
 		fi
 		## INDEXED answers two questions at once: whether this location is
 		## indexed at all, and -- when it is -- how far behind the index has
@@ -3811,6 +3839,7 @@ $_h index: $_ixs"
 					_ixsz="$_ixsz / ~$(human_bytes $(( _ixb * _snaps / _ixn )))" ;;
 			esac
 		fi
+		status_footnote_flush "$_h"
 		_tbl="$_tbl
 $_h	$(printf '%s' "$_dest" | cut -c1-30)	$_snaps	$_span	$_last$_mark	$_space	$_ixd	$_ixsz	$_ixper"
 	done <<_EOF
@@ -3857,6 +3886,9 @@ _EOF
 	for _uh in $(printf '%s\n' "$_locs" | awk -F'\t' '{print $1}'); do
 		usage_sample "$_uh"
 	done
+	## the footer's own dashes: a size nobody has paid yet, not a missing number
+	[ "$_csize" = "-" ] && _csize="- (nothing read yet)"
+	[ "$_isize" = "-" ] && _isize="- (nothing indexed yet)"
 	note "cache $_csize · index $_isize$_scanned"
 	while IFS= read -r _il; do
 		[ -n "$_il" ] && note "$_il"
@@ -3875,7 +3907,9 @@ _EOF
 			_ix_off="$_ix_off $_ixh"
 		fi
 	done
-	[ -n "$_ix_off" ] && note "not indexed:${_ix_off} -- index one: $US --index <LOCATION>"
+	## named for the columns it explains: INDEX and PER SNAP are empty for these
+	## locations for this reason, which is the last unexplained "-" in the table
+	[ -n "$_ix_off" ] && note "not indexed (so INDEX and PER SNAP are -):${_ix_off} -- index one: $US --index <LOCATION>"
 	[ -n "$_ix_on" ] && note "indexed:${_ix_on} -- $US --no-index <LOCATION> stops, --rm-index <LOCATION> also deletes"
 
 	## growth, only once the series says something
@@ -8714,7 +8748,7 @@ t_test_opt_in_indexing() {
 		"$(printf '%s\n' "$_oi_st" | awk '$1 == "store" || $1 == "local" {print $(NF-2)}' | tr '\n' '|')" \
 		"0/$(snapshots_get store | count_lines)|no|"
 	t_eq "the footer says how to opt in AND how to opt out" \
-		"$(printf '%s\n' "$_oi_st" | count_match 'not indexed:') $(printf '%s\n' "$_oi_st" | count_match 'no-index <LOCATION> stops')" \
+		"$(printf '%s\n' "$_oi_st" | count_match 'not indexed (so') $(printf '%s\n' "$_oi_st" | count_match 'no-index <LOCATION> stops')" \
 		"1 1"
 
 	## fake index artefacts for two locations: one to remove, one that must survive
@@ -8737,7 +8771,7 @@ t_test_opt_in_indexing() {
 	## with nothing opted in, neither the footer nor --index offers to keep going
 	_oi_st2=$(cmd_status 2>/dev/null)
 	t_eq "the footer then offers only the way in" \
-		"$(printf '%s\n' "$_oi_st2" | count_match 'not indexed:') $(printf '%s\n' "$_oi_st2" | count_match 'no-index <LOCATION> stops')" \
+		"$(printf '%s\n' "$_oi_st2" | count_match 'not indexed (so') $(printf '%s\n' "$_oi_st2" | count_match 'no-index <LOCATION> stops')" \
 		"1 0"
 	t_eq "and --index with no argument indexes nothing, saying why" \
 		"$( ( cmd_index ) 2>&1 | count_match 'nothing is indexed')" "1"
@@ -9616,6 +9650,43 @@ t_test_index_increment_only_new() {
 ## Adversarial: a row that HAS a cached table must keep its plain "?" and cost
 ## no footnote, or every away-disk grows a pointless number; and the numbers in
 ## the cells must match the answers under the table when there are several.
+## "Every dash is explained" is a promise that rots the moment a column is
+## added, so it is checked rather than remembered: every cell that is just "-"
+## must be answered, either by its row's number or by a footer line naming that
+## column. Adversarial: the check walks the REAL table, so a new column with no
+## answer fails here rather than in front of the reader.
+t_test_every_dash_is_explained() {
+	printf '\nEvery "-" in the table is answered somewhere\n'
+	_ed_out=$(cmd_status 2>&1)
+	_ed_tbl=$(printf '%s\n' "$_ed_out" | sed -n '2,$p' | sed -n '/^ -->/q;p')
+	_ed_head=$(printf '%s\n' "$_ed_out" | sed -n '1p')
+	_ed_notes=$(printf '%s\n' "$_ed_out" | sed -n 's/^ --> //p')
+
+	## which columns a footer line explains by name
+	_ed_named=""
+	printf '%s\n' "$_ed_notes" | grep -q 'INDEX and PER SNAP are -' && _ed_named="INDEX PER"
+
+	_ed_bad=$(printf '%s\n' "$_ed_tbl" | LC_ALL=C awk -v named="$_ed_named" '
+		{
+			row = $0
+			marked = (row ~ /\([0-9]+\)/)
+			n = split(row, f, "  +")
+			for (i = 1; i <= n; i++) {
+				if (f[i] != "-") continue
+				## a bare dash: answered by this row s number, or by a column
+				## a footer line names
+				if (marked) continue
+				if (named != "" && (i >= 7)) continue
+				print "unexplained dash in: " row
+			}
+		}')
+	t_eq "no cell is left as a bare dash with nothing to explain it" "$_ed_bad" ""
+
+	## and the promise the other way: a row that is fully known carries no number
+	t_eq "a location with everything known has no number" \
+		"$(printf '%s\n' "$_ed_tbl" | awk '/^ store /' | count_match '([0-9])')" "0"
+}
+
 ## --add opened the store to identify it -- for a sparsebundle that is minutes
 ## of attaching -- counted its snapshots for one line of output, and kept
 ## nothing, so the location it had just added showed an empty row until
@@ -11456,6 +11527,7 @@ run_tests() {
 	t_test_cache_excluded
 	t_test_config_search_order
 	t_test_attach_progress
+	t_test_every_dash_is_explained
 	t_test_add_caches_what_it_opened
 	t_test_status_footnotes
 	t_test_attach_estimate

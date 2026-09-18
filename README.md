@@ -258,6 +258,20 @@ is not answering, a store with no backups in it yet, and a Mac with no local
 snapshots. Where an image's attach has been timed before, the note says what it
 will cost.
 
+**Every `-` in the table is answered** — that is the rule, and the suite checks
+it against the real table rather than trusting it, so a column added later
+fails a test instead of the reader. Two mechanisms, and no cell needs both:
+
+* **the row's number**, for what is missing about that location. One number per
+  row, never one per cell: a store that is not here has no snapshots *and* no
+  free space, and saying so twice in a line is noise, so its reasons are joined
+  into the one note.
+* **a footer line that names the column**, where the answer is the same for
+  every row — `not indexed (so INDEX and PER SNAP are -): …`, and the cache and
+  index sizes reading `- (nothing read yet)` / `- (nothing indexed yet)`.
+
+A row where everything is known carries no number at all.
+
 **Opening a store keeps what that cost.** `--add` attaches a sparsebundle to
 identify it — minutes, on a spinning disk — so it scans it through the cache
 while it is open, rather than counting the snapshots for one line of output and
