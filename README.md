@@ -229,32 +229,32 @@ in a log.
 
 ```text
 $ my-tm                                            # = --status
- LOC     DESTINATION                  SNAPS  SPAN                    LAST  USED/FREE  INDEXED    INDEX           PER SNAP
- backup  /Volumes/TimeMachine.Backup     67  2025-09-28..2026-09-16   17m  3.59T/1.87T 11/67 now  1.60G / ~9.72G   148.5M
- host1   host1:/Volumes/TM.Ext            -  -                          -           -  no                      -         -
- local   / + /System/Volumes/Data        15  2026-09-15..2026-09-16   14m           -  no                      -         -
+LOC     DESTINATION                  SNAPS  SPAN                    LAST  USED/FREE  INDEXED    INDEX           PER SNAP
+backup  /Volumes/TimeMachine.Backup     67  2025-09-28..2026-09-16   17m  3.59T/1.87T 11/67 now  1.60G / ~9.72G   148.5M
+host1   host1:/Volumes/TM.Ext            -  -                          -           -  no                      -         -
+local   / + /System/Volumes/Data        15  2026-09-15..2026-09-16   14m           -  no                      -         -
  --> cache 13.6K · index 1.60G · scanned 3m ago
  --> backup index: walking 2026-09-16_2249.27 now, 7m in · new backups follow automatically · 55 more only with: my-tm --index backup --all
  --> not indexed: host1 local -- index one: my-tm --index <LOCATION>
 
 $ my-tm backup                                     # = --ls backup
- ID      SNAPSHOT             AGE  FILES   ADDED   DRIFT  TOTAL  INDEXED  VOL
- k7f2q9  2026-08-22_1456.25   14m  17.9k    5.3G   1.4x   1.59T  now      Data
- m3x8b1  2026-08-20_1558.05    2d  12.1k    3.9G   1.0x   1.58T  yes      Data
- q4d7h2  2026-07-30_1558.05   23d  91.2k   84.7G  22.0x!  1.51T  no       Data
+ID      SNAPSHOT             AGE  FILES   ADDED   DRIFT  TOTAL  INDEXED  VOL
+k7f2q9  2026-08-22_1456.25   14m  17.9k    5.3G   1.4x   1.59T  now      Data
+m3x8b1  2026-08-20_1558.05    2d  12.1k    3.9G   1.0x   1.58T  yes      Data
+q4d7h2  2026-07-30_1558.05   23d  91.2k   84.7G  22.0x!  1.51T  no       Data
  --> 409 more (--all) · ADDED median 3.8G · indexed 11/412, walking 2026-08-22_1456.25 now
 
 $ my-tm ~/Documents/report.odt                     # = --lookup
- ID      SNAPSHOT             AGE   SIZE  STATE
- k7f2q9  2026-08-22_1456.25   14m  12.4K  =live
- m3x8b1  2026-08-20_1558.05    2d  11.9K  changed
- q4d7h2  2026-07-30_1558.05   23d      -  absent
+ID      SNAPSHOT             AGE   SIZE  STATE
+k7f2q9  2026-08-22_1456.25   14m  12.4K  =live
+m3x8b1  2026-08-20_1558.05    2d  11.9K  changed
+q4d7h2  2026-07-30_1558.05   23d      -  absent
  --> backup/Data · 3 distinct versions in 412 snapshots
 
 $ my-tm 'invoice*.pdf'                             # = --find
- PATH                                     VERSIONS  NEWEST      OLDEST
- /Users/you/Documents/2026/invoice-4.pdf         3  2026-08-20  2026-03-02
- /Users/you/Documents/2025/invoice-9.pdf         1  2025-11-04  2025-11-04
+PATH                                     VERSIONS  NEWEST      OLDEST
+/Users/you/Documents/2026/invoice-4.pdf         3  2026-08-20  2026-03-02
+/Users/you/Documents/2025/invoice-9.pdf         1  2025-11-04  2025-11-04
  --> my-tm <path> for the version table · --all to expand every version here
 ```
 
@@ -265,8 +265,8 @@ under the table whenever they appear, the `??` with how old each measurement
 is -- a free space from two weeks ago is a different claim from today's:
 
 ```text
- horse   /Volumes/TimeMachine.Horse   71  2025-09-28..2026-09-17   1d?  3.59T/1.86T??  16/71
- ? ?? horse: the table as last read -- the destination is not attached; attach it (or mount it) and it is read live · the space as measured 1d ago -- attach the destination and it is measured live
+horse   /Volumes/TimeMachine.Horse   71  2025-09-28..2026-09-17   1d?  3.59T/1.86T??  16/71
+? ?? horse: the table as last read -- the destination is not attached; attach it (or mount it) and it is read live · the space as measured 1d ago -- attach the destination and it is measured live
 ```
 
 Every line under the table **starts with the mark it answers** — `?`, `??`
@@ -285,14 +285,11 @@ in it at all carries a **superscript number** instead, answered under the
 table — why there is nothing, and the command that fills it in:
 
 ```text
- LOC     DESTINATION                     SNAPS  SPAN  LAST  USED/FREE    INDEXED
- horse   /Volumes/backup/timeMachine/ho      -  -     -¹    9.65T/4.90T  no
- local   / + /System/Volumes/Data            -  -     -²     1.38T/417.0G  no
- ¹ horse: nothing has been read from it yet, and a status never attaches a
-   sparsebundle -- it would take minutes. Read it once with: my-tm --ls horse
- ² local: this Mac keeps no local snapshots right now -- Time Machine makes them
-   only while backing THIS Mac up. my-tm can take them itself: my-tm --local-snap
-   takes one now, LOCAL_SNAP_INTERVAL=1h in the config keeps taking them
+LOC    DESTINATION                                     SNAPS  SPAN  LAST      USED/FREE  INDEXED
+horse  /Volumes/backup/timeMachine/horse.sparsebundle      -  -       -¹    9.65T/4.90T  no
+local  / + /System/Volumes/Data                            -  -       -²  281.7G/165.3G  no
+¹ horse: nothing has been read from it yet, and a status never attaches a sparsebundle -- it would take minutes. Read it once with: my-tm --ls horse (about 4m34s, once)
+² local: this Mac keeps no local snapshots right now -- Time Machine makes them only while backing THIS Mac up. my-tm can take them itself: my-tm --local-snap takes one now, LOCAL_SNAP_INTERVAL=1h in the config keeps taking them
 ```
 
 A mark takes one column per digit, where `(1)` took three. Columns are sized

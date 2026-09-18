@@ -3961,7 +3961,7 @@ _EOF
 	## (the same stream as note(), which the footer lines around them use)
 	while IFS= read -r _fn_line; do
 		[ -n "$_fn_line" ] || continue
-		printf ' %s\n' "$_fn_line"
+		printf '%s\n' "$_fn_line"
 	done <<_FNEOF
 $STATUS_Q_TEXT$STATUS_FN_TEXT
 _FNEOF
@@ -4073,7 +4073,7 @@ table_align() {
 					if (substr(spec, i, 1) == "r") cell = fill c[r, i]
 					else if (i == n[r]) cell = c[r, i]
 					else cell = c[r, i] fill
-					line = line (i > 1 ? "  " : " ") cell
+					line = line (i > 1 ? "  " : "") cell
 				}
 				print line
 			}
@@ -4420,7 +4420,7 @@ _EOF
 		fi
 
 		## collapse identical versions (inode+size+mtime), newest row per group
-		printf ' %-8s %-20s %5s %6s  %s\n' ID SNAPSHOT AGE SIZE STATE
+		printf '%-8s %-20s %5s %6s  %s\n' ID SNAPSHOT AGE SIZE STATE
 		_now=$(now_epoch)
 		sort -t"$(printf '\t')" -k2,2nr "$_work/known" | lookup_collapse >"$_work/distinct"
 
@@ -4440,7 +4440,7 @@ _EOF
 			else
 				_state="changed"; _size=$(human_bytes "$_s")
 			fi
-			printf ' %-8s %-20s %5s %6s  %s\n' \
+			printf '%-8s %-20s %5s %6s  %s\n' \
 				"$_id" "$(ts_display "$_ts")" "$(human_age $(( _now - _ep )))" "$_size" "$_state"
 		done <"$_work/distinct"
 
@@ -4505,7 +4505,7 @@ _EOF
 		return 0
 	fi
 
-	printf ' %-48s %8s  %-10s  %s\n' PATH VERSIONS NEWEST OLDEST
+	printf '%-48s %8s  %-10s  %s\n' PATH VERSIONS NEWEST OLDEST
 	_max="${LIMIT:-20}"
 	[ "$OPT_ALL" = "1" ] && _max=0
 	_i=0
@@ -4522,7 +4522,7 @@ _EOF
 			_new=$(printf '%s\n' "$_vrows" | tail -n 1 | cut -c1-10)
 			_old=$(printf '%s\n' "$_vrows" | head -n 1 | cut -c1-10)
 		fi
-		printf ' %-48s %8s  %-10s  %s\n' "$(printf '%s' "$_p" | cut -c1-48)" "$_vers" "$_new" "$_old"
+		printf '%-48s %8s  %-10s  %s\n' "$(printf '%s' "$_p" | cut -c1-48)" "$_vers" "$_new" "$_old"
 	done
 	[ "$_max" -gt 0 ] && [ "$_n" -gt "$_max" ] &&
 		note "$(( _n - _max )) more (--all) · $US <path> for the version table"
@@ -4571,29 +4571,29 @@ cmd_show() {
 	[ "${_vol:--}" = "-" ] && _vol="Data"
 
 	if [ -z "$_path" ]; then
-		printf ' %-10s %s\n' ID "$_id"
-		printf ' %-10s %s\n' SNAPSHOT "$(ts_display "$_ts")"
-		printf ' %-10s %s\n' LOCATION "$_loc"
-		printf ' %-10s %s\n' AGE "$(human_age $(( $(now_epoch) - ${_ep:-0} )))"
-		printf ' %-10s %s\n' FILES "$(human_count "$_files")"
-		printf ' %-10s %s\n' ADDED "$(human_bytes "$_added")"
-		printf ' %-10s %s\n' TOTAL "$(human_bytes "$_total")"
-		printf ' %-10s %s\n' VOLUME "$_vol"
-		printf ' %-10s %s\n' STATE "${_state:-ok}"
+		printf '%-10s %s\n' ID "$_id"
+		printf '%-10s %s\n' SNAPSHOT "$(ts_display "$_ts")"
+		printf '%-10s %s\n' LOCATION "$_loc"
+		printf '%-10s %s\n' AGE "$(human_age $(( $(now_epoch) - ${_ep:-0} )))"
+		printf '%-10s %s\n' FILES "$(human_count "$_files")"
+		printf '%-10s %s\n' ADDED "$(human_bytes "$_added")"
+		printf '%-10s %s\n' TOTAL "$(human_bytes "$_total")"
+		printf '%-10s %s\n' VOLUME "$_vol"
+		printf '%-10s %s\n' STATE "${_state:-ok}"
 		## only advertise the browsable path when it is really there: a tree
 		## that --refresh has never built is a path that does not exist
 		_browse="$(tm_root)/$_loc/$_ts/$_vol"
 		if [ -e "$_browse" ]; then
-			printf ' %-10s %s\n' BROWSE "$_browse"
+			printf '%-10s %s\n' BROWSE "$_browse"
 		elif [ -L "$_browse" ] || [ -d "$(dirname "$_browse")" ]; then
 			## the tree entry is there; it is simply not mounted yet
-			printf ' %-10s %s  (%s --mount %s <TTL> to fill it)\n' \
+			printf '%-10s %s  (%s --mount %s <TTL> to fill it)\n' \
 				BROWSE "$_browse" "$US" "$_id"
 		else
 			_why=""
 			( jobs_blind_on "$_loc" ) &&
 				_why="; the jobs cannot see into network volumes -- JOBS_RUN_WITH_FULL_DISK_ACCESS=1 keeps it built"
-			printf ' %-10s %s  (%s --refresh %s to build the tree%s)\n' \
+			printf '%-10s %s  (%s --refresh %s to build the tree%s)\n' \
 				BROWSE "$_browse" "$US" "$_loc" "$_why"
 		fi
 		return 0
@@ -4604,12 +4604,12 @@ cmd_show() {
 	_full="$(mnt_volume_path "$_loc" "$_ts" "$_vol")$_rel"
 	if [ -e "$_full" ]; then
 		_st=$(stat -f '%z%t%Sm%t%Sp %Su:%Sg' "$_full" 2>/dev/null)
-		printf ' %-10s %s\n' PATH "$_rel"
-		printf ' %-10s %s\n' IN "$_id ($(ts_display "$_ts"))"
-		printf ' %-10s %s\n' SIZE "$(human_bytes "$(printf '%s' "$_st" | cut -f1)")"
-		printf ' %-10s %s\n' MTIME "$(printf '%s' "$_st" | cut -f2)"
-		printf ' %-10s %s\n' MODE "$(printf '%s' "$_st" | cut -f3)"
-		printf ' %-10s %s\n' FULL "$_full"
+		printf '%-10s %s\n' PATH "$_rel"
+		printf '%-10s %s\n' IN "$_id ($(ts_display "$_ts"))"
+		printf '%-10s %s\n' SIZE "$(human_bytes "$(printf '%s' "$_st" | cut -f1)")"
+		printf '%-10s %s\n' MTIME "$(printf '%s' "$_st" | cut -f2)"
+		printf '%-10s %s\n' MODE "$(printf '%s' "$_st" | cut -f3)"
+		printf '%-10s %s\n' FULL "$_full"
 	else
 		note "$_rel: not in $_id ($(ts_display "$_ts"))"
 	fi
@@ -5665,10 +5665,10 @@ cmd_rm() {
 		rm -f "$_plan"
 		return 0
 	fi
-	printf ' %-8s %-20s %-10s %s\n' ID SNAPSHOT LOCATION FREES
+	printf '%-8s %-20s %-10s %s\n' ID SNAPSHOT LOCATION FREES
 	_sum=0
 	while IFS="$(printf '\t')" read -r _loc _ts _id _u; do
-		printf ' %-8s %-20s %-10s %s\n' "$_id" "$(ts_display "$_ts")" "$_loc" \
+		printf '%-8s %-20s %-10s %s\n' "$_id" "$(ts_display "$_ts")" "$_loc" \
 			"$(size_or_q "${_u:--}")"
 		case "${_u:--}" in [0-9]*) _sum=$(( _sum + _u )) ;; esac
 	done <"$_plan"
@@ -5842,11 +5842,11 @@ cmd_thin() {
 		_nkeep=$(printf '%s\n' "$_dec" | awk -F'\t' '$1 == "keep"' | count_lines)
 
 		printf '\n%s  policy: %s\n' "$_h" "$_p"
-		printf ' %-8s %-20s %s\n' ID SNAPSHOT ACTION
+		printf '%-8s %-20s %s\n' ID SNAPSHOT ACTION
 		printf '%s\n' "$_dec" | while IFS="$(printf '\t')" read -r _act _ts; do
 			[ "$_act" = "del" ] || continue
 			_id=$(snapshots_get "$_h" | awk -F'\t' -v t="$_ts" '$2 == t {print $4; exit}')
-			printf ' %-8s %-20s %s\n' "$_id" "$(ts_display "$_ts")" "DELETE"
+			printf '%-8s %-20s %s\n' "$_id" "$(ts_display "$_ts")" "DELETE"
 		done
 		note "$_nkeep kept, $_ndel to delete"
 
@@ -9977,10 +9977,11 @@ t_test_status_marks_guide_the_reader() {
 	locations_run_cache_drop
 	_mg_out=$(cmd_status 2>&1)
 	t_match "a long destination is shown in full" "$_mg_out" "$_mg_long"
+	t_match "the status table starts in column one" "$_mg_out" "^LOC "
 	t_eq "no answer under the table starts with -->" \
 		"$(printf '%s\n' "$_mg_out" | grep -cE '^ --> ([?]|[¹²³⁴⁵⁶⁷⁸⁹⁰])')" "0"
 	t_ne "local shows the Data volume's space, not a mark" \
-		"$(printf '%s\n' "$_mg_out" | awk '/^ local /' | t_count_re '/[0-9.]+[KMGT]')" "0"
+		"$(printf '%s\n' "$_mg_out" | awk '/^local /' | t_count_re '/[0-9.]+[KMGT]')" "0"
 	printf '%s\n' "$_mg_save" >"$T_ROOT/cache/locations.tsv"
 	locations_run_cache_drop
 
@@ -9989,12 +9990,12 @@ t_test_status_marks_guide_the_reader() {
 	printf 'liveimg\t%s\t\n' "$_mg_img" >>"$T_ROOT/cache/locations.tsv"
 	locations_run_cache_drop
 	printf 'liveimg\t2025-01-01-000000\t1735689600\tlive01\t-\t-\t-\t-\t-\tok\tData\n' | t_cache_add
-	_mg_det=$(cmd_status 2>&1 | awk '/^ liveimg /')
+	_mg_det=$(cmd_status 2>&1 | awk '/^liveimg /')
 	t_match "(detached, it is the table as last read: ?)" "$_mg_det" "[0-9]d[?]"
 	# shellcheck disable=SC2329  # the redefinition is what makes it "attached"
 	_mg_att=$( ( image_mountpoint() { printf '%s\n' "$T_ROOT/store"; }
 	             image_attach() { printf '%s\n' "$T_ROOT/store"; }
-	             cmd_status ) 2>&1 | awk '/^ liveimg /')
+	             cmd_status ) 2>&1 | awk '/^liveimg /')
 	t_eq "attached, it is read live: no ?" "$(printf '%s' "$_mg_att" | t_count_re '[0-9][dhm][?]')" "0"
 	t_match "(and the live table is really there)" "$_mg_att" "2026-08-20"
 	printf '%s\n' "$_mg_save" >"$T_ROOT/cache/locations.tsv"
@@ -10012,7 +10013,7 @@ t_test_superscript_marks_and_alignment() {
 	t_eq "numbers become superscript digits" "$(superscript 1) $(superscript 12) $(superscript 90)" "¹ ¹² ⁹⁰"
 	_sa_raw=$(cmd_status 2>&1)
 	t_match "a cell carries a superscript mark" "$_sa_raw" "[-]¹"
-	t_match "and its answer starts with it" "$_sa_raw" "^ ¹ "
+	t_match "and its answer starts with it" "$_sa_raw" "^¹ "
 	t_eq "no (n) is left" "$(printf '%s\n' "$_sa_raw" | t_count_re '-[(][0-9]+[)]')" "0"
 
 	_sa_tbl=$(printf 'A\tLAST\tDEST\tE\nx\t-\t/Volumes/plain\tz\nyy\t-¹\t/Volumes/Größe\tz\nzz\t26d?\t/Volumes/Ω\tz\n' | table_align "lrll")
@@ -10020,6 +10021,10 @@ t_test_superscript_marks_and_alignment() {
 	t_eq "every row is the same width in characters" "$(printf '%s' "$_sa_w" | wc -w | tr -d ' ')" "1"
 	t_eq "(and the multi-byte cells really were there)" \
 		"$(printf '%s\n' "$_sa_tbl" | count_match 'Größe')" "1"
+	t_eq "a table starts in column one: no row begins with a space" \
+		"$(printf '%s\n' "$_sa_tbl" | t_count_re '^ ')" "0"
+	t_eq "(and its first cell is really at the start)" \
+		"$(printf '%s\n' "$_sa_tbl" | t_count_re '^yy ')" "1"
 }
 
 ## A detached disk's USED/FREE said "cannot be measured" while the footer, two
@@ -10033,15 +10038,15 @@ t_test_status_remembered_space() {
 	rm -f "$_rs_uf"
 	_rs_out=$(cmd_status 2>&1 | t_unsup)
 	t_eq "never measured: no ?? is invented" \
-		"$(printf '%s\n' "$_rs_out" | awk '/^ ejectedstore /' | t_count_re '[?][?]')" "0"
-	t_match "and the cell keeps its note" "$(printf '%s\n' "$_rs_out" | awk '/^ ejectedstore /')" "[-]([0-9])"
+		"$(printf '%s\n' "$_rs_out" | awk '/^ejectedstore /' | t_count_re '[?][?]')" "0"
+	t_match "and the cell keeps its note" "$(printf '%s\n' "$_rs_out" | awk '/^ejectedstore /')" "[-]([0-9])"
 
 	need_dir "$(dirname "$_rs_uf")"
 	printf '%s\t%s\t%s\t1\t-\n' "$(( $(now_epoch) - 90000 ))" 3950000000000 2050000000000 >"$_rs_uf"
 	_rs_out=$(cmd_status 2>&1)
-	_rs_row=$(printf '%s\n' "$_rs_out" | awk '/^ ejectedstore /')
+	_rs_row=$(printf '%s\n' "$_rs_out" | awk '/^ejectedstore /')
 	t_match "measured before: the value is shown, marked ??" "$_rs_row" "/[0-9.]*[KMGT][?][?]"
-	t_match "a line says what the ?? means for that row" "$_rs_out" "^ ?? ejectedstore: the space as measured"
+	t_match "a line says what the ?? means for that row" "$_rs_out" "^?? ejectedstore: the space as measured"
 	t_match "and how old that measurement is" "$_rs_out" "measured 1d ago"
 	t_match "and what removes it" "$_rs_out" "attach the destination and it is measured live"
 
@@ -10054,10 +10059,10 @@ t_test_status_remembered_space() {
 	## a detached disk with a remembered table but no space ever measured: the
 	## other branch -- its space gets a note of its own, still never a "??"
 	t_eq "remembered table, space never measured: still no ?? invented" \
-		"$(printf '%s\n' "$_rs_q" | t_unsup | awk '/^ awaystore /' | t_count_re '[?][?]')" "0"
+		"$(printf '%s\n' "$_rs_q" | t_unsup | awk '/^awaystore /' | t_count_re '[?][?]')" "0"
 	t_match "(its space has a note of its own)" \
-		"$(printf '%s\n' "$_rs_q" | t_unsup | awk '/^ awaystore /')" "[-][(][0-9][0-9]*[)]"
-	t_match "a ? in the table is explained too, on a line of its own" "$_rs_q" "^ ? awaystore: the table as last read"
+		"$(printf '%s\n' "$_rs_q" | t_unsup | awk '/^awaystore /')" "[-][(][0-9][0-9]*[)]"
+	t_match "a ? in the table is explained too, on a line of its own" "$_rs_q" "^? awaystore: the table as last read"
 	t_match "with what removes it" "$_rs_q" "attach it (or mount it) and it is read live"
 	printf '%s\n' "$_rs_save" >"$T_ROOT/cache/locations.tsv"
 	locations_run_cache_drop
@@ -10218,7 +10223,7 @@ t_test_find_searches_only_the_stores_index() {
 	_fs_out=$(cmd_find 'Info.plist' store 2>&1)
 	t_match "a store with no index says it was not searched" "$_fs_out" "not indexed here, so not searched: store"
 	t_eq "and lists nothing as if it had been" \
-		"$(printf '%s\n' "$_fs_out" | t_count_re '^ /')" "0"
+		"$(printf '%s\n' "$_fs_out" | t_count_re '^/')" "0"
 }
 
 ## B. `my-tm list horse`: "list" was taken as a NAME to search for, so my-tm
@@ -10264,7 +10269,7 @@ t_test_bare_command_words() {
 t_test_every_dash_is_explained() {
 	printf '\nEvery "-" in the table is answered somewhere\n'
 	_ed_out=$(cmd_status 2>&1 | t_unsup)
-	_ed_tbl=$(printf '%s\n' "$_ed_out" | sed -n '2,$p' | sed -nE '/^ (-->|[?]|\([0-9]+\))/q;p')
+	_ed_tbl=$(printf '%s\n' "$_ed_out" | sed -n '2,$p' | sed -nE '/^( -->|[?]|\([0-9]+\))/q;p')
 	_ed_head=$(printf '%s\n' "$_ed_out" | sed -n '1p')
 	_ed_notes=$(printf '%s\n' "$_ed_out" | sed -n 's/^ --> //p')
 
@@ -10290,7 +10295,7 @@ t_test_every_dash_is_explained() {
 
 	## and the promise the other way: a row that is fully known carries no number
 	t_eq "a location with everything known has no number" \
-		"$(printf '%s\n' "$_ed_tbl" | awk '/^ store /' | t_count_re '[(][0-9]+[)]')" "0"
+		"$(printf '%s\n' "$_ed_tbl" | awk '/^store /' | t_count_re '[(][0-9]+[)]')" "0"
 }
 
 ## --add opened the store to identify it -- for a sparsebundle that is minutes
@@ -10336,7 +10341,7 @@ t_test_status_footnotes() {
 
 	## every number in the table is answered under it, and only once
 	_sf_marks=$(printf '%s\n' "$_sf_out" | sed -nE 's/.*-\(([0-9]+)\).*/\1/p' | sort -u | tr '\n' ' ')
-	_sf_notes=$(printf '%s\n' "$_sf_out" | sed -nE 's/^ \(([0-9]+)\) .*/\1/p' | sort -u | tr '\n' ' ')
+	_sf_notes=$(printf '%s\n' "$_sf_out" | sed -nE 's/^\(([0-9]+)\) .*/\1/p' | sort -u | tr '\n' ' ')
 	t_eq "every number in the table has an answer under it" "$_sf_marks" "$_sf_notes"
 	t_ne "and there is at least one" "$_sf_marks" ""
 
