@@ -258,7 +258,19 @@ $ my-tm 'invoice*.pdf'                             # = --find
  --> my-tm <path> for the version table · --all to expand every version here
 ```
 
-Rows from cache for an unmounted location are marked `?`. A row with nothing
+Rows from cache for an unmounted location are marked `?`, and a destination
+that is away shows its space **as last measured**, marked `??`, from the same
+usage series the growth line in the footer uses. Both marks are explained
+under the table whenever they appear, the `??` with how old each measurement
+is -- a free space from two weeks ago is a different claim from today's:
+
+```text
+ horse   /Volumes/TimeMachine.Horse   71  2025-09-28..2026-09-17   1d?  3.59T/1.86T??  16/71
+ --> ? a table remembered from when the destination was last seen · ?? space as last measured, the destination being away: horse (1d ago)
+```
+
+A destination that is away and was never measured has no number to remember,
+so it keeps a footnote instead of an invented `??`. A row with nothing
 in it at all carries a **number** instead, answered under the table — why there
 is nothing, and the command that fills it in:
 
@@ -999,9 +1011,10 @@ change the exit code.
 **A run nobody is watching notifies.** `--health` exists to catch failures that
 happen *silently*, so a run whose stdout is not a terminal — a LaunchDaemon,
 whose output goes to a log file — raises a notification as well as writing the
-report. It names the first problem verbatim and counts the rest
-(`health: store: newest backup is 9d old (+2 more)`); a bare count would be
-nothing anyone could act on. Failures always notify;
+report. It names the first problem verbatim, counts the rest, and says where
+they are (`health: store: newest backup is 9d old (+2 more: my-tm --health)`) --
+a notification cannot be scrolled, so a count alone told you there was more
+and not where to find it. Failures always notify;
 `HEADLESS_NOTIFY_HEALTH_WARNINGS=1` (the default) does the same for warnings,
 `0` restricts it to failures. A run in a terminal never notifies — you are
 already reading it.

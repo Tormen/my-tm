@@ -3686,6 +3686,19 @@ status_footnote() {             # <text>; sets FN_MARK, appends to this row's no
 	fi
 }
 
+## The space a destination had when it was last measured: "<epoch> <TAB> used
+## <TAB> free", from the usage series -- the numbers the growth line in the
+## footer already uses, so a detached disk's cell need not claim it cannot know.
+usage_last() {                  # <handle>
+	for _ul_d in $(cache_read_dirs); do
+		[ -f "$_ul_d/usage.$1.tsv" ] || continue
+		tail -n 1 "$_ul_d/usage.$1.tsv" 2>/dev/null |
+			LC_ALL=C awk -F'\t' '$1 > 0 && $2 != "" && $3 != "" {printf "%s\t%s\t%s\n", $1, $2, $3; f = 1}
+				END {exit(f ? 0 : 1)}' && return 0
+	done
+	return 1
+}
+
 ## called once the row is built, with the handle the reasons belong to
 status_footnote_flush() {       # <handle>
 	[ -n "${FN_ROW:-}" ] || return 0
@@ -3733,7 +3746,7 @@ _EOF
 	## also gathers the per-location index lines printed below the table.
 	_tbl="LOC	DESTINATION	SNAPS	SPAN	LAST	USED/FREE	INDEXED	INDEX	PER SNAP"
 	_now=$(now_epoch)
-	STATUS_FN_N=0; STATUS_FN_TEXT=""
+	STATUS_FN_N=0; STATUS_FN_TEXT=""; _qq_rows=""
 	## every read this status makes of ANOTHER Mac asks for that Mac's cached
 	## table only (remote_snap_names): a status opens nothing, here or there
 	STATUS_READ=1
@@ -3807,8 +3820,14 @@ _EOF
 		elif is_remote_target "$_t"; then
 			status_footnote "its free space is $(remote_host "$_t")'s to report -- ask it there: ssh $(remote_host "$_t") my-tm"
 			_space="-$FN_MARK"
+		elif _ul=$(usage_last "$_h"); then
+			## Away, but measured before: that value, marked "??" -- a remembered
+			## number, not a live one -- and said so under the table, with WHEN,
+			## because a two-week-old free space is a different claim from today's.
+			_space="$(human_bytes "$(printf '%s' "$_ul" | cut -f2)")/$(human_bytes "$(printf '%s' "$_ul" | cut -f3)")??"
+			_qq_rows="${_qq_rows:-} $_h ($(human_age $(( _now - $(printf '%s' "$_ul" | cut -f1) ))) ago)"
 		else
-			status_footnote "its free space cannot be measured while the destination is away"
+			status_footnote "its free space cannot be measured while the destination is away, and it never was"
 			_space="-$FN_MARK"
 		fi
 		## INDEXED answers two questions at once: whether this location is
@@ -3876,6 +3895,15 @@ $_locs
 _EOF
 	printf '%s\n' "$_tbl" | table_align "llrlrrlrr"
 
+	## the marks in the table, answered: "?" is a table remembered from when the
+	## destination was last seen, "??" a free space remembered the same way --
+	## both are real numbers, just not today's, and the reader is told whose
+	_legend=""
+	printf '%s\n' "$_tbl" | LC_ALL=C awk -F'\t' '{for (i = 1; i <= NF; i++) if ($i ~ /[^?]\?$/) f = 1} END {exit(f ? 0 : 1)}' &&
+		_legend="? a table remembered from when the destination was last seen"
+	[ -n "${_qq_rows:-}" ] &&
+		_legend="${_legend:+$_legend · }?? space as last measured, the destination being away:$_qq_rows"
+	[ -n "$_legend" ] && note "$_legend"
 	## the numbers in the table, answered: why there is nothing, and what fills it
 	if [ -n "${STATUS_FN_TEXT:-}" ]; then
 		while IFS= read -r _fn_line; do
@@ -5300,10 +5328,13 @@ health_is_headless() {
 	return 0
 }
 
-## " (+3 more)" when the run found more than the one problem being named
+## " (+3 more: my-tm --health)" when the run found more than the one problem
+## being named. A count alone told the reader there was more and not where it
+## was: a notification cannot be scrolled, so it names the command that lists
+## every one of them.
 health_more() {
 	_hm=$(( HEALTH_PROBLEMS - 1 ))
-	[ "$_hm" -gt 0 ] && printf ' (+%s more)' "$_hm"
+	[ "$_hm" -gt 0 ] && printf ' (+%s more: %s --health)' "$_hm" "$US"
 	return 0
 }
 
@@ -9086,8 +9117,8 @@ t_test_headless_health_notifies() {
 	  HEALTH_RC=2; HEALTH_PROBLEMS=3
 	  HEALTH_FIRST_FAIL="store: newest backup is 9d old"
 	  health_notify_headless )
-	t_eq "a failure is notified, named, with the rest counted" \
-		"$(count_match 'store: newest backup is 9d old (+2 more)' <"$_hn_log") of $(count_lines <"$_hn_log")" \
+	t_eq "a failure is notified, named, with the rest counted -- and where to see them" \
+		"$(count_match "store: newest backup is 9d old (+2 more: $US --health)" <"$_hn_log") of $(count_lines <"$_hn_log")" \
 		"1 of 1"
 
 	: >"$_hn_log"
@@ -9861,6 +9892,39 @@ t_test_index_increment_only_new() {
 ## Adversarial: a row that HAS a cached table must keep its plain "?" and cost
 ## no footnote, or every away-disk grows a pointless number; and the numbers in
 ## the cells must match the answers under the table when there are several.
+## A detached disk's USED/FREE said "cannot be measured" while the footer, two
+## lines down, still quoted its free space from the usage series. The cell now
+## shows that last measurement marked "??", and the legend says what "??" and
+## "?" mean and HOW OLD the measurement is. Adversarial: a disk never measured
+## must keep its note -- a "??" with no number behind it would be invented.
+t_test_status_remembered_space() {
+	printf '\nA detached disk shows its space as last measured, marked ??\n'
+	_rs_uf="$(cache_write_dir)/usage.ejectedstore.tsv"
+	rm -f "$_rs_uf"
+	_rs_out=$(cmd_status 2>&1)
+	t_eq "never measured: no ?? is invented" \
+		"$(printf '%s\n' "$_rs_out" | awk '/^ ejectedstore /' | count_match '[?][?]')" "0"
+	t_match "and the cell keeps its note" "$(printf '%s\n' "$_rs_out" | awk '/^ ejectedstore /')" "[-]([0-9])"
+
+	need_dir "$(dirname "$_rs_uf")"
+	printf '%s\t%s\t%s\t1\t-\n' "$(( $(now_epoch) - 90000 ))" 3950000000000 2050000000000 >"$_rs_uf"
+	_rs_out=$(cmd_status 2>&1)
+	_rs_row=$(printf '%s\n' "$_rs_out" | awk '/^ ejectedstore /')
+	t_match "measured before: the value is shown, marked ??" "$_rs_row" "/[0-9.]*[KMGT][?][?]"
+	t_match "the legend says what ?? means" "$_rs_out" "?? space as last measured"
+	t_match "and how old that measurement is" "$_rs_out" "ejectedstore (1d ago)"
+
+	## a remembered TABLE is marked ? -- and that is explained too
+	_rs_save=$(cat "$T_ROOT/cache/locations.tsv")
+	printf 'awaystore\t/Volumes/NotHereAtAll\t\n' >>"$T_ROOT/cache/locations.tsv"
+	locations_run_cache_drop
+	printf 'awaystore\t2026-01-01-000000\t1767225600\taway77\t-\t-\t-\t-\t-\tok\tData\n' | t_cache_add
+	t_match "a ? in the table is explained too" "$(cmd_status 2>&1)" "? a table remembered"
+	printf '%s\n' "$_rs_save" >"$T_ROOT/cache/locations.tsv"
+	locations_run_cache_drop
+	rm -f "$_rs_uf"
+}
+
 ## REGRESSION: the suite, run without a terminal (by an agent, by cron), sent
 ## REAL notifications about its fake stores -- a dozen alerts that a newest
 ## backup was 652h old, which the fixture's is on purpose, and that
@@ -11949,6 +12013,7 @@ run_tests() {
 	t_test_cache_excluded
 	t_test_config_search_order
 	t_test_attach_progress
+	t_test_status_remembered_space
 	t_test_suite_never_notifies_a_person
 	t_test_ssh_never_becomes_a_master
 	t_test_status_asks_remotes_for_their_cache
