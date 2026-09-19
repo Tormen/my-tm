@@ -1782,9 +1782,11 @@ without ever being destructive.
 
 * **Completion**: `_my-tm` written to the invoking user's `~/.zsh/completions/`
   on every run — owned by them even under `sudo`, and only rewritten when the
-  content differs — plus a bash file when bash is the caller. Completes
-  commands, handles and IDs from the cache, and paths *inside* a snapshot
-  after an ID.
+  content differs; `my-tm --completion bash` prints the bash one. A word
+  starting with `-` completes to the commands and options `--help` names (the
+  suite holds the two lists to each other); any other word, in any position,
+  to a handle or a file — `my-tm /Use<TAB>` is a `--lookup` in the making.
+  A shell that is already open keeps the version it loaded: open a new one.
 * **Full Disk Access**: `tmutil listbackups|compare|delete|verifychecksums` need
   it. my-tm detects the denial and prints one pointer line rather than a stack
   of errors. The jobs get it through a launcher (§9).

@@ -7251,6 +7251,20 @@ cmd_maintenance() {
 ## COMPLETION
 #############################################################################
 
+## Every --option --help names, one per line: the completion offers exactly
+## these, and the suite holds the two lists to each other.
+help_options() {
+	usage | LC_ALL=C awk '/^  -/ {
+		f = $0; sub(/^  /, "", f)
+		if (match(f, /   +[^ ]/)) f = substr(f, 1, RSTART - 1)
+		while (match(f, /--[a-z][a-z-]*/)) { print substr(f, RSTART, RLENGTH); f = substr(f, RSTART + RLENGTH) }
+	}' | LC_ALL=C sort -u
+}
+
+## A word that starts with "-" is a command or an option; any other word is a
+## <LOCATION>, an <ID> or a <PATH> -- in any position, since `my-tm <PATH>
+## [<LOCATION>]` and `my-tm <ID> <PATH>` both take them bare -- so it
+## completes to a handle or a file.
 completion_zsh() {
 	cat <<'_EOF'
 #compdef my-tm
@@ -7272,11 +7286,13 @@ _my-tm() {
     '--no-index:stop indexing a location, keep its index'
     '--rm-index:stop indexing a location and delete its index'
     '--verify:re-check stored checksums'
-    '--local-snapshot:take an APFS local snapshot'
+    '--local-snap:take an APFS local snapshot'
     '--health:run the health checks'
     '--rm:delete snapshots'
     '--thin:apply a retention policy'
     '--backup:start or stop a backup'
+    '--eject:with --backup: eject the disk after it'
+    '--no-eject:with --backup: leave the disk mounted'
     '--install:set up dirs, firmlink, daemons'
     '--uninstall:undo --install'
     '--setup:configure Time Machine itself'
@@ -7286,14 +7302,23 @@ _my-tm() {
     '--create-config:print the default config'
     '--config:use a specific config file'
     '--completion:print the completion script'
+    '--source:use this location only'
+    '--all:no limits'
+    '--limit:stop after N rows'
+    '--json:machine-readable output'
+    '--cached:answer from what is known, open nothing'
+    '--force:overwrite / force a busy unmount'
+    '--verbose:echo each command before it runs'
+    '--debug:diagnostics'
+    '--deepdebug:diagnostics and shell tracing'
     '--run-tests:run the built-in tests'
+    '--version:the exact build'
     '--help:this'
   )
-  if (( CURRENT == 2 )); then
+  if [[ $PREFIX == -* ]]; then
     _describe 'command' cmds
-    _alternative "handles:location:($(my-tm --completion --handles 2>/dev/null))"
   else
-    _files
+    _alternative "handles:location:($(my-tm --completion --handles 2>/dev/null))" 'files:path:_files'
   fi
 }
 _my-tm "$@"
@@ -7305,10 +7330,12 @@ completion_bash() {
 _my_tm() {
   local cur="${COMP_WORDS[COMP_CWORD]}"
   local cmds="--status --ls --lookup --find --show --mount --umount --open --cat
-    --cp --diff --index --no-index --rm-index --verify --local-snapshot
-    --health --rm --thin
-    --backup --install --uninstall --setup --add --forget --refresh
-    --create-config --config --completion --run-tests --help"
+    --cp --diff --index --no-index --rm-index --verify --local-snap
+    --health --rm --thin --backup --eject --no-eject
+    --install --uninstall --setup --add --forget --refresh
+    --create-config --config --completion --source --all --limit --json
+    --cached --force --verbose --debug --deepdebug
+    --run-tests --version --help"
   if [[ "$cur" == -* ]]; then
     COMPREPLY=( $(compgen -W "$cmds" -- "$cur") )
   else
@@ -10236,6 +10263,40 @@ t_test_image_read_without_attaching() {
 	rm -rf "$_ra_img" "$T_ROOT/cache/read.$(slug "$_ra_img")"
 }
 
+## `my-tm /Use<TAB>` completed nothing: the first word was offered commands
+## and handles only, although a bare <PATH> there is --lookup. And the command
+## list was typed by hand and had drifted from --help (--cached, --eject,
+## --no-eject and --version missing). Adversarial: the lists are compared to
+## what --help names, both ways, and the zsh function is RUN -- with the
+## completion builtins replaced by recorders -- for a first word that is a path.
+t_test_completion_follows_help() {
+	printf '\nThe completion offers what --help names, and a path in any position\n'
+	_cf_help=$(help_options)
+	t_eq "(--help names a real list)" \
+		"$(printf '%s\n' "$_cf_help" | awk '$0 == "--cached" || $0 == "--lookup" {n++} END {print n+0}')" "2"
+	t_eq "zsh offers exactly the options --help names" \
+		"$(completion_zsh | sed -nE "s/^ *'(--[a-z][a-z-]*):.*/\1/p" | LC_ALL=C sort -u)" "$_cf_help"
+	t_eq "bash too" \
+		"$(completion_bash | sed -n '/local cmds="/,/"$/p' | tr -s ' "' '\n' | grep -E '^--[a-z]' | LC_ALL=C sort -u)" "$_cf_help"
+	if command -v zsh >/dev/null 2>&1; then
+		completion_zsh >"$T_ROOT/_my-tm"
+		# shellcheck disable=SC2016  # expanded by the zsh it is handed to
+		_cf_run='_describe() { print -rn -- "commands "; }
+			_alternative() { print -rn -- "$*"; }
+			my-tm() { print store; }
+			PREFIX=$1; CURRENT=2; . "$2"'
+		t_match "a first word that is a path completes to files" \
+			"$(zsh -fc "$_cf_run" zsh /Use "$T_ROOT/_my-tm")" "files:path:_files"
+		t_match "(and to a handle, too)" \
+			"$(zsh -fc "$_cf_run" zsh st "$T_ROOT/_my-tm")" "handles:location:(store)"
+		t_eq "a word with a dash completes to commands only" \
+			"$(zsh -fc "$_cf_run" zsh --ca "$T_ROOT/_my-tm")" "commands "
+		rm -f "$T_ROOT/_my-tm"
+	else
+		t_skip "a first word that is a path completes to files" "no zsh"
+	fi
+}
+
 ## Footnote marks are superscript digits ("-¹", "¹ horse: ..."), and they
 ## exposed a real bug: this awk counts BYTES, so a 2-byte "¹" -- or a path
 ## with an umlaut -- was padded one column short and pushed its row out of
@@ -12392,6 +12453,7 @@ run_tests() {
 	t_test_attach_progress
 	t_test_status_marks_guide_the_reader
 	t_test_image_read_without_attaching
+	t_test_completion_follows_help
 	t_test_superscript_marks_and_alignment
 	t_test_status_remembered_space
 	t_test_suite_never_notifies_a_person
