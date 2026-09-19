@@ -88,6 +88,7 @@ HEALTH_MAX_AGE_DEFAULT="48h"
 HEALTH_MIN_FREE_PCT=10
 HEALTH_MAX_INTERRUPTED=2
 HEALTH_DRIFT_FACTOR=5
+INTERRUPTED_AFTER="1h"
 HEADLESS_NOTIFY_HEALTH_WARNINGS=1
 MAINT_JOB="local.my-tm.maintenance"
 MAINT_INTERVAL=120
@@ -360,6 +361,9 @@ HEALTH_MAX_AGE_DEFAULT="48h"    # a newer backup is expected within this: <N>s|m
                                 # 0 = no age expected (the age is only shown)
 HEALTH_MIN_FREE_PCT=10
 HEALTH_MAX_INTERRUPTED=2; HEALTH_DRIFT_FACTOR=5
+INTERRUPTED_AFTER="1h"          # a backup into an image that Time Machine still
+                                # calls Running, with nothing written for this
+                                # long, is shown "interrupted ?": <N>m|h|d
 HEADLESS_NOTIFY_HEALTH_WARNINGS=1   # a --health nobody is watching notifies on
                                     # warnings too, not only on failures. 0:
                                     # failures only. A run in a terminal never
@@ -1740,6 +1744,15 @@ snapshots_get() {
 			_fresh=0
 		fi
 	fi
+	## An image that is not attached and has not been written to since its
+	## table was read still holds exactly that table, however old the read:
+	## asking the bundle is a walk of its file dates, attaching it is minutes.
+	if [ "$_fresh" = "0" ] && [ -f "$_cf" ] && [ "$(loc_kind "$_h")" = "image" ] &&
+	   ! image_mountpoint "$(loc_target "$_h")" >/dev/null 2>&1 &&
+	   image_unchanged_since_read "$(loc_target "$_h")"; then
+		dbg "snapshots: '$_h' is unchanged since its table was read -- nothing to attach"
+		_fresh=1
+	fi
 	if [ "$_fresh" = "1" ]; then
 		_cached=$(cache_read_checked "$_cf" 2>/dev/null | awk -F'\t' -v l="$_h" '$1 == l')
 		if [ -n "$_cached" ]; then
@@ -1749,9 +1762,12 @@ snapshots_get() {
 		fi
 	fi
 	dbg "snapshots: scanning '$_h'"
+	## a second early: a write in the very second the read began still counts
+	_t0=$(( $(now_epoch) - 1 ))
 	_rows=$(snapshots_scan "$_h")
 	[ -n "$_rows" ] || return 0
 	snapshots_cache_put "$_h" "$_rows"
+	[ "$(loc_kind "$_h")" = "image" ] && image_read_stamp "$(loc_target "$_h")" "$_t0"
 	printf '%s\n' "$_rows"
 	return 0
 }
@@ -1966,6 +1982,94 @@ attach_measured() {             # <img> <bytes-now>
 			print s; f = 1; exit
 		}
 		END { exit(f ? 0 : 1) }' "$_am_f"
+}
+
+## Time Machine keeps the list of what an image holds BESIDE the image, in the
+## bundle: reading it needs no attach, and it is the list an attach finds --
+## a thinned snapshot is gone from it too. "<handle> TAB <snapshot> TAB
+## <epoch>", one per snapshot; 1 when the bundle has none or it is unreadable.
+image_history() {               # <handle> <img>
+	_ih_f="$2/com.apple.TimeMachine.SnapshotHistory.plist"
+	[ -r "$_ih_f" ] || return 1
+	_ih_rows=$(plutil -convert xml1 -o - "$_ih_f" 2>/dev/null | LC_ALL=C awk -v h="$1" '
+		## "2025-09-26T06:33:07Z" -> epoch, by calendar arithmetic: awk has no
+		## portable mktime, and a date(1) per snapshot is a fork per row
+		function epoch(s,    y, m, d, era, yoe, doy, doe) {
+			y = substr(s, 1, 4) + 0; m = substr(s, 6, 2) + 0; d = substr(s, 9, 2) + 0
+			if (m <= 2) y--
+			era = int(y / 400); yoe = y - era * 400
+			doy = int((153 * (m + (m > 2 ? -3 : 9)) + 2) / 5) + d - 1
+			doe = yoe * 365 + int(yoe / 4) - int(yoe / 100) + doy
+			return (era * 146097 + doe - 719468) * 86400 + \
+				substr(s, 12, 2) * 3600 + substr(s, 15, 2) * 60 + substr(s, 18, 2)
+		}
+		function inner(s, tag) { sub(".*<" tag ">", "", s); sub("</" tag ">.*", "", s); return s }
+		/<key>/ { k = inner($0, "key"); next }
+		/<date>/ && k == "com.apple.backupd.SnapshotCompletionDate" { dt = inner($0, "date") }
+		/<string>/ && k == "com.apple.backupd.SnapshotName" { n = inner($0, "string"); sub(/[.]backup$/, "", n) }
+		/<\/dict>/ {
+			if (n ~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9]$/ &&
+			    dt ~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z$/)
+				printf "%s\t%s\t%d\n", h, n, epoch(dt)
+			n = ""; dt = ""
+		}')
+	[ -n "$_ih_rows" ] || return 1
+	printf '%s\n' "$_ih_rows"
+}
+
+## When an image's table was read: a file per image whose date is the moment
+## the read BEGAN. A write to the bundle after it is a backup, a thinning or a
+## repair; a bundle with none still holds exactly that table, however old the
+## read. my-tm attaches -readonly, so its own reads never count as a write.
+image_read_stamp() {            # <img> <epoch the read began>
+	need_dir "$(cache_write_dir)" || return 0
+	touch -t "$(date -j -f '%s' "$2" '+%Y%m%d%H%M.%S')" \
+		"$(cache_write_dir)/read.$(slug "$1")" 2>/dev/null
+	return 0
+}
+
+## Every read that was recorded must still hold: a write after ANY of them
+## may be missing from the rows it produced.
+image_unchanged_since_read() {  # <img>
+	_iu_n=0
+	for _iu_d in $(cache_read_dirs); do
+		_iu_st="$_iu_d/read.$(slug "$1")"
+		[ -f "$_iu_st" ] || continue
+		_iu_new=$(find "$1" -newer "$_iu_st" -print -quit 2>/dev/null) || return 1
+		[ -z "$_iu_new" ] || return 1
+		_iu_n=$(( _iu_n + 1 ))
+	done
+	[ "$_iu_n" -gt 0 ]
+}
+
+## What Time Machine last said about a backup INTO this image, from the
+## Results.plist it keeps beside it -- nothing unless that says Running. The
+## age is the last sign of life: the report, or a band written after it. A
+## Running with none for INTERRUPTED_AFTER stopped without saying so -- the Mac
+## slept, the share went away.
+image_running() {               # <img>
+	_ir_f="$1/com.apple.TimeMachine.Results.plist"
+	[ -r "$_ir_f" ] || return 1
+	case "$(plutil -extract Running raw -o - "$_ir_f" 2>/dev/null)" in
+		1|true) : ;;
+		*) return 1 ;;
+	esac
+	_ir_pct=$(plutil -extract Progress.Percent raw -o - "$_ir_f" 2>/dev/null |
+		awk '$1 + 0 > 0 {printf " %d%%", $1 * 100}')
+	_ir_m=$(stat -f '%m' "$_ir_f" 2>/dev/null) || return 1
+	# shellcheck disable=SC2012  # band names are hex digits; ls -t is the cheap newest
+	_ir_b=$(ls -t "$1/bands" 2>/dev/null | head -n 1)
+	if [ -n "$_ir_b" ] && _ir_bm=$(stat -f '%m' "$1/bands/$_ir_b" 2>/dev/null) &&
+	   [ "$_ir_bm" -gt "$_ir_m" ]; then
+		_ir_m=$_ir_bm
+	fi
+	_ir_age=$(( $(now_epoch) - _ir_m ))
+	_ir_lim=$(parse_interval "$INTERRUPTED_AFTER") || _ir_lim=3600
+	if [ "$_ir_age" -gt "$_ir_lim" ]; then
+		printf 'Running%s (since %s! interrupted ?)\n' "$_ir_pct" "$(human_age "$_ir_age")"
+	else
+		printf 'Running%s (since %s)\n' "$_ir_pct" "$(human_age "$_ir_age")"
+	fi
 }
 
 ## How long this attach should take: "<seconds> <TAB> <bytes> <TAB> <media>
@@ -3781,7 +3885,7 @@ _EOF
 	## also gathers the per-location index lines printed below the table.
 	_tbl="LOC	DESTINATION	SNAPS	SPAN	LAST	USED/FREE	INDEXED	INDEX	PER SNAP"
 	_now=$(now_epoch)
-	STATUS_FN_N=0; STATUS_FN_TEXT=""; STATUS_Q_TEXT=""
+	STATUS_FN_N=0; STATUS_FN_TEXT=""; STATUS_Q_TEXT=""; _run_lines=""
 	## every read this status makes of ANOTHER Mac asks for that Mac's cached
 	## table only (remote_snap_names): a status opens nothing, here or there
 	STATUS_READ=1
@@ -3799,10 +3903,16 @@ _EOF
 			## so it is read live like a disk: nothing is opened for this line
 			_rows=$(snapshots_get "$_h")
 		elif [ "$(loc_kind "$_h")" = "image" ]; then
-			## an image is reported from what has already been read, never by
-			## attaching it here (see above)
-			_rows=$(snapshots_cached_only "$_h")
-			if [ -n "$_rows" ]; then
+			## an image is never attached here (see above), and rarely needs to
+			## be: Time Machine keeps the list of what is in it beside the image,
+			## and a bundle nobody has written to since it was read still holds
+			## exactly that table
+			if _rows=$(image_history "$_h" "$_t"); then
+				dbg "status: '$_h' from the snapshot list beside the image"
+			elif _rows=$(snapshots_cached_only "$_h") && [ -n "$_rows" ] &&
+			     image_unchanged_since_read "$_t"; then
+				dbg "status: '$_h' unchanged since its table was read"
+			elif [ -n "$_rows" ]; then
 				_mark="?"
 				status_qmark "?" "the table as last read -- the sparsebundle is not attached. To see it live: $US --ls $_h$(status_open_cost "$_t")"
 			else
@@ -3944,6 +4054,10 @@ $_h index: $_ixs"
 			esac
 		fi
 		status_footnote_flush "$_h"
+		if [ "$(loc_kind "$_h")" = "image" ] && _run=$(image_running "$_t"); then
+			_run_lines="${_run_lines}$_h: Time Machine says $_run
+"
+		fi
 		_tbl="$_tbl
 $_h	$_dest	$_snaps	$_span	$_last$_mark	$_space	$_ixd	$_ixsz	$_ixper"
 	done <<_EOF
@@ -3965,6 +4079,11 @@ _EOF
 	done <<_FNEOF
 $STATUS_Q_TEXT$STATUS_FN_TEXT
 _FNEOF
+	while IFS= read -r _run; do
+		[ -n "$_run" ] && note "$_run"
+	done <<_RUNEOF
+$_run_lines
+_RUNEOF
 
 	## locations the jobs cannot see into, each named once with the setting that
 	## would change it -- nothing for any other location
@@ -10006,6 +10125,117 @@ t_test_status_marks_guide_the_reader() {
 	rm -rf "$_mg_img"
 }
 
+## "Is there really no way to know if this sparsebundle was updated other than
+## opening it?" There is, twice over, and neither attaches anything: Time
+## Machine keeps its list of snapshots BESIDE the image
+## (com.apple.TimeMachine.SnapshotHistory.plist), and a bundle whose files are
+## all older than the moment its table was read still holds that table. Its
+## Results.plist says whether a backup into it is Running -- and for how long
+## nothing has been written.
+## Adversarial: the plist must WIN over a cache that still lists a thinned
+## snapshot; a write after the read must bring the "?" back; an unchanged
+## bundle must cost --ls no attach while a changed one still gets one; and a
+## Running that is still writing must not be called interrupted.
+t_img_plist() {                 # <bundle> <name> <completion date> ...
+	_tip_f="$1/com.apple.TimeMachine.SnapshotHistory.plist"; shift
+	{
+		printf '<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0">\n<dict>\n<key>Snapshots</key>\n<array>\n'
+		while [ "$#" -ge 2 ]; do
+			printf '<dict>\n<key>com.apple.backupd.SnapshotCompletionDate</key>\n<date>%s</date>\n' "$2"
+			printf '<key>com.apple.backupd.SnapshotName</key>\n<string>%s.backup</string>\n</dict>\n' "$1"
+			shift 2
+		done
+		printf '</array>\n</dict>\n</plist>\n'
+	} >"$_tip_f"
+}
+t_img_results() {               # <bundle> <true|false> <percent>
+	printf '<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0">\n<dict>\n<key>Progress</key>\n<dict>\n<key>Percent</key>\n<real>%s</real>\n</dict>\n<key>Running</key>\n<%s/>\n</dict>\n</plist>\n' \
+		"$3" "$2" >"$1/com.apple.TimeMachine.Results.plist"
+}
+t_test_image_read_without_attaching() {
+	printf '\nAn image is read from its own files, never by attaching it\n'
+	_ra_save=$(cat "$T_ROOT/cache/locations.tsv")
+	## an hdiutil that RECORDS an attach (and fails it): the default stub keeps
+	## no record, and a "nothing was attached" would then hold whatever ran
+	_ra_h="$(t_stub_dir)/hdiutil"; cp "$_ra_h" "$T_ROOT/hdiutil.orig"
+	{ printf '#!/bin/sh\n'; printf 'printf "hdiutil %%s\\n" "$*" >>"%s"\n' "$(t_calls)"; printf 'exit 1\n'; } >"$_ra_h"
+	chmod 0755 "$_ra_h"
+	: >"$(t_calls)"
+	_ra_img="$T_ROOT/beside.sparsebundle"; mkdir -p "$_ra_img/bands"
+	: >"$_ra_img/Info.plist"; : >"$_ra_img/bands/0"
+	printf 'besideimg\t%s\t\n' "$_ra_img" >>"$T_ROOT/cache/locations.tsv"
+	locations_run_cache_drop
+
+	## the snapshot list beside the image: real dates, converted without date(1)
+	t_img_plist "$_ra_img" 2024-02-29-130000 2024-02-29T12:00:00Z \
+		2025-09-26-083307 2025-09-26T06:33:07Z
+	t_eq "a completion date is the epoch date(1) gives (on a leap day)" \
+		"$(image_history besideimg "$_ra_img" | awk -F'\t' '$2 == "2024-02-29-130000" {print $3}')" \
+		"$(date -j -u -f '%Y-%m-%d %H:%M:%S' '2024-02-29 12:00:00' '+%s')"
+	t_eq "(and one after it)" \
+		"$(image_history besideimg "$_ra_img" | awk -F'\t' '$2 == "2025-09-26-083307" {print $3}')" "1758868387"
+	## the cache still lists a snapshot that has since been thinned away
+	printf 'besideimg\t2023-01-01-000000\t1672531200\tthin01\t-\t-\t-\t-\t-\tok\tData\n' | t_cache_add
+	_ra_out=$(cmd_status 2>&1)
+	_ra_row=$(printf '%s\n' "$_ra_out" | awk '/^besideimg /')
+	t_match "the row comes from the list beside the image" "$_ra_row" "besideimg .* 2 .*2024-02-29[.][.]2025-09-26"
+	t_eq "(so it is today's: no ?)" "$(printf '%s' "$_ra_row" | t_count_re '[0-9][dhm][?]')" "0"
+	t_eq "(and nothing under the table about it)" \
+		"$(printf '%s\n' "$_ra_out" | t_count_re '^[?¹²³⁴⁵⁶⁷⁸⁹] besideimg:')" "0"
+	t_eq "and nothing was attached for it" "$(grep -c 'hdiutil attach' "$(t_calls)")" "0"
+	rm -f "$_ra_img/com.apple.TimeMachine.SnapshotHistory.plist"
+
+	## no list beside it: the dates of its files decide
+	_ra_old=$(( $(now_epoch) - 7200 ))
+	find "$_ra_img" -exec touch -t "$(date -j -f '%s' "$_ra_old" '+%Y%m%d%H%M.%S')" {} +
+	_ra_det=$(cmd_status 2>&1 | awk '/^besideimg /')
+	t_match "never read (no stamp): the table as last read, ?" "$_ra_det" "[0-9]d[?]"
+	image_read_stamp "$_ra_img" $(( _ra_old + 60 ))
+	_ra_det=$(cmd_status 2>&1 | awk '/^besideimg /')
+	t_eq "nothing written since it was read: no ?" "$(printf '%s' "$_ra_det" | t_count_re '[0-9][dhm][?]')" "0"
+	t_match "(and the table is really there)" "$_ra_det" "besideimg .* 1 "
+	: >"$T_ROOT/calls.log"
+	( CACHE_TTL=0; snapshots_get besideimg >/dev/null 2>&1 )
+	t_eq "--ls: an expired cache of an unchanged bundle attaches nothing" \
+		"$(grep -c 'hdiutil attach' "$(t_calls)")" "0"
+
+	touch "$_ra_img/bands/0"
+	_ra_det=$(cmd_status 2>&1 | awk '/^besideimg /')
+	t_match "a band written after the read: the ? is back" "$_ra_det" "[0-9]d[?]"
+	: >"$T_ROOT/calls.log"
+	( CACHE_TTL=0; snapshots_get besideimg >/dev/null 2>&1 )
+	t_ne "(and --ls reads it again)" "$(grep -c 'hdiutil attach' "$(t_calls)")" "0"
+	## a read records when it began, so the next status needs nothing
+	rm -f "$T_ROOT/cache/read.$(slug "$_ra_img")"
+	# shellcheck disable=SC2329  # the redefinition is what makes the read work
+	( image_attach() { printf '%s\n' "$T_ROOT/store"; }; CACHE_TTL=0; snapshots_get besideimg >/dev/null 2>&1 )
+	[ -f "$T_ROOT/cache/read.$(slug "$_ra_img")" ] && _ra_s=stamp || _ra_s=none
+	t_eq "a read leaves its stamp" "$_ra_s" "stamp"
+	( image_unchanged_since_read "$_ra_img" ) && _ra_u=unchanged || _ra_u=changed
+	t_eq "(and the bundle counts as unchanged since)" "$_ra_u" "unchanged"
+
+	## what Time Machine last said about a backup into it
+	t_img_results "$_ra_img" true 0.8838
+	touch -t "$(date -j -f '%s' "$(( $(now_epoch) - 3 * 86400 ))" '+%Y%m%d%H%M.%S')" \
+		"$_ra_img/com.apple.TimeMachine.Results.plist" "$_ra_img/bands/0"
+	_ra_out=$(cmd_status 2>&1)
+	t_match "a Running that has written nothing for days is called out" "$_ra_out" \
+		"besideimg: Time Machine says Running 88% (since 3d! interrupted ?)"
+	touch "$_ra_img/bands/0"
+	_ra_out=$(cmd_status 2>&1)
+	t_match "a band written just now: it is running, not interrupted" "$_ra_out" \
+		"besideimg: Time Machine says Running 88% (since 0m)"
+	t_eq "(no ! and no interrupted)" "$(printf '%s\n' "$_ra_out" | count_match 'interrupted ?')" "0"
+	t_img_results "$_ra_img" false 0
+	t_eq "not Running: nothing to say" \
+		"$(cmd_status 2>&1 | count_match 'besideimg: Time Machine says')" "0"
+
+	cp "$T_ROOT/hdiutil.orig" "$_ra_h"; chmod 0755 "$_ra_h"; rm -f "$T_ROOT/hdiutil.orig"
+	printf '%s\n' "$_ra_save" >"$T_ROOT/cache/locations.tsv"
+	locations_run_cache_drop
+	rm -rf "$_ra_img" "$T_ROOT/cache/read.$(slug "$_ra_img")"
+}
+
 ## Footnote marks are superscript digits ("-¹", "¹ horse: ..."), and they
 ## exposed a real bug: this awk counts BYTES, so a 2-byte "¹" -- or a path
 ## with an umlaut -- was padded one column short and pushed its row out of
@@ -12161,6 +12391,7 @@ run_tests() {
 	t_test_config_search_order
 	t_test_attach_progress
 	t_test_status_marks_guide_the_reader
+	t_test_image_read_without_attaching
 	t_test_superscript_marks_and_alignment
 	t_test_status_remembered_space
 	t_test_suite_never_notifies_a_person

@@ -279,9 +279,30 @@ its cached table is checked against it like a disk's — and `local`'s
 USED/FREE is the Data volume its snapshots live on, whose free space is what
 decides how long macOS keeps them. The DESTINATION column is never cut short.
 
+**A sparsebundle is read without attaching it.** Time Machine keeps the list
+of the snapshots in an image *beside* the image, in
+`com.apple.TimeMachine.SnapshotHistory.plist` — the list an attach finds, a
+thinned snapshot gone from it too — so SNAPS, SPAN and LAST come from there:
+today's values, no `?`. Where a bundle has no such list, the dates of its files
+decide: every read records when it began, and a bundle with nothing written
+since still holds exactly that table — no `?`, and `--ls` returns it without
+the attach (a bundle written to since is attached as before). my-tm attaches
+read-only, so its own reads never count as a write.
+
+**A backup into it that stopped is shown.** When the bundle's
+`com.apple.TimeMachine.Results.plist` still says Running, a line under the
+table says so, with its progress and its last sign of life — the report, or a
+band written after it. Nothing written for `INTERRUPTED_AFTER` (1h) is a backup
+that stopped without saying so — the Mac slept, the share went away:
+
+```text
+ --> horse: Time Machine says Running 88% (since 358d! interrupted ?)
+```
+
 A destination that is away and was never measured has no number to remember,
 so it keeps a footnote instead of an invented `??`. A row with nothing
-in it at all carries a **superscript number** instead, answered under the
+in it at all — here a sparsebundle with no snapshot list beside it, never
+opened — carries a **superscript number** instead, answered under the
 table — why there is nothing, and the command that fills it in:
 
 ```text
@@ -1475,6 +1496,9 @@ HEALTH_MAX_AGE_DEFAULT="48h"; HEALTH_MIN_FREE_PCT=10  # 0 = no age expected
 HEADLESS_NOTIFY_HEALTH_WARNINGS=1   # a --health nobody is watching notifies on
                                     # warnings too; 0 = failures only
 HEALTH_MAX_INTERRUPTED=2; HEALTH_DRIFT_FACTOR=5
+INTERRUPTED_AFTER="1h"          # a backup into an image that Time Machine still
+                                # calls Running, with nothing written for this
+                                # long, is shown "interrupted ?": <N>m|h|d
 # --- jobs installed by --install ---
 MAINT_JOB="local.my-tm.maintenance"   # mount sweep + /tm refresh + local snaps
 MAINT_INTERVAL=120              # s between maintenance runs
