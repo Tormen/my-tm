@@ -434,7 +434,9 @@ or `-S` narrows, `--all` widens to every known location.
   short-lived read-only `mount_apfs` plus one `stat` each, batched into a
   single exec (§8, §15), and the result goes into the store. So lookup cost is
   proportional to the snapshots that are *new since anyone last asked*, not to
-  the history.
+  the history. An answer worked out from the index is kept the same way:
+  replaying the index's deltas for one path costs seconds (50 MB of them on
+  horse), so it happens once per path, and a user's run reads root's answers.
 * **A read that fails is not an absent file.** `absent` is only "no such file"
   in a snapshot volume that is still mounted and readable; a permission error,
   or a mount released while it was read, is printed, counted as "could not be

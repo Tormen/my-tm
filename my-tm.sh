@@ -3169,20 +3169,24 @@ vs_versions_for() {
 	[ -n "$_cur" ] || _cur=$(printf -- '-\t-')
 	printf '%s\t%s\n' "$_bts" "$_cur"
 	## then replay the deltas in time order, carrying the last known state; if
-	## a delta somehow holds both, the file being THERE is the truth
-	vs_delta_files "$_d" | LC_ALL=C awk -v p="$_p" -v cur="$_cur" '{
-		ts = $0; sub(/.*\/d\./, "", ts); sub(/\.gz$/, "", ts); sub(/\.tsv$/, "", ts)
-		c = "gzip -cdf < \"" $0 "\" 2>/dev/null"; hit = ""; keep = ""
-		while ((c | getline row) > 0) {
-			split(row, f, "\t")
-			if (f[1] != p) continue
-			if (f[2] != "-") { hit = f[2] "\t" f[3]; break }
-			keep = f[2] "\t" f[3]
-		}
-		close(c)
-		if (hit != "") cur = hit; else if (keep != "") cur = keep
-		printf "%s\t%s\n", ts, cur
-	}'
+	## a delta somehow holds both, the file being THERE is the truth.
+	## grep -F picks the few rows that mention the path out of millions and awk
+	## only checks those: awk reading every row itself took 9s of 9.3 for one
+	## lookup on horse (13 deltas, 4.6M rows), grep -F takes 0.25s.
+	while IFS= read -r _vf_f; do
+		[ -n "$_vf_f" ] || continue
+		_vf_ts=${_vf_f##*/d.}; _vf_ts=${_vf_ts%.gz}; _vf_ts=${_vf_ts%.tsv}
+		_vf_hit=$(gzip -cdf <"$_vf_f" 2>/dev/null | LC_ALL=C grep -F -- "$_p" |
+			LC_ALL=C awk -F'\t' -v p="$_p" '
+				$1 != p { next }
+				$2 != "-" { print $2 "\t" $3; f = 1; exit }
+				{ k = $2 "\t" $3 }
+				END { if (!f && k != "") print k }')
+		[ -n "$_vf_hit" ] && _cur=$_vf_hit
+		printf '%s\t%s\n' "$_vf_ts" "$_cur"
+	done <<_EOF
+$(vs_delta_files "$_d")
+_EOF
 	return 0
 }
 
@@ -4498,6 +4502,23 @@ lookup_flush() {
 	return 0
 }
 
+## Split snapshot rows (stdin, as snapshots_get prints them) against a file of
+## answers "<ts> TAB <inode> TAB <size> TAB <mtime>": the answered ones are
+## appended to <known> as "ts ep id inode size mtime" -- and to <copy> too,
+## unless it is "none" -- and the rest to <rest> unchanged, for the next source.
+lookup_split() {                # <answers> <known> <rest> <copy>
+	LC_ALL=C awk -F'\t' -v OFS='\t' -v known="$2" -v rest="$3" -v copy="$4" '
+		FILENAME == ARGV[1] { if (!($1 in a)) a[$1] = $2 OFS $3 OFS $4; next }
+		$2 == "" { next }
+		$2 in a {
+			print $2, $3, $4, a[$2] >>known
+			if (copy != "none") print $2, $3, $4, a[$2] >>copy
+			next
+		}
+		{ print >>rest }
+	' "$1" -
+}
+
 cmd_lookup() {
 	_p="$1"; _scope="${2:-}"
 	case "$_p" in
@@ -4522,26 +4543,34 @@ cmd_lookup() {
 		_any=1
 
 		_work=$(mktemp -d /tmp/my-tm.lk.XXXXXX) || return 1
-		: >"$_work/known"
-		: >"$_work/todo"
-		## what the index walk already recorded: every covered snapshot, no mount
-		vs_versions_for "$_h" "$_rel" >"$_work/indexed" 2>/dev/null || : >"$_work/indexed"
-		_nidx=$(count_lines <"$_work/indexed")
-		[ "$_nidx" -gt 0 ] && dbg "lookup $_h: $_nidx snapshots answered from the index"
-		while IFS="$(printf '\t')" read -r _l _ts _ep _id _x _f _a _t2 _u _st _vol; do
-			[ -n "${_ts:-}" ] || continue
-			if _hit=$(awk -F'\t' -v t="$_ts" '$1 == t {printf "-\t%s\t%s", $2, $3; exit}' \
-					"$_work/indexed"); [ -n "$_hit" ]; then
-				printf '%s\t%s\t%s\t%s\n' "$_ts" "$_ep" "$_id" "$_hit" >>"$_work/known"
-			elif _hit=$(vs_lookup "$_h" "$_ts" "$_rel"); then
-				printf '%s\t%s\t%s\t%s\n' "$_ts" "$_ep" "$_id" "$_hit" >>"$_work/known"
-			else
-				[ "${_vol:--}" = "-" ] && _vol="Data"
-				printf '%s\t%s\t%s\t%s\n' "$_ts" "$_ep" "$_id" "$_vol" >>"$_work/todo"
+		: >"$_work/known"; : >"$_work/todo"; : >"$_work/pending"; : >"$_work/indexed"
+		## 1. the answers already kept -- root's shared cache first, then this
+		##    user's own -- in ONE pass, not a process per snapshot
+		vs_check_generation
+		for _vf in $(vs_current_files); do
+			LC_ALL=C awk -F'\t' -v l="$_h" -v p="$_rel" \
+				'$1 == l && $3 == p {print $2 "\t" $4 "\t" $5 "\t" $6}' "$_vf"
+		done >"$_work/kept"
+		printf '%s\n' "$_rows" | lookup_split "$_work/kept" "$_work/known" "$_work/pending" none
+		## 2. what the index walk recorded, for the rest -- replaying its deltas
+		##    costs seconds, so its answers are kept like any other, and the next
+		##    run (root's, or any user's reading root's) does not replay them
+		if [ -s "$_work/pending" ]; then
+			vs_versions_for "$_h" "$_rel" 2>/dev/null |
+				awk -F'\t' -v OFS='\t' '{print $1, "-", $2, $3}' >"$_work/indexed"
+			if [ -s "$_work/indexed" ]; then
+				dbg "lookup $_h: $(count_lines <"$_work/indexed") snapshots answered from the index"
+				: >"$_work/unanswered"
+				lookup_split "$_work/indexed" "$_work/known" "$_work/unanswered" "$_work/fromidx" <"$_work/pending"
+				[ -s "$_work/fromidx" ] &&
+					awk -F'\t' -v p="$_rel" '{printf "%s\t%s\t%s\t%s\t%s\n", $1, p, $4, $5, $6}' \
+						"$_work/fromidx" | vs_put "$_h"
+				mv -f "$_work/unanswered" "$_work/pending"
 			fi
-		done <<_EOF
-$_rows
-_EOF
+		fi
+		## 3. the rest is read live: "ts ep id volume"
+		awk -F'\t' -v OFS='\t' '$2 != "" { v = $11; if (v == "" || v == "-") v = "Data"; print $2, $3, $4, v }' \
+			"$_work/pending" >"$_work/todo"
 		_ntodo=$(count_lines < "$_work/todo")
 		_nknown=$(count_lines < "$_work/known")
 		dbg "lookup $_h: $_nknown from the version store, $_ntodo to read live"
@@ -11501,6 +11530,29 @@ t_test_versions_any_walk_order() {
 	rm -rf "$_d" "$_wo"
 }
 
+## A lookup answered from the index replayed the index's deltas on EVERY run:
+## on horse that is 50 MB of them, 10 s of CPU for one path, root's run and
+## every user's alike, although nothing was read live. Answers from the index
+## are kept like any other now. Adversarial: the replay is counted -- once on
+## the first lookup, never on the second -- and the table must not change.
+t_test_index_answers_are_kept() {
+	printf '\nAn answer from the index is kept, not worked out again\n'
+	_ik_n="$T_ROOT/ik.replays"; : >"$_ik_n"
+	_ik_rows=$(snapshots_get store | cut -f2)
+	# shellcheck disable=SC2329  # stands in for the index: counts, and answers every snapshot
+	_ik_run() { (
+		vs_versions_for() { echo x >>"$_ik_n"; printf '%s\n' "$_ik_rows" | awk 'NF {print $1 "\t4242\t1700000000"}'; }
+		cmd_lookup /Users/u/kept.txt store
+	) 2>&1; }
+	_ik_1=$(_ik_run)
+	t_eq "the first lookup works it out from the index, once" "$(count_lines <"$_ik_n")" "1"
+	_ik_2=$(_ik_run)
+	t_eq "the second does not replay the index at all" "$(count_lines <"$_ik_n")" "1"
+	t_eq "(and answers the same)" "$_ik_2" "$_ik_1"
+	t_match "(which is a real answer)" "$_ik_1" "4[.]14K"
+	rm -f "$_ik_n"
+}
+
 ## The suite writes its shared cache itself, so it never saw what every
 ## non-root run on a real machine sees: a shared cache that belongs to root.
 ## On horse that printed "cannot create .../versions.gen: Permission denied"
@@ -12603,6 +12655,7 @@ run_tests() {
 	t_test_completion_follows_help
 	t_test_failed_read_is_not_absent
 	t_test_user_on_a_root_cache
+	t_test_index_answers_are_kept
 	t_test_index_is_shared_only
 	t_test_superscript_marks_and_alignment
 	t_test_status_remembered_space
