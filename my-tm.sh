@@ -3531,16 +3531,29 @@ vs_prune() {
 
 vs_file() { printf '%s/index/versions.tsv\n' "$(cache_write_dir)"; }
 
-## Discard a store written by a different generation of the path logic.
+## The stores of lookup answers written by THIS generation of the path logic,
+## one path per line. Everything that reads them goes through here: a store
+## from another generation is never read -- a non-root run cannot discard
+## root's, and must not believe it either.
+vs_current_files() {
+	for _d in $(cache_read_dirs); do
+		[ -f "$_d/index/versions.tsv" ] || continue
+		[ "$(cat "$_d/index/versions.gen" 2>/dev/null)" = "$VS_GENERATION" ] || continue
+		printf '%s\n' "$_d/index/versions.tsv"
+	done
+	return 0
+}
+
+## Discard a store written by a different generation -- where this run may:
+## one it cannot write is left to its owner, and is not read meanwhile.
 vs_check_generation() {
 	for _d in $(cache_read_dirs); do
 		[ -f "$_d/index/versions.tsv" ] || continue
-		_g=""
-		[ -f "$_d/index/versions.gen" ] && _g=$(cat "$_d/index/versions.gen" 2>/dev/null)
-		[ "$_g" = "$VS_GENERATION" ] && continue
-		dbg "version store in $_d was written by generation ${_g:-0}, not $VS_GENERATION -- discarding it"
+		[ "$(cat "$_d/index/versions.gen" 2>/dev/null)" = "$VS_GENERATION" ] && continue
+		[ -w "$_d/index" ] || continue
+		dbg "version store in $_d was written by another generation than $VS_GENERATION -- discarding it"
 		rm -f "$_d/index/versions.tsv" 2>/dev/null
-		printf '%s\n' "$VS_GENERATION" >"$_d/index/versions.gen" 2>/dev/null || true
+		{ printf '%s\n' "$VS_GENERATION" >"$_d/index/versions.gen"; } 2>/dev/null || true
 	done
 	return 0
 }
@@ -3548,9 +3561,7 @@ vs_check_generation() {
 vs_lookup() {
 	_loc="$1"; _ts="$2"; _p="$3"
 	vs_check_generation
-	for _d in $(cache_read_dirs); do
-		_f="$_d/index/versions.tsv"
-		[ -f "$_f" ] || continue
+	for _f in $(vs_current_files); do
 		_hit=$(awk -F'\t' -v l="$_loc" -v t="$_ts" -v p="$_p" \
 			'$1 == l && $2 == t && $3 == p { printf "%s\t%s\t%s\n", $4, $5, $6; exit }' "$_f")
 		[ -n "$_hit" ] && { printf '%s\n' "$_hit"; return 0; }
@@ -3570,16 +3581,14 @@ vs_put() {
 		[ -f "$_f" ] && cat "$_f"
 		cat "$_new"
 	} | sort -u | atomic_write "$_f" 2>/dev/null || dbg "version store not writable: $_f"
-	printf '%s\n' "$VS_GENERATION" >"$(dirname "$_f")/versions.gen" 2>/dev/null || true
+	{ printf '%s\n' "$VS_GENERATION" >"$(dirname "$_f")/versions.gen"; } 2>/dev/null || true
 	rm -f "$_new"
 	return 0
 }
 
 vs_covered_count() {
 	_loc="$1"
-	for _d in $(cache_read_dirs); do
-		_f="$_d/index/versions.tsv"
-		[ -f "$_f" ] || continue
+	for _f in $(vs_current_files); do
 		awk -F'\t' -v l="$_loc" '$1 == l {seen[$2] = 1} END {print length(seen)}' "$_f"
 		return 0
 	done
@@ -4539,7 +4548,7 @@ _EOF
 
 		if [ "$_ntodo" -gt 0 ]; then
 			[ "$_ntodo" -gt "$LOOKUP_CHUNK" ] &&
-				msg "reading $_ntodo snapshots of '$_h' (first touch on a sleeping disk can take a while)"
+				msg "reading $_ntodo of $(( _ntodo + _nknown )) snapshots of '$_h' -- $_nknown already known from the index and earlier lookups; these are kept once read"
 			## In chunks: mount up to LOOKUP_CHUNK snapshots, stat them all in ONE
 			## exec, release them, next chunk.  Mounting the whole history at once
 			## would pin every snapshot against Time Machine's thinning for as long
@@ -4660,9 +4669,8 @@ _EOF
 		_i=$(( _i + 1 ))
 		[ "$_max" -gt 0 ] && [ "$_i" -gt "$_max" ] && break
 		_vers="?"; _new="-"; _old="-"
-		_vrows=$(for _d in $(cache_read_dirs); do
-			[ -f "$_d/index/versions.tsv" ] || continue
-			awk -F'\t' -v p="$_p" '$3 == p && $4 != "-" {print $2}' "$_d/index/versions.tsv"
+		_vrows=$(for _f in $(vs_current_files); do
+			awk -F'\t' -v p="$_p" '$3 == p && $4 != "-" {print $2}' "$_f"
 		done | sort -u)
 		if [ -n "$_vrows" ]; then
 			_vers=$(printf '%s\n' "$_vrows" | count_lines)
@@ -11493,6 +11501,54 @@ t_test_versions_any_walk_order() {
 	rm -rf "$_d" "$_wo"
 }
 
+## The suite writes its shared cache itself, so it never saw what every
+## non-root run on a real machine sees: a shared cache that belongs to root.
+## On horse that printed "cannot create .../versions.gen: Permission denied"
+## once per snapshot. Adversarial: the real script, as a separate process with
+## its own config, first fills the shared cache, which is then made read-only
+## and left one version-store generation behind -- the state after an update --
+## and every command a user runs must print nothing on stderr but my-tm's own
+## messages, and must not read the stale store.
+t_test_user_on_a_root_cache() {
+	printf '\nA user run against a shared cache it may not write\n'
+	_ur="$T_ROOT/ur"; mkdir -p "$_ur/nosite" "$_ur/ucache"
+	{
+		printf 'CACHE_DIR="%s"\nCACHE_DIR_USER="%s"\n' "$T_ROOT/cache" "$_ur/ucache"
+		## a mount tree of its own: what it builds must not change later tests
+		printf 'MOUNT_ROOT="%s"\nLOG_DIR="%s"\nFIRMLINK="%s"\n' "$_ur/mount" "$_ur/log" "$_ur/mount"
+	} >"$_ur/conf"
+	# shellcheck disable=SC2069  # stderr ONLY: that is what is being judged
+	_ur_run() { MY_TM_CONFIG="$_ur/conf" SITE_CONF_DIR="$_ur/nosite" dash "$T_MYTM" "$@" 2>&1 >/dev/null; }
+	## anything but my-tm's own prefixes is a leak: a shell error, a tool's
+	_ur_leaks() { printf '%s\n' "$1" | grep -v -e '^ !!! ' -e '^ --> ' -e '^ >>> ' -e '^    > ' \
+		-e '^ ~~~ ' -e '^ERROR ' -e '^$' -e '^  *[^ ]' || true; }
+
+	## as the owner: fill the shared cache, then leave the store one generation old
+	_ur_run --status >/dev/null; _ur_run --ls store >/dev/null
+	_ur_id=$(snapshots_get store | head -n 1 | cut -f4)
+	mkdir -p "$T_ROOT/cache/index"
+	printf 'store\t2026-08-20-155805\t/Users/u/stale\t1\t999\t1\n' >>"$T_ROOT/cache/index/versions.tsv"
+	printf '%s\n' "$(( VS_GENERATION - 1 ))" >"$T_ROOT/cache/index/versions.gen"
+	chmod -R a-w "$T_ROOT/cache"
+
+	for _ur_c in "--status" "--ls store" "--ls" "--cached --ls store" "--show $_ur_id" \
+	             "--find stale store" "--lookup /Users/u/stale store" "--health store" \
+	             "--refresh store" "--index store"; do
+		# shellcheck disable=SC2086  # the command words are split on purpose
+		_ur_err=$(_ur_run $_ur_c)
+		t_eq "$_ur_c: nothing on stderr but my-tm's own lines" "$(_ur_leaks "$_ur_err")" ""
+	done
+	# shellcheck disable=SC2086
+	t_match "(--index still refuses, naming the root command)" "$(_ur_run --index store)" "rerun as root"
+	t_eq "the stale store is not believed" \
+		"$(vs_lookup store 2026-08-20-155805 /Users/u/stale 2>/dev/null)" ""
+	chmod -R u+w "$T_ROOT/cache"
+	t_eq "(and it is still there for its owner to discard)" \
+		"$(count_match '/Users/u/stale' <"$T_ROOT/cache/index/versions.tsv")" "1"
+	rm -f "$T_ROOT/cache/index/versions.tsv" "$T_ROOT/cache/index/versions.gen"
+	rm -rf "$_ur"
+}
+
 ## Two runs at once -- root and a user -- and the user's run recorded a file
 ## that was plainly there as "absent" in three snapshots, for good: every stat
 ## that failed became "absent", whatever the reason. Adversarial: a file that
@@ -12546,6 +12602,7 @@ run_tests() {
 	t_test_image_read_without_attaching
 	t_test_completion_follows_help
 	t_test_failed_read_is_not_absent
+	t_test_user_on_a_root_cache
 	t_test_index_is_shared_only
 	t_test_superscript_marks_and_alignment
 	t_test_status_remembered_space
