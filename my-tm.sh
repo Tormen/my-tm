@@ -122,9 +122,10 @@ LOOKUP_CHUNK=16
 ## a permanent fact -- but only if my-tm looked in the RIGHT PLACE. A bug in
 ## path resolution once recorded "absent" for files that were plainly there,
 ## and "permanent fact" then means "permanently wrong". Bump this whenever
-## anything about how a path inside a snapshot is resolved changes: rows from
-## an older generation are discarded rather than trusted.
-VS_GENERATION=2
+## anything about how a path inside a snapshot is resolved -- or how a failed
+## read is told from an absent file -- changes: rows from an older generation
+## are discarded rather than trusted. (3: a failed stat was stored as absent.)
+VS_GENERATION=3
 
 #############################################################################
 ## RUNTIME STATE (never in the config)
@@ -3123,7 +3124,7 @@ _EOF
 ## indexed, and a lookup replays the deltas by name. A snapshot walked out of
 ## order therefore rewrites the delta of the one after it (or becomes the new
 ## baseline), in a hard-linked copy of the store that is swapped in whole.
-vs_dir() { printf '%s/index/%s.versions\n' "$(cache_write_dir)" "$1"; }
+vs_dir() { printf '%s/%s.versions\n' "$(index_dir)" "$1"; }
 
 ## Which baseline bucket a path lives in. Must match vs_write_baseline exactly:
 ## the last two characters of the path, with anything awkward folded to "_".
@@ -3590,7 +3591,19 @@ vs_covered_count() {
 ## THE SEARCH INDEX  (locate(1) machinery: no new format, no daemon)
 #############################################################################
 
-index_dir() { printf '%s/index\n' "$(cache_write_dir)"; }
+## The name index is EXPENSIVE -- a walk of every file in every snapshot -- so
+## it exists once, in the shared directory, written by root alone: a non-root
+## walk also sees only what that user may read, so a private index would be
+## an incomplete one. A cache is cheap and every user keeps their own.
+index_dir() { printf '%s/index\n' "$CACHE_DIR"; }
+
+## Refuse in one line, naming the command to run as root, before anything is
+## walked or written -- rather than building a private, incomplete copy.
+index_writable() {
+	need_dir "$(index_dir)" >/dev/null 2>&1
+	[ -w "$(index_dir)" ] && return 0
+	err "$(index_dir) is the shared name index: needs root -- rerun as root: $US ${1:-}"
+}
 
 ## The locate build tools ship in /usr/libexec and are NOT on PATH. Calling
 ## them by bare name exits 127, which would leave --index cheerfully
@@ -3617,11 +3630,9 @@ index_dbs() {
 	_loc="$1"; _list=""
 	[ "$(loc_target "$_loc")" = "local" ] && [ -f /var/db/locate.database ] &&
 		_list="/var/db/locate.database"
-	for _d in $(cache_read_dirs); do
-		for _f in "$_d/index/$_loc.db" "$_d/index/$_loc".inc.*.db; do
-			[ -f "$_f" ] || continue
-			if [ -z "$_list" ]; then _list="$_f"; else _list="$_list:$_f"; fi
-		done
+	for _f in "$(index_dir)/$_loc.db" "$(index_dir)/$_loc".inc.*.db; do
+		[ -f "$_f" ] || continue
+		if [ -z "$_list" ]; then _list="$_f"; else _list="$_list:$_f"; fi
 	done
 	printf '%s\n' "$_list"
 	return 0
@@ -3634,14 +3645,11 @@ index_covered_file() { printf '%s/%s.covered\n' "$(index_dir)" "$1"; }
 ## bookkeeping file to keep in step with it. Never indexed reads as the whole
 ## epoch, which is older than any interval anyone can configure.
 index_age() {
-	## every directory it may be READ from, not the one this user may write:
-	## the index is root's, and anyone else writes elsewhere
+	## the shared index is the only one (see index_dir)
 	_ia_m=0
-	for _ia_d in $(cache_read_dirs); do
-		[ -f "$_ia_d/index/$1.covered" ] || continue
-		_ia_t=$(stat -f '%m' "$_ia_d/index/$1.covered" 2>/dev/null || echo 0)
-		[ "$_ia_t" -gt "$_ia_m" ] && _ia_m=$_ia_t
-	done
+	if [ -f "$(index_dir)/$1.covered" ]; then
+		_ia_m=$(stat -f '%m' "$(index_dir)/$1.covered" 2>/dev/null || echo 0)
+	fi
 	[ "$_ia_m" -gt 0 ] || { now_epoch; return 0; }
 	printf '%s\n' "$(( $(now_epoch) - _ia_m ))"
 }
@@ -3675,11 +3683,10 @@ index_loc_bytes() {
 	## The handle is saved first -- set -- below reuses $1 for the path list.
 	_ilb_h="$1"
 	set --
-	for _ilb_d in $(cache_read_dirs); do
-		for _ilb_p in "$_ilb_d/index/$_ilb_h.db" "$_ilb_d/index/$_ilb_h".inc.*.db \
-		              "$_ilb_d/index/$_ilb_h.covered" "$_ilb_d/index/$_ilb_h.versions"; do
-			[ -e "$_ilb_p" ] && set -- "$@" "$_ilb_p"
-		done
+	_ilb_d=$(index_dir)
+	for _ilb_p in "$_ilb_d/$_ilb_h.db" "$_ilb_d/$_ilb_h".inc.*.db \
+	              "$_ilb_d/$_ilb_h.covered" "$_ilb_d/$_ilb_h.versions"; do
+		[ -e "$_ilb_p" ] && set -- "$@" "$_ilb_p"
 	done
 	if [ "$#" -eq 0 ]; then
 		printf '0\n'
@@ -3688,14 +3695,12 @@ index_loc_bytes() {
 	du -sk "$@" 2>/dev/null | awk '{ s += $1 } END { print s * 1024 }'
 }
 
-## bytes of index on disk, across every directory it is read from
+## bytes of index on disk
 index_size_bytes() {
 	_is_b=0
-	for _is_d in $(cache_read_dirs); do
-		[ -d "$_is_d/index" ] || continue
-		_is_b=$(( _is_b + $(du -sk "$_is_d/index" 2>/dev/null | awk '{print $1 * 1024}') ))
-	done
-	printf '%s\n' "$_is_b"
+	[ -d "$(index_dir)" ] &&
+		_is_b=$(du -sk "$(index_dir)" 2>/dev/null | awk '{print $1 * 1024}')
+	printf '%s\n' "${_is_b:-0}"
 }
 
 ## Is there a backup this location's index has not seen? Opted in, reachable,
@@ -3749,11 +3754,7 @@ index_rm() {
 
 ## every snapshot of a location the index already covers
 unique_cache_dump() {
-	for _d in $(cache_read_dirs); do
-		_f="$_d/index/$1.covered"
-		[ -f "$_f" ] || continue
-		cat "$_f" 2>/dev/null
-	done
+	[ -f "$(index_dir)/$1.covered" ] && cat "$(index_dir)/$1.covered" 2>/dev/null
 	return 0
 }
 
@@ -4437,15 +4438,42 @@ lookup_flush() {
 		## NUL-separated into one stat: a path inside a backup can contain
 		## spaces, so word-splitting an argument list would corrupt it
 		cut -f4 "$_w/paths" | tr '\n' '\0' |
-			xargs -0 stat -f '%N%t%i %z %m' >"$_w/stats" 2>/dev/null || true
-		awk -F'\t' '
-			FILENAME ~ /stats$/ { st[$1] = $2; next }
+			xargs -0 stat -f '%N%t%i %z %m' >"$_w/stats" 2>"$_w/staterr" || true
+		## A failed stat is NOT "absent". It was once taken as that, and stored
+		## for good: two runs at once, one reading inside the other's mount,
+		## recorded a file that was plainly there as gone. Absent is only "no
+		## such file" in a volume that is still there and readable; anything
+		## else -- permission, a mount released underneath -- is not an answer.
+		: >"$_w/roots"
+		cut -f5 "$_w/paths" | sort -u >"$_w/roots.all"
+		while IFS= read -r _r; do
+			[ -n "$_r" ] && [ -d "$_r" ] && [ -x "$_r" ] && printf '%s\n' "$_r" >>"$_w/roots"
+		done <"$_w/roots.all"
+		: >"$_w/unread"
+		## "stat: <path>: No such file or directory" -- macOS 26 repeats the
+		## "stat: " before the reason, so only the start and the end are fixed
+		awk -F'\t' -v unread="$_w/unread" '
+			function missing(pre,    i) {
+				for (i = 1; i <= ne; i++)
+					if (index(err[i], pre) == 1 && err[i] ~ /No such file or directory$/) return 1
+				return 0
+			}
+			FILENAME ~ /stats$/   { st[$1] = $2; next }
+			FILENAME ~ /staterr$/ { err[++ne] = $0; next }
+			FILENAME ~ /roots$/   { ok[$0] = 1; next }
 			FILENAME ~ /paths$/ {
-				v = ($4 in st) ? st[$4] : "- - -";
+				if ($4 in st) v = st[$4]
+				else if (missing("stat: " $4 ": ") && ($5 in ok)) v = "- - -"
+				else { print $1 "\t" $4 > unread; next }
 				split(v, a, " ");
 				printf "%s\t%s\t%s\t%s\t%s\t%s\n", $1, $2, $3, a[1], a[2], a[3];
 			}
-		' "$_w/stats" "$_w/paths" >"$_w/chunk_known"
+		' "$_w/stats" "$_w/staterr" "$_w/roots" "$_w/paths" >"$_w/chunk_known"
+		while IFS="$(printf '\t')" read -r _ut _up; do
+			[ -n "$_ut" ] || continue
+			_ue=$(awk -v p="stat: $_up: " 'index($0, p) == 1 {r = substr($0, length(p) + 1); sub(/^stat: /, "", r); print r; exit}' "$_w/staterr")
+			warn "could not read it in $(ts_display "$_ut"): ${_ue:-its volume is no longer mounted}"
+		done <"$_w/unread"
 		cat "$_w/chunk_known" >>"$_w/known"
 		## snapshots are immutable, so these rows are permanent facts
 		awk -F'\t' -v p="$_relp" '{printf "%s\t%s\t%s\t%s\t%s\n", $1, p, $4, $5, $6}' \
@@ -4521,8 +4549,8 @@ _EOF
 				[ -n "${_ts:-}" ] || continue
 				_mp=$(transient_snapshot "$_h" "$_ts") || continue
 				printf '%s\n' "$_mp" >>"$_work/mnts"
-				printf '%s\t%s\t%s\t%s\n' "$_ts" "$_ep" "$_id" \
-					"$(mnt_volume_path "$_h" "$_ts" "$_vol")$_rel" >>"$_work/paths"
+				_vr=$(mnt_volume_path "$_h" "$_ts" "$_vol")
+				printf '%s\t%s\t%s\t%s\t%s\n' "$_ts" "$_ep" "$_id" "$_vr$_rel" "$_vr" >>"$_work/paths"
 				_inchunk=$(( _inchunk + 1 ))
 				if [ "$_inchunk" -ge "$LOOKUP_CHUNK" ]; then
 					lookup_flush "$_work" "$_h" "$_rel"
@@ -5057,6 +5085,8 @@ cmd_index() {
 	locate_tool locate.mklocatedb >/dev/null ||
 		err "locate.mklocatedb not found (looked on PATH and in /usr/libexec). The name index --find uses cannot be built without it."
 	_targets="$*"
+	_iw_all=""; [ "${OPT_ALL:-0}" = "1" ] && _iw_all=" --all"
+	index_writable "--index${_targets:+ $_targets}$_iw_all"
 	## drop what has been thinned away since the last run, before adding more
 	for _ph in $(locations_all | awk -F'\t' '$2 != "local" || 1 {print $1}'); do
 		loc_reachable "$_ph" && vs_prune "$_ph"
@@ -5173,6 +5203,7 @@ cmd_rm_index() {
 		_rxs="$_rxs $_rh"
 	done
 	locations_writable "--rm-index$_rxs"
+	index_writable "--rm-index$_rxs"
 	for _rx in $_rxs; do
 		_rx_c=$(index_covered_count "$_rx")
 		loc_set_index "$_rx" 0 || err "$_rx: could not write the location list"
@@ -7446,7 +7477,10 @@ MAINTAIN
                                  already opted in. AUTO_INDEX_TM_BACKUP_DISKS=1
                                  opts in this Mac's backup disks instead.
                                  With --all: every snapshot -- an overnight
-                                 job, warns first
+                                 job, warns first. The index is expensive, so
+                                 it exists once, shared: only root builds it
+                                 (anyone else is told the command). Caches
+                                 are cheap: each user keeps their own
   --no-index <LOCATION>...       stop indexing it; the index it has is kept and
                                  still answers --find
   --rm-index <LOCATION>...       stop indexing it and delete its index
@@ -11459,6 +11493,63 @@ t_test_versions_any_walk_order() {
 	rm -rf "$_d" "$_wo"
 }
 
+## Two runs at once -- root and a user -- and the user's run recorded a file
+## that was plainly there as "absent" in three snapshots, for good: every stat
+## that failed became "absent", whatever the reason. Adversarial: a file that
+## cannot be read (permission), and one whose volume is gone (released while it
+## was read), must be neither "absent" nor stored; a genuinely missing file in
+## a readable volume still is.
+t_test_failed_read_is_not_absent() {
+	printf '\nA read that fails is not an absent file\n'
+	_fa="$T_ROOT/fa"; mkdir -p "$_fa/w" "$_fa/vol/here" "$_fa/vol/locked"
+	printf 'x' >"$_fa/vol/here/f"; printf 'y' >"$_fa/vol/locked/f"; chmod 000 "$_fa/vol/locked"
+	{
+		printf '2026-01-04-000000\t4\tp4\t%s\t%s\n' "$_fa/vol/here/f" "$_fa/vol"
+		printf '2026-01-03-000000\t3\ta3\t%s\t%s\n' "$_fa/vol/here/gone" "$_fa/vol"
+		printf '2026-01-02-000000\t2\tl2\t%s\t%s\n' "$_fa/vol/locked/f" "$_fa/vol"
+		printf '2026-01-01-000000\t1\tu1\t%s\t%s\n' "$_fa/unmounted/here/f" "$_fa/unmounted"
+	} >"$_fa/w/paths"
+	: >"$_fa/w/known"; : >"$_fa/w/mnts"
+	_fa_err=$(lookup_flush "$_fa/w" flushloc /here/f 2>&1 >/dev/null)
+	chmod 700 "$_fa/vol/locked"
+	t_eq "a file that is there is read" \
+		"$(awk -F'\t' '$3 == "p4" {print $5}' "$_fa/w/known")" "1"
+	t_eq "a file missing from a readable volume is absent" \
+		"$(awk -F'\t' '$3 == "a3" {print $5}' "$_fa/w/known")" "-"
+	t_eq "one that cannot be read is NOT absent" \
+		"$(awk -F'\t' '$3 == "l2"' "$_fa/w/known" | count_lines)" "0"
+	t_eq "nor one whose volume is gone" \
+		"$(awk -F'\t' '$3 == "u1"' "$_fa/w/known" | count_lines)" "0"
+	t_eq "and neither is stored" \
+		"$(awk -F'\t' '$1 == "flushloc" && ($2 == "2026-01-02-000000" || $2 == "2026-01-01-000000")' "$(vs_file)" | count_lines)" "0"
+	t_match "each is said, with why" "$_fa_err" "could not read it in 2026-01-02_0000.00: Permission denied"
+	t_match "(the one whose volume went, too)" "$_fa_err" "could not read it in 2026-01-01_0000.00"
+	rm -rf "$_fa"
+}
+
+## The name index is expensive and walked as root: a non-root run builds no
+## private one -- it would be a second copy, and an incomplete one, missing
+## whatever that user may not read. Adversarial: the refusal must come BEFORE
+## anything is walked, and an index that exists outside the shared directory
+## must not be searched.
+t_test_index_is_shared_only() {
+	printf '\nThe name index exists once, shared, and only root builds it\n'
+	mkdir -p "$(index_dir)"
+	chmod 0550 "$(index_dir)"
+	: >"$(t_calls)"
+	_is_out=$( ( cmd_index store ) 2>&1 )
+	chmod 0750 "$(index_dir)"
+	t_match "a run that may not write it refuses, naming the root command" "$_is_out" \
+		"is the shared name index: needs root -- rerun as root: .* --index store"
+	t_eq "and walks nothing first" "$(count_match 'mount_apfs' <"$(t_calls)")" "0"
+	t_eq "(nor builds a private one)" \
+		"$(for _x in "$CACHE_DIR_USER"/index/store*.db; do [ -e "$_x" ] && echo "$_x"; done | count_lines)" "0"
+	mkdir -p "$CACHE_DIR_USER/index"; : >"$CACHE_DIR_USER/index/store.db"
+	t_eq "an index outside the shared directory is not searched" \
+		"$(index_dbs store | tr ':' '\n' | count_match "$CACHE_DIR_USER")" "0"
+	rm -f "$CACHE_DIR_USER/index/store.db"
+}
+
 ## REGRESSION: presence was decided by the INODE field, but the version store
 ## holds path, size and mtime and has no inode -- so every snapshot the index
 ## answered was reported "absent" no matter what it held, which made a
@@ -12454,6 +12545,8 @@ run_tests() {
 	t_test_status_marks_guide_the_reader
 	t_test_image_read_without_attaching
 	t_test_completion_follows_help
+	t_test_failed_read_is_not_absent
+	t_test_index_is_shared_only
 	t_test_superscript_marks_and_alignment
 	t_test_status_remembered_space
 	t_test_suite_never_notifies_a_person

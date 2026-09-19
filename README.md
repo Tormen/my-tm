@@ -435,6 +435,10 @@ or `-S` narrows, `--all` widens to every known location.
   single exec (§8, §15), and the result goes into the store. So lookup cost is
   proportional to the snapshots that are *new since anyone last asked*, not to
   the history.
+* **A read that fails is not an absent file.** `absent` is only "no such file"
+  in a snapshot volume that is still mounted and readable; a permission error,
+  or a mount released while it was read, is printed, counted as "could not be
+  read" and never stored.
 * The live path is read **in chunks of 16 snapshots**: mount up to 16, `stat`
   them all in one exec, release them, next chunk. Mounting a whole history at
   once measured fine (62 mounts in ~4 s) but pins every snapshot against
@@ -879,9 +883,8 @@ change before making it.
 1. creates `$CACHE_DIR` and `$MOUNT_ROOT` — owner `root`, group `$TM_GROUP`
    (empty by default: the invoking user's primary group), mode `0750`: root
    writes, the group reads, others see nothing — files inside likewise, `0640`.
-   Everything a non-root run needs
-   to write goes to that user's own overlay and log dirs (§13), created on
-   first use.
+   A non-root run keeps its own cache and log (§13); the name index and the
+   location list are root's alone.
 2. **excludes `$CACHE_DIR` from Time Machine** (`tmutil addexclusion -p`).
    `$MOUNT_ROOT` lives there and holds mounted snapshots — a backup copied back
    into the backup — plus placeholders `$MAINT_JOB` rewrites every
@@ -1370,12 +1373,10 @@ A `PATH` is *covered* by a location when the volume UUID of `PATH`
     snapshots.cache         one line per snapshot, ALL locations: ID, loc,
                             timestamp, xid, files, added, total, state
     mounts.cache            root's own mount records (§8)
-    index/                  the search databases (§7)
+    index/                  the name index (§7) -- here only, root writes it
     mount/                  the /tm tree (§8)
-~/Library/Caches/my-tm/    per-user overlay ($CACHE_DIR_USER): this user's
-                            mount records, version-store rows from live
-                            lookups, and index increments — everything a
-                            non-root run may not write into the shared dir
+~/Library/Caches/my-tm/    this user's own cache ($CACHE_DIR_USER): snapshot
+                            table, answers of live lookups, mount records
 ~/Library/Logs/my-tm/      $LOG_DIR: my-tm.log (+ -D/-DD targets)
 ```
 
@@ -1387,13 +1388,18 @@ store read again; individual rows are validated too, since a checksum only
 proves a file is intact, not that what was written made sense. `locations.tsv`
 gets no checksum on purpose: it cannot be rebuilt from anything.
 
-The shared copies are written by root — the daemons, and any `sudo my-tm` run;
-the index is machine-global fact and expensive to build, so no reason for
-several users and root each to rescan. An unprivileged run reads the shared
-set and writes what it may not share into its own overlay; index queries pass
-both sets to `locate -d`, so an unprivileged `--index` is still useful — to
-that user — until a root run folds the work in. Deterministic IDs (§5) mean
-concurrent writers can never disagree. Writes are atomic (tmpfile + `mv`), and a written file takes its mode from its
+**Cache per user, index shared.** A cache only makes answers fast, and it is
+cheap and small: every user keeps their own, reading root's first. The name
+index is expensive — a walk of every file in every snapshot — so it exists
+once, here, and only root writes it; a non-root walk would also see only
+what that user may read. A non-root run that would have to write it builds
+nothing and names the command instead (the location list likewise):
+
+```text
+!!! /var/lib/mine/my-tm/index is the shared name index: needs root -- rerun as root: my-tm --index horse
+```
+
+Deterministic IDs (§5) mean concurrent writers can never disagree. Writes are atomic (tmpfile + `mv`), and a written file takes its mode from its
 directory: group-readable (`0640`) where the directory lets the group read,
 private (`0600`) elsewhere, never world-readable — my-tm runs under `umask 027`.
 Caches are line-oriented TSV: greppable, human-readable, rebuilt by `--refresh`.
