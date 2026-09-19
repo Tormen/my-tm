@@ -1104,7 +1104,7 @@ host2	host2:/Volumes/Backup
 <HOST>` first looks for a my-tm **already there**, along `REMOTE_MY_TM_PATHS`,
 and uses the first it finds — copying nothing and changing no modes. A second
 copy would *shadow* the one the host keeps current itself: in a `/LINKS` farm a
-file in `local/sbin` wins over `global/sbin`, so a copy put there stops every
+file in `local/bin` wins over `global/bin`, so a copy put there stops every
 later promotion from reaching that host. `--uninstall <HOST>` likewise never
 removes a my-tm it did not put there. Only when none is found is one copied, to
 the location's 3rd field, else `REMOTE_INSTALL_DIR_DEFAULT` (`/usr/local/sbin`),
