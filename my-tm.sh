@@ -34,8 +34,8 @@ US="${0##*/}"
 ## so the ROOT-OWNED COPY the daemons run -- which has no git beside it -- can
 ## still say which release it is and whether it is one.
 MY_TM_VERSION="0.9.1"
-SCRIPT_COMMIT="3c28d53"
-SCRIPT_RELEASE="v0.9.1-88-g3c28d53"
+SCRIPT_COMMIT="857f311"
+SCRIPT_RELEASE="v0.9.1-89-g857f311"
 
 ## The first 12 hex of this file's own SHA-256: the value that identifies the
 ## bytes. my-tm is COPIED to its installed path, so this is what tells the
@@ -69,7 +69,18 @@ _self_dir() {
 version_string() {
 	_vs_b=$(build_id)
 	_vs_d=$(git -c safe.directory='*' -C "$(_self_dir)" describe --tags --long 2>/dev/null)
-	[ -n "$_vs_d" ] || _vs_d=$SCRIPT_RELEASE
+	## describe answers about WHERE this file sits, not about what it is: a copy
+	## dropped in a foreign repo gets THAT repo's tags (/LINKS/global is one, and
+	## it holds the copies update-LINKS promotes). The stamped commit is the
+	## proof -- a repo that does not have it is not this tool's repo.
+	if [ -n "$_vs_d" ] && [ -n "$SCRIPT_COMMIT" ] \
+	   && ! git -c safe.directory='*' -C "$(_self_dir)" cat-file -e "${SCRIPT_COMMIT}^{commit}" 2>/dev/null; then
+		_vs_d=""
+	fi
+	## The stamp is a PAIR, written together: without SCRIPT_COMMIT there is no
+	## stamp to fall back to, and a lone SCRIPT_RELEASE would be a release claim
+	## nothing backs -- an unstamped file says so.
+	if [ -z "$_vs_d" ] && [ -n "$SCRIPT_COMMIT" ]; then _vs_d=$SCRIPT_RELEASE; fi
 	case "$_vs_d" in
 		*-*-g*)
 			_vs_t=${_vs_d%-*-g*}
