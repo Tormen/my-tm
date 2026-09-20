@@ -34,8 +34,8 @@ US="${0##*/}"
 ## so the ROOT-OWNED COPY the daemons run -- which has no git beside it -- can
 ## still say which release it is and whether it is one.
 MY_TM_VERSION="0.9.1"
-SCRIPT_COMMIT="70b8d97"
-SCRIPT_RELEASE="v0.9.1-87-g70b8d97"
+SCRIPT_COMMIT="3c28d53"
+SCRIPT_RELEASE="v0.9.1-88-g3c28d53"
 
 ## The first 12 hex of this file's own SHA-256: the value that identifies the
 ## bytes. my-tm is COPIED to its installed path, so this is what tells the
@@ -50,9 +50,25 @@ build_id() {
 ## my-tm 0.9.1+86 (v0.9.1-86-g377d933: 86 commit(s) past v0.9.1, unreleased, ..)
 ## Git first (exact in a checkout), the stamp second -- the installed copy has
 ## no git, and the stamp lags one release step because it precedes the tag.
+## The directory holding the REAL file, symlinks resolved. /LINKS/bin/<tool> is
+## a farm link into ANOTHER repo, so asking git from there answers about THAT
+## repo -- and once it has a tag of its own, this tool would report a stranger's
+## release as its own.
+_self_dir() {
+	_sd_p=$0
+	while [ -L "$_sd_p" ]; do
+	  _sd_t=$(readlink "$_sd_p") || break
+	  case "$_sd_t" in
+	    /*) _sd_p=$_sd_t ;;
+	    *)  _sd_p=$(dirname "$_sd_p")/$_sd_t ;;
+	  esac
+	done
+	(cd "$(dirname "$_sd_p")" 2>/dev/null && pwd -P)
+}
+
 version_string() {
 	_vs_b=$(build_id)
-	_vs_d=$(git -c safe.directory='*' -C "$(dirname "$0")" describe --tags --long 2>/dev/null)
+	_vs_d=$(git -c safe.directory='*' -C "$(_self_dir)" describe --tags --long 2>/dev/null)
 	[ -n "$_vs_d" ] || _vs_d=$SCRIPT_RELEASE
 	case "$_vs_d" in
 		*-*-g*)
