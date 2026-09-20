@@ -27,7 +27,85 @@ fi
 umask 027
 
 US="${0##*/}"
-MY_TM_VERSION="0.9.2"
+## MY_TM_VERSION names the release these bytes are BASED on -- only a release
+## commit sets it. SCRIPT_COMMIT is the commit this file was released from and
+## SCRIPT_RELEASE what 'git describe --tags --long' said then (<nearest
+## tag>-<commits since it>-g<short sha>); both are written by '--stamp-version'
+## so the ROOT-OWNED COPY the daemons run -- which has no git beside it -- can
+## still say which release it is and whether it is one.
+MY_TM_VERSION="0.9.1"
+SCRIPT_COMMIT="70b8d97"
+SCRIPT_RELEASE="v0.9.1-87-g70b8d97"
+
+## The first 12 hex of this file's own SHA-256: the value that identifies the
+## bytes. my-tm is COPIED to its installed path, so this is what tells the
+## checkout and the copy apart -- run --version on each and diff.
+build_id() {
+	_bi=$(shasum -a 256 "$0" 2>/dev/null | cut -c1-12)
+	[ -n "$_bi" ] || _bi=$(cksum < "$0" 2>/dev/null | cut -d" " -f1)
+	printf '%s' "${_bi:-unknown}"
+}
+
+## my-tm 0.9.1 (v0.9.1-0-g377d933: the v0.9.1 tag, build 1a2b3c4d5e6f)
+## my-tm 0.9.1+86 (v0.9.1-86-g377d933: 86 commit(s) past v0.9.1, unreleased, ..)
+## Git first (exact in a checkout), the stamp second -- the installed copy has
+## no git, and the stamp lags one release step because it precedes the tag.
+version_string() {
+	_vs_b=$(build_id)
+	_vs_d=$(git -c safe.directory='*' -C "$(dirname "$0")" describe --tags --long 2>/dev/null)
+	[ -n "$_vs_d" ] || _vs_d=$SCRIPT_RELEASE
+	case "$_vs_d" in
+		*-*-g*)
+			_vs_t=${_vs_d%-*-g*}
+			_vs_n=${_vs_d%-g*}; _vs_n=${_vs_n##*-}
+			if [ "$_vs_n" = 0 ]; then
+				printf '%s %s (%s: the %s tag, build %s)\n' "$US" "$MY_TM_VERSION" "$_vs_d" "$_vs_t" "$_vs_b"
+			else
+				printf '%s %s+%s (%s: %s commit(s) past %s, unreleased, build %s)\n' \
+					"$US" "$MY_TM_VERSION" "$_vs_n" "$_vs_d" "$_vs_n" "$_vs_t" "$_vs_b"
+			fi ;;
+		*)
+			if [ -n "$SCRIPT_COMMIT" ]; then
+				printf '%s %s (commit %s, build %s)\n' "$US" "$MY_TM_VERSION" "$SCRIPT_COMMIT" "$_vs_b"
+			else
+				printf '%s %s (build %s, unstamped)\n' "$US" "$MY_TM_VERSION" "$_vs_b"
+			fi ;;
+	esac
+}
+
+## Record HEAD and git's describe string in this file, then AMEND the commit
+## they belong to. Run it after committing and BEFORE pushing -- the amend
+## rewrites the commit -- and tag afterwards, or the tag lands on the commit
+## the amend replaced. The stamped sha lags HEAD by one, which is expected.
+cmd_stamp_version() {
+	_sv_dir=$(cd "$(dirname "$0")" 2>/dev/null && pwd) || err "stamp-version: cannot resolve my own directory"
+	_sv_self="$_sv_dir/$(basename "$0")"
+	git -C "$_sv_dir" rev-parse --git-dir >/dev/null 2>&1 || err "stamp-version: not a git checkout"
+	_sv_sha=$(git -C "$_sv_dir" rev-parse --short HEAD 2>/dev/null)
+	[ -n "$_sv_sha" ] || err "stamp-version: no commit to stamp from"
+	if git -C "$_sv_dir" rev-parse -q --verify '@{upstream}' >/dev/null 2>&1 \
+	   && git -C "$_sv_dir" merge-base --is-ancestor HEAD '@{upstream}' 2>/dev/null; then
+		err "stamp-version: HEAD $_sv_sha is already pushed -- amending it would rewrite published history. Commit, stamp, THEN push"
+	fi
+	_sv_staged=$(git -C "$_sv_dir" diff --cached --name-only 2>/dev/null)
+	[ -z "$_sv_staged" ] || err "stamp-version: something is staged -- the amend would fold it in: $_sv_staged"
+	git -C "$_sv_dir" diff --quiet -- "$(basename "$0")" 2>/dev/null \
+		|| err "stamp-version: this script has uncommitted edits -- commit them first"
+	_sv_desc=$(git -c safe.directory='*' -C "$_sv_dir" describe --tags --long 2>/dev/null)
+	_sv_tmp=$(mktemp "${TMPDIR:-/tmp}/my-tm.stamp.XXXXXX") || err "stamp-version: mktemp failed"
+	cp -p "$_sv_self" "$_sv_tmp" 2>/dev/null
+	sed -e "s|^SCRIPT_COMMIT=.*|SCRIPT_COMMIT=\"$_sv_sha\"|" \
+	    -e "s|^SCRIPT_RELEASE=.*|SCRIPT_RELEASE=\"$_sv_desc\"|" "$_sv_self" > "$_sv_tmp" \
+		|| { rm -f "$_sv_tmp"; err "stamp-version: could not rewrite the stamp"; }
+	grep -q "^SCRIPT_COMMIT=\"$_sv_sha\"\$" "$_sv_tmp" \
+		|| { rm -f "$_sv_tmp"; err "stamp-version: the rewritten file carries no stamp -- refusing to install it"; }
+	mv -f "$_sv_tmp" "$_sv_self" || { rm -f "$_sv_tmp"; err "stamp-version: could not install the stamped file"; }
+	git -C "$_sv_dir" add -- "$(basename "$0")" || err "stamp-version: git add failed"
+	git -C "$_sv_dir" commit -q --amend --no-edit || err "stamp-version: git amend failed"
+	printf 'stamped SCRIPT_COMMIT=%s SCRIPT_RELEASE=%s -- HEAD is now %s\n' \
+		"$_sv_sha" "${_sv_desc:-<no tag yet>}" "$(git -C "$_sv_dir" rev-parse --short HEAD)"
+	printf '  > the stamped sha lags HEAD by one: amending changes it. Tag AFTER this.\n'
+}
 
 #############################################################################
 ## DEFAULTS -- all neutral.  Site values belong in the config file, never here.
@@ -7946,12 +8024,13 @@ main() {
 		--refresh)      cmd_refresh "$@" ;;
 		--create-config) cmd_create_config "${1:-}" ;;
 		--completion)   cmd_completion "${1:-}" ;;
+		--stamp-version) cmd_stamp_version ;;
 		--version)
 			## name the FILE and its date, not just the number: my-tm is copied to
 			## a root-owned path for the daemons rather than symlinked, so a
 			## checkout and an installed copy can differ while looking identical
 			_vb=$(abs_path "$0")
-			printf '%s %s\n' "$US" "$MY_TM_VERSION"
+			version_string
 			printf '  %s\n' "$_vb"
 			printf '  %s\n' "$(stat -f '%Sm' -t '%Y-%m-%d %H:%M' "$_vb" 2>/dev/null)"
 			;;
