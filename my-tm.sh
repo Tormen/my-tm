@@ -34,8 +34,8 @@ US="${0##*/}"
 ## so the ROOT-OWNED COPY the daemons run -- which has no git beside it -- can
 ## still say which release it is and whether it is one.
 MY_TM_VERSION="0.9.1"
-SCRIPT_COMMIT="857f311"
-SCRIPT_RELEASE="v0.9.1-89-g857f311"
+SCRIPT_COMMIT="1e54aca"
+SCRIPT_RELEASE="v0.9.1-90-g1e54aca"
 
 ## The first 12 hex of this file's own SHA-256: the value that identifies the
 ## bytes. my-tm is COPIED to its installed path, so this is what tells the
@@ -114,6 +114,11 @@ cmd_stamp_version() {
 	   && git -C "$_sv_dir" merge-base --is-ancestor HEAD '@{upstream}' 2>/dev/null; then
 		err "stamp-version: HEAD $_sv_sha is already pushed -- amending it would rewrite published history. Commit, stamp, THEN push"
 	fi
+	## The repo may be SHARED -- other sessions commit here too -- and an amend
+	## rewrites whatever HEAD happens to be. Stamp only the commit that carries
+	## THIS file: if HEAD does not touch it, HEAD is somebody else's work.
+	[ -n "$(git -C "$_sv_dir" show --name-only --format= HEAD -- "$(basename "$0")" 2>/dev/null)" ] \
+	   || err "stamp-version: HEAD does not touch this file -- it is not this file's commit (commit it first; in a shared repo the amend would rewrite someone else's)."
 	_sv_staged=$(git -C "$_sv_dir" diff --cached --name-only 2>/dev/null)
 	[ -z "$_sv_staged" ] || err "stamp-version: something is staged -- the amend would fold it in: $_sv_staged"
 	git -C "$_sv_dir" diff --quiet -- "$(basename "$0")" 2>/dev/null \
