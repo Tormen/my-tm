@@ -1763,6 +1763,8 @@ Each of these runs twice (idempotence), against a fixture root, and asserts the
 |---|---|
 | `--add` / `--forget` | the `locations.tsv` line appears/vanishes; the rest of the file is byte-identical; a duplicate handle is refused; a handle in the ID alphabet is refused; a bad folder is refused before any write |
 | `--create-config` | never overwrites; stdout form and file form are identical |
+| space | the "??" in the table and the growth line below it name the same free space, with the newest sample written to the cache the other reader used to ignore |
+| a remote read that fails | the row says the read failed and why, names `--install <HOST> go`, and does not call it "not read yet"; a read that works and finds nothing keeps its own wording |
 | a user's run | the real script, against a shared cache it may not write and one version-store generation behind: `--status`, `--ls`, `--show`, `--find`, `--lookup`, `--health`, `--refresh`, `--index` print nothing on stderr but my-tm's own lines, and the stale store is not read |
 | `--install` | dirs created `root:$TM_GROUP` `0750` *verified by mode*, not by intent; `/etc/synthetic.conf` gains exactly one comment + one tab-separated line; a second run adds nothing; a pre-existing foreign `tm` entry is left alone and reported; the completion file lands in the invoking user's home, owned by them, and an unchanged rerun does not rewrite it; a job binary inside a user-writable tree is refused |
 | `--uninstall` | removes exactly what `--install` added and nothing else; a diff of `/etc/synthetic.conf` before-install vs after-uninstall is empty; asks before the cache |

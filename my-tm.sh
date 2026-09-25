@@ -2668,13 +2668,23 @@ usage_sample() {
 	return 0
 }
 
+## The samples of a location from EVERY cache, oldest first: root's shared
+## series and this user's own are the same measurement of the same disk, so a
+## reader that sees only one of them contradicts the other -- the table said
+## "966.7G??" from the shared series while the footer said "1.86T free" from a
+## user's stale one.
+usage_series() {                # <handle>
+	for _us_d in $(cache_read_dirs); do
+		[ -f "$_us_d/usage.$1.tsv" ] && cat "$_us_d/usage.$1.tsv"
+	done | LC_ALL=C sort -t"$(printf '\t')" -k1,1n -u
+	return 0
+}
+
 ## Growth from the series, and how long the free space lasts at that rate.
 ## Emits: per-day-bytes <TAB> free <TAB> days-left <TAB> span-days <TAB> samples
 ## Nothing at all until the series is long enough to mean something.
 usage_trend() {
-	_f="$(cache_write_dir)/usage.$1.tsv"
-	[ -f "$_f" ] || return 1
-	awk -F'\t' -v minspan="${USAGE_MIN_SPAN:-7200}" '
+	usage_series "$1" | awk -F'\t' -v minspan="${USAGE_MIN_SPAN:-7200}" '
 		NR == 1 { e0 = $1; u0 = $2 }
 		{ e1 = $1; u1 = $2; free = $3; n++ }
 		END {
@@ -2685,7 +2695,7 @@ usage_trend() {
 			days = (per > 0) ? free / per : -1;
 			printf "%d\t%d\t%d\t%.1f\t%d\n", per, free, days, span / 86400, n;
 		}
-	' "$_f"
+	'
 }
 
 ## the sweep never acts on a record alone: the live mount table must confirm a
@@ -3940,13 +3950,9 @@ status_footnote() {             # <text>; sets FN_MARK, appends to this row's no
 ## <TAB> free", from the usage series -- the numbers the growth line in the
 ## footer already uses, so a detached disk's cell need not claim it cannot know.
 usage_last() {                  # <handle>
-	for _ul_d in $(cache_read_dirs); do
-		[ -f "$_ul_d/usage.$1.tsv" ] || continue
-		tail -n 1 "$_ul_d/usage.$1.tsv" 2>/dev/null |
-			LC_ALL=C awk -F'\t' '$1 > 0 && $2 != "" && $3 != "" {printf "%s\t%s\t%s\n", $1, $2, $3; f = 1}
-				END {exit(f ? 0 : 1)}' && return 0
-	done
-	return 1
+	usage_series "$1" | tail -n 1 |
+		LC_ALL=C awk -F'\t' '$1 > 0 && $2 != "" && $3 != "" {printf "%s\t%s\t%s\n", $1, $2, $3; f = 1}
+			END {exit(f ? 0 : 1)}'
 }
 
 ## called once the row is built, with the handle the reasons belong to
@@ -4046,7 +4052,10 @@ _EOF
 		elif loc_ready "$_h"; then
 			_rows=$(snapshots_get "$_h")
 			if [ -z "$_rows" ]; then
-				if is_remote_target "$_t"; then
+				_rerr=$(remote_read_err "$_h")
+				if is_remote_target "$_t" && [ -n "$_rerr" ]; then
+					status_footnote "reading it on $(remote_host "$_t") failed: $_rerr -- my-tm may have moved there, as root: $US --install $(remote_host "$_t") go"
+				elif is_remote_target "$_t"; then
 					status_footnote "$(remote_host "$_t") has not read it yet, and a status never makes it open the store -- it could take minutes there. Read it once with: $US --ls $_h"
 				elif [ "$_t" = "local" ]; then
 					status_footnote "this Mac keeps no local snapshots right now -- Time Machine makes them only while backing THIS Mac up, and a Mac that is just a backup target has none. my-tm can take them itself: $US --local-snap takes one now, LOCAL_SNAP_INTERVAL=1h in the config keeps taking them"
@@ -5536,6 +5545,11 @@ remote_run() {                  # <handle> <args...>
 	ssh_batch "$_rr_host" "$_rr_dir/my-tm $*"
 }
 
+## Why the last read of this location's host failed, if it did -- written by
+## the read, so a status that gets no table can say which of the two it is.
+remote_read_err_file() { printf '%s/remote-err.%s\n' "$RUN_DIR" "$(slug "$1")"; }
+remote_read_err() { cat "$(remote_read_err_file "$1")" 2>/dev/null; }
+
 remote_snap_names() {
 	_t=$(loc_target "$1")
 	_rsn_host=$(remote_host "$_t")
@@ -5551,13 +5565,30 @@ remote_snap_names() {
 	## remote too old to know it refuses the call rather than opening anyway.
 	_rsn_c=""
 	[ "${STATUS_READ:-0}" = "1" ] && _rsn_c="--cached"
-	remote_run "$1" -J $_rsn_c --ls "$(remote_path "$_t")" 2>&1 >"$_rsn_out" |
-		LC_ALL=C awk -v h="$_rsn_host" '{
+	## A read that FAILED is not a store nobody has read yet, and saying so
+	## sent the reader to "--ls it once" while the truth was that my-tm was no
+	## longer at the recorded path there. The status is kept, and the first
+	## thing the far side complained about, for whoever asks next.
+	## in $RUN_DIR, not a variable: the caller reads the table in a command
+	## substitution, and a subshell's variables never reach it
+	rm -f "$(remote_read_err_file "$1")"
+	_rsn_rc="$_rsn_out.rc"; _rsn_err="$_rsn_out.err"
+	{ remote_run "$1" -J $_rsn_c --ls "$(remote_path "$_t")" 2>&1 >"$_rsn_out"
+	  printf '%s\n' "$?" >"$_rsn_rc"
+	} | LC_ALL=C awk -v h="$_rsn_host" -v raw="$_rsn_err" '{
 			line = $0; sub(/^[[:space:]]*(>>>|>>|~~~|-->|!!!|>|~)[[:space:]]?/, "", line)
 			if (line == "") next
+			print line >>raw
 			if ($0 ~ /^[[:space:]]*!!!/) printf " !!! %s: %s\n", h, line
 			else printf "    > %s: %s\n", h, line
 		}' >&2
+	if [ "$(cat "$_rsn_rc" 2>/dev/null)" != "0" ]; then
+		_rsn_why=$(head -n 1 "$_rsn_err" 2>/dev/null)
+		[ -n "$_rsn_why" ] || _rsn_why="it answered with an error"
+		printf '%s\n' "$_rsn_why" >"$(remote_read_err_file "$1")" 2>/dev/null
+		dbg "remote read of '$1' failed: $_rsn_why"
+	fi
+	rm -f "$_rsn_rc" "$_rsn_err"
 	## the remote copy of my-tm answers in JSON, so nothing has to be re-parsed
 	sed -nE 's/.*"snapshot": *"([0-9-]+)".*/\1/p' "$_rsn_out" | sort
 	rm -f "$_rsn_out"
@@ -11664,6 +11695,65 @@ t_test_index_answers_are_kept() {
 	rm -f "$_ik_n"
 }
 
+## The space a location has was read from TWO series -- the table's "??" from
+## the shared cache, the growth line under it from this user's own -- so a
+## status contradicted itself: "966.7G??" above "1.86T free". One series now,
+## merged from every cache. Adversarial: the newest sample sits in the cache
+## the OTHER reader used to ignore, so a reader still reading one file alone
+## reports the other number.
+t_test_space_is_one_series() {
+	printf '\nThe space of a location is one series, wherever it was sampled\n'
+	_ss_h=awaystore
+	_ss_save=$(cat "$T_ROOT/cache/locations.tsv")
+	printf '%s\t%s\t\n' "$_ss_h" "$T_ROOT/gone-away" >>"$T_ROOT/cache/locations.tsv"
+	locations_run_cache_drop
+	## the NEWEST sample in this user's own cache, the older one in the shared
+	## cache: a reader that consults only one of the two answers with the other
+	printf '%s\t2000000000000\t1800000000000\t1\t-\n' "$(( $(now_epoch) - 300000 ))" \
+		>"$CACHE_DIR/usage.$_ss_h.tsv"
+	printf '%s\t3000000000000\t900000000000\t1\t-\n' "$(( $(now_epoch) - 100000 ))" \
+		>"$CACHE_DIR_USER/usage.$_ss_h.tsv"
+	t_eq "the newest sample wins, wherever it was written" \
+		"$(usage_last "$_ss_h" | cut -f3)" "900000000000"
+	t_eq "and the growth line reports that same free space" \
+		"$(usage_trend "$_ss_h" | cut -f2)" "900000000000"
+	t_eq "(it saw both samples, not one)" "$(usage_trend "$_ss_h" | cut -f5)" "2"
+	_ss_out=$(cmd_status "$_ss_h" 2>&1)
+	_ss_n=$(human_bytes 900000000000)
+	t_eq "the table and the line under it name the same number" \
+		"$(printf '%s\n' "$_ss_out" | count_match "$_ss_n")" "2"
+	t_eq "(and the stale one is named nowhere)" \
+		"$(printf '%s\n' "$_ss_out" | count_match "$(human_bytes 1800000000000)")" "0"
+	rm -f "$CACHE_DIR_USER/usage.$_ss_h.tsv" "$CACHE_DIR/usage.$_ss_h.tsv"
+	printf '%s\n' "$_ss_save" >"$T_ROOT/cache/locations.tsv"
+	locations_run_cache_drop
+}
+
+## A remote read that FAILED was reported as "the host has not read it yet",
+## which sent the reader to "--ls it once" while the truth was that my-tm was
+## no longer at the path recorded for that host -- every remote call failing.
+## Adversarial: a read that genuinely finds nothing must keep the old wording.
+t_test_remote_failure_is_not_unread() {
+	printf '\nA remote read that failed says so, and what to do about it\n'
+	# shellcheck disable=SC2329  # stand-ins: the host answers, the call fails
+	_rf_out=$( ( remote_reachable() { return 0; }
+	             remote_run() { printf 'no such file or directory: /LINKS/sbin/my-tm\n' >&2; return 127; }
+	             cmd_status remote ) 2>&1 )
+	t_match "it says the read failed, and why" "$_rf_out" \
+		"reading it on host1 failed: .*no such file or directory"
+	t_match "and names the command that puts it right" "$_rf_out" "[-][-]install host1 go"
+	t_eq "it is NOT called 'not read yet'" \
+		"$(printf '%s\n' "$_rf_out" | count_match 'has not read it yet')" "0"
+	# shellcheck disable=SC2329  # the other case: the call works, nothing is there
+	_rf_ok=$( ( remote_reachable() { return 0; }
+	            remote_run() { return 0; }
+	            cmd_status remote ) 2>&1 )
+	t_match "a read that works but finds nothing keeps its own wording" "$_rf_ok" \
+		"host1 has not read it yet"
+	t_eq "(and claims no failure)" \
+		"$(printf '%s\n' "$_rf_ok" | count_match 'failed:')" "0"
+}
+
 ## The suite writes its shared cache itself, so it never saw what every
 ## non-root run on a real machine sees: a shared cache that belongs to root.
 ## On horse that printed "cannot create .../versions.gen: Permission denied"
@@ -12766,6 +12856,8 @@ run_tests() {
 	t_test_completion_follows_help
 	t_test_failed_read_is_not_absent
 	t_test_user_on_a_root_cache
+	t_test_space_is_one_series
+	t_test_remote_failure_is_not_unread
 	t_test_index_answers_are_kept
 	t_test_index_is_shared_only
 	t_test_superscript_marks_and_alignment
