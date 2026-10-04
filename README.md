@@ -146,7 +146,9 @@ INSTALL & SET UP
   --create-config [<FILE>]       print the default config, or write it to <FILE>
   --config <FILE>                use this config instead of the search order
   --completion [zsh|bash]        print the completion script
-  --run-tests | --help
+  --run-tests [<FILTER>]         run the built-in tests (TAP: the plan '1..N' first,
+                                 then 'ok K - name' per test)
+  --version | --help
 
   ADDED is what a backup WROTE, not what deleting it would free: macOS exposes
   no per-snapshot exclusive size for an APFS Time Machine store, so no column

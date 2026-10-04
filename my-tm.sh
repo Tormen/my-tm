@@ -34,8 +34,8 @@ US="${0##*/}"
 ## so the ROOT-OWNED COPY the daemons run -- which has no git beside it -- can
 ## still say which release it is and whether it is one.
 MY_TM_VERSION="0.9.1"
-SCRIPT_COMMIT="1e54aca"
-SCRIPT_RELEASE="v0.9.1-90-g1e54aca"
+SCRIPT_COMMIT="77a21f8"
+SCRIPT_RELEASE="v0.9.1-93-g77a21f8"
 
 ## The first 12 hex of this file's own SHA-256: the value that identifies the
 ## bytes. my-tm is COPIED to its installed path, so this is what tells the
@@ -7708,7 +7708,11 @@ INSTALL & SET UP
   --create-config [<FILE>]       print the default config, or write it to <FILE>
   --config <FILE>                use this config instead of the search order
   --completion [zsh|bash]        print the completion script
-  --run-tests | --version | --help
+  --run-tests [<FILTER>]         run the built-in tests: the plan '1..N' first,
+                                 then one 'ok K - name' line per test; only the
+                                 tests whose name contains <FILTER>, if given.
+                                 Add --with-snapshots to take a real local snapshot
+  --version | --help
 
   ADDED is what a backup WROTE, not what deleting it would free: macOS exposes
   no per-snapshot exclusive size for an APFS Time Machine store, so no column
@@ -12810,134 +12814,189 @@ t_test_version_output() {
 		"$(cd /tmp && abs_path ./x/y)" "/tmp/x/y"
 }
 
+## the guard: a test function left out of the run list would never run, and
+## the suite would still end green -- so the list is held to the file
+t_test_run_list_is_complete() {
+	printf '\nThe run list names every test\n'
+	_rl_def=$(sed -nE 's/^t_test_([a-z0-9_]+)\(\).*/\1/p' "$T_MYTM")
+	_rl_run=$(sed -nE 's/^[[:space:]]+_rt ([a-z0-9_]+)[[:space:]]+&& t_test_([a-z0-9_]+)$/\1 \2/p' "$T_MYTM" |
+		awk '$1 == $2 { print $1; next } { print "misnamed:" $1 "/" $2 }')
+	_rl_bad=$( { printf '%s\n' "$_rl_def" | sed 's/^/D /'; printf '%s\n' "$_rl_run" | sed 's/^/R /'; } |
+		awk '$1 == "D" { d[$2] = 1; next } { r[$2]++ }
+		     END { for (n in d) if (r[n] != 1) print n " (in the list " r[n] + 0 "x)"
+		           for (n in r) if (!(n in d)) print n " (no such test)" }' | LC_ALL=C sort | tr '\n' ' ' | sed 's/ $//')
+	[ -n "$_rl_def" ] || _rl_bad="no t_test_ function found in $T_MYTM"
+	t_eq "the run list names each of the $(printf '%s\n' "$_rl_def" | t_count_re .) test functions once" \
+		"$_rl_bad" ""
+}
+
+## The run list: the tests in the order they run, one t_test_<name> function
+## each. It is walked twice -- once to count the plan, once to run -- so the
+## plan always comes from this same list. The FILTER picks the names that
+## contain it. Some tests read state an earlier one left behind, so the order
+## is part of the suite.
+_rt_list() {
+	_rt ids                                  && t_test_ids
+	_rt handles                              && t_test_handles
+	_rt ttl                                  && t_test_ttl
+	_rt format                               && t_test_format
+	_rt manifest                             && t_test_manifest
+	_rt states                               && t_test_states
+	_rt previous_is_not_a_state              && t_test_previous_is_not_a_state
+	_rt thin                                 && t_test_thin
+	_rt config                               && t_test_config
+	_rt location_parameters                  && t_test_location_parameters
+	_rt locations                            && t_test_locations
+	_rt handle_characters                    && t_test_handle_characters
+	_rt one_shared_location_list             && t_test_one_shared_location_list
+	_rt ladder                               && t_test_ladder
+	_rt mount_records                        && t_test_mount_records
+	_rt version_store                        && t_test_version_store
+	_rt atomic                               && t_test_atomic
+	_rt plists                               && t_test_plists
+	_rt rm_dryrun                            && t_test_rm_dryrun
+	_rt help                                 && t_test_help
+	_rt paths                                && t_test_paths
+	_rt version_output                       && t_test_version_output
+	_rt post_backup                          && t_test_post_backup
+	_rt backup_already_running               && t_test_backup_already_running
+	_rt backup_volume_unmounted              && t_test_backup_volume_unmounted
+	_rt backup_result                        && t_test_backup_result
+	_rt cache_excluded                       && t_test_cache_excluded
+	_rt config_search_order                  && t_test_config_search_order
+	_rt attach_progress                      && t_test_attach_progress
+	_rt status_marks_guide_the_reader        && t_test_status_marks_guide_the_reader
+	_rt image_read_without_attaching         && t_test_image_read_without_attaching
+	_rt completion_follows_help              && t_test_completion_follows_help
+	_rt failed_read_is_not_absent            && t_test_failed_read_is_not_absent
+	_rt user_on_a_root_cache                 && t_test_user_on_a_root_cache
+	_rt space_is_one_series                  && t_test_space_is_one_series
+	_rt remote_failure_is_not_unread         && t_test_remote_failure_is_not_unread
+	_rt index_answers_are_kept               && t_test_index_answers_are_kept
+	_rt index_is_shared_only                 && t_test_index_is_shared_only
+	_rt superscript_marks_and_alignment      && t_test_superscript_marks_and_alignment
+	_rt status_remembered_space              && t_test_status_remembered_space
+	_rt suite_never_notifies_a_person        && t_test_suite_never_notifies_a_person
+	_rt ssh_never_becomes_a_master           && t_test_ssh_never_becomes_a_master
+	_rt status_asks_remotes_for_their_cache  && t_test_status_asks_remotes_for_their_cache
+	_rt find_searches_only_the_stores_index  && t_test_find_searches_only_the_stores_index
+	_rt bare_command_words                   && t_test_bare_command_words
+	_rt every_dash_is_explained              && t_test_every_dash_is_explained
+	_rt add_caches_what_it_opened            && t_test_add_caches_what_it_opened
+	_rt status_footnotes                     && t_test_status_footnotes
+	_rt attach_estimate                      && t_test_attach_estimate
+	_rt attach_message_is_about_this_disk    && t_test_attach_message_is_about_this_disk
+	_rt attach_is_not_orphaned               && t_test_attach_is_not_orphaned
+	_rt attach_one_at_a_time                 && t_test_attach_one_at_a_time
+	_rt remote_progress_reaches_the_caller   && t_test_remote_progress_reaches_the_caller
+	_rt lsof_never_answers                   && t_test_lsof_never_answers
+	_rt install_builds_no_tree               && t_test_install_builds_no_tree
+	_rt runs_without_home                    && t_test_runs_without_home
+	_rt autodetect_mode                      && t_test_autodetect_mode
+	_rt cache_unreadable                     && t_test_cache_unreadable
+	_rt install_config                       && t_test_install_config
+	_rt install_logs                         && t_test_install_logs
+	_rt job_plist_streams                    && t_test_job_plist_streams
+	_rt network_volume_of                    && t_test_network_volume_of
+	_rt opt_in_indexing                      && t_test_opt_in_indexing
+	_rt index_timing                         && t_test_index_timing
+	_rt headless_health_notifies             && t_test_headless_health_notifies
+	_rt ssh_locations                        && t_test_ssh_locations
+	_rt health_scope                         && t_test_health_scope
+	_rt every_default_is_offered             && t_test_every_default_is_offered
+	_rt remote_add_and_install               && t_test_remote_add_and_install
+	_rt unrecorded_mounts                    && t_test_unrecorded_mounts
+	_rt private_var_is_var                   && t_test_private_var_is_var
+	_rt remote_install_dir                   && t_test_remote_install_dir
+	_rt attention_todo                       && t_test_attention_todo
+	_rt install_writes_a_config              && t_test_install_writes_a_config
+	_rt install_uses_existing_my_tm          && t_test_install_uses_existing_my_tm
+	_rt ls_columns_align                     && t_test_ls_columns_align
+	_rt index_progress_visible               && t_test_index_progress_visible
+	_rt status_index_size                    && t_test_status_index_size
+	_rt run_cache                            && t_test_run_cache
+	_rt loc_resolve                          && t_test_loc_resolve
+	_rt vol_device                           && t_test_vol_device
+	_rt launcher                             && t_test_launcher
+	_rt install_launcher                     && t_test_install_launcher
+	_rt job_guidance                         && t_test_job_guidance
+	_rt detection_dedup                      && t_test_detection_dedup
+	_rt ejected_destination                  && t_test_ejected_destination
+	_rt auto_mount_destinations              && t_test_auto_mount_destinations
+	_rt verify_reports                       && t_test_verify_reports
+	_rt locate_toolchain                     && t_test_locate_toolchain
+	_rt indexer_exemption_expires            && t_test_indexer_exemption_expires
+	_rt lookup_collapse                      && t_test_lookup_collapse
+	_rt progress_goes_to_stderr              && t_test_progress_goes_to_stderr
+	_rt usage_trend                          && t_test_usage_trend
+	_rt version_store_pruning                && t_test_version_store_pruning
+	_rt prune_without_version_store          && t_test_prune_without_version_store
+	_rt delta_removals_by_path               && t_test_delta_removals_by_path
+	_rt versions_any_walk_order              && t_test_versions_any_walk_order
+	_rt presence_by_size_not_inode           && t_test_presence_by_size_not_inode
+	_rt full_disk_access                     && t_test_full_disk_access
+	_rt bundle_ownership                     && t_test_bundle_ownership
+	_rt network_bundles                      && t_test_network_bundles
+	_rt add_picker                           && t_test_add_picker
+	_rt image_orphan_adoption                && t_test_image_orphan_adoption
+	_rt snapshot_set_is_validated            && t_test_snapshot_set_is_validated
+	_rt no_exclusive_size_claims             && t_test_no_exclusive_size_claims
+	_rt index_increment_only_new             && t_test_index_increment_only_new
+	_rt site_conf_dir_from_env               && t_test_site_conf_dir_from_env
+	_rt detached_store_still_answers         && t_test_detached_store_still_answers
+	_rt rm_needs_the_store                   && t_test_rm_needs_the_store
+	_rt volume_paths                         && t_test_volume_paths
+	_rt mount_root_fallback                  && t_test_mount_root_fallback
+	_rt version_store_generation             && t_test_version_store_generation
+	_rt local_list_never_cached              && t_test_local_list_never_cached
+	_rt maintenance_keeps_other_tables       && t_test_maintenance_keeps_other_tables
+	_rt commands_keep_other_tables           && t_test_commands_keep_other_tables
+	_rt local_snapshots                      && t_test_local_snapshots
+	_rt run_list_is_complete                 && t_test_run_list_is_complete
+	_rt ''
+}
+
+## Open test $1 (and close the one before it with its 'ok K - name' line).
+## Returns 0 only when $1 is to run now; in the counting pass it only counts.
+_rt() {
+	if [ "$_rt_counting" = 1 ]; then
+		[ -n "$1" ] && _rt_want "$1" && _rt_n=$(( _rt_n + 1 ))
+		return 1
+	fi
+	if [ -n "$_rt_cur" ]; then
+		if [ "$T_FAIL" = "$_rt_bad" ]; then printf 'ok %s - %s\n' "$_rt_k" "$_rt_cur"
+		else printf 'not ok %s - %s\n' "$_rt_k" "$_rt_cur"; fi
+	fi
+	_rt_cur=""
+	{ [ -n "$1" ] && _rt_want "$1"; } || return 1
+	_rt_k=$(( _rt_k + 1 )); _rt_cur=$1; _rt_bad=$T_FAIL
+	return 0
+}
+_rt_want() { case "$1" in *"$_rt_filter"*) return 0 ;; esac; return 1; }
+
 run_tests() {
 	T_WITH_SNAPSHOTS=0
-	for _a in "$@"; do
-		[ "$_a" = "--with-snapshots" ] && T_WITH_SNAPSHOTS=1
+	_rt_filter=""
+	for _rt_a in "$@"; do
+		case "$_rt_a" in
+			--with-snapshots) T_WITH_SNAPSHOTS=1 ;;
+			-*) err "--run-tests: unknown option '$_rt_a'  (see --help)" ;;
+			*)  [ -z "$_rt_filter" ] || err "--run-tests takes one <FILTER>, got '$_rt_filter' and '$_rt_a'"
+			    _rt_filter=$_rt_a ;;
+		esac
 	done
 	if is_root; then
 		printf ' !!! do not run the tests as root -- they must pass unprivileged.\n' >&2
 		exit 1
 	fi
+	_rt_n=0; _rt_k=0; _rt_cur=""; _rt_bad=0
+	_rt_counting=1; _rt_list; _rt_counting=0
+	printf '1..%s\n' "$_rt_n"
 	printf '%s %s -- self test\n' "$US" "$MY_TM_VERSION"
 	t_setup
 
-	t_test_ids
-	t_test_handles
-	t_test_ttl
-	t_test_format
-	t_test_manifest
-	t_test_states
-	t_test_previous_is_not_a_state
-	t_test_thin
-	t_test_config
-	t_test_location_parameters
-	t_test_locations
-	t_test_handle_characters
-	t_test_one_shared_location_list
-	t_test_ladder
-	t_test_mount_records
-	t_test_version_store
-	t_test_atomic
-	t_test_plists
-	t_test_rm_dryrun
-	t_test_help
-	t_test_paths
-	t_test_version_output
-	t_test_post_backup
-	t_test_backup_already_running
-	t_test_backup_volume_unmounted
-	t_test_backup_result
-	t_test_cache_excluded
-	t_test_config_search_order
-	t_test_attach_progress
-	t_test_status_marks_guide_the_reader
-	t_test_image_read_without_attaching
-	t_test_completion_follows_help
-	t_test_failed_read_is_not_absent
-	t_test_user_on_a_root_cache
-	t_test_space_is_one_series
-	t_test_remote_failure_is_not_unread
-	t_test_index_answers_are_kept
-	t_test_index_is_shared_only
-	t_test_superscript_marks_and_alignment
-	t_test_status_remembered_space
-	t_test_suite_never_notifies_a_person
-	t_test_ssh_never_becomes_a_master
-	t_test_status_asks_remotes_for_their_cache
-	t_test_find_searches_only_the_stores_index
-	t_test_bare_command_words
-	t_test_every_dash_is_explained
-	t_test_add_caches_what_it_opened
-	t_test_status_footnotes
-	t_test_attach_estimate
-	t_test_attach_message_is_about_this_disk
-	t_test_attach_is_not_orphaned
-	t_test_attach_one_at_a_time
-	t_test_remote_progress_reaches_the_caller
-	t_test_lsof_never_answers
-	t_test_install_builds_no_tree
-	t_test_runs_without_home
-	t_test_autodetect_mode
-	t_test_cache_unreadable
-	t_test_install_config
-	t_test_install_logs
-	t_test_job_plist_streams
-	t_test_network_volume_of
-	t_test_opt_in_indexing
-	t_test_index_timing
-	t_test_headless_health_notifies
-	t_test_ssh_locations
-	t_test_health_scope
-	t_test_every_default_is_offered
-	t_test_remote_add_and_install
-	t_test_unrecorded_mounts
-	t_test_private_var_is_var
-	t_test_remote_install_dir
-	t_test_attention_todo
-	t_test_install_writes_a_config
-	t_test_install_uses_existing_my_tm
-	t_test_ls_columns_align
-	t_test_index_progress_visible
-	t_test_status_index_size
-	t_test_run_cache
-	t_test_loc_resolve
-	t_test_vol_device
-	t_test_launcher
-	t_test_install_launcher
-	t_test_job_guidance
-	t_test_detection_dedup
-	t_test_ejected_destination
-	t_test_auto_mount_destinations
-	t_test_verify_reports
-	t_test_locate_toolchain
-	t_test_indexer_exemption_expires
-	t_test_lookup_collapse
-	t_test_progress_goes_to_stderr
-	t_test_usage_trend
-	t_test_version_store_pruning
-	t_test_prune_without_version_store
-	t_test_delta_removals_by_path
-	t_test_versions_any_walk_order
-	t_test_presence_by_size_not_inode
-	t_test_full_disk_access
-	t_test_bundle_ownership
-	t_test_network_bundles
-	t_test_add_picker
-	t_test_image_orphan_adoption
-	t_test_snapshot_set_is_validated
-	t_test_no_exclusive_size_claims
-	t_test_index_increment_only_new
-	t_test_site_conf_dir_from_env
-	t_test_detached_store_still_answers
-	t_test_rm_needs_the_store
-	t_test_volume_paths
-	t_test_mount_root_fallback
-	t_test_version_store_generation
-	t_test_local_list_never_cached
-	t_test_maintenance_keeps_other_tables
-	t_test_commands_keep_other_tables
-	t_test_local_snapshots
+	## one line per test as it ends, numbered in list order: 'ok K - name'
+	_rt_list
 
 	t_teardown
 	printf '\n%s passed, %s failed, %s skipped\n' "$T_PASS" "$T_FAIL" "$T_SKIP"
