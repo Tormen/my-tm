@@ -34,8 +34,8 @@ US="${0##*/}"
 ## so the ROOT-OWNED COPY the daemons run -- which has no git beside it -- can
 ## still say which release it is and whether it is one.
 MY_TM_VERSION="0.9.1"
-SCRIPT_COMMIT="8f06642"
-SCRIPT_RELEASE="v0.9.1-94-g8f06642"
+SCRIPT_COMMIT="c6642d8"
+SCRIPT_RELEASE="v0.9.1-95-gc6642d8"
 
 ## The first 12 hex of this file's own SHA-256: the value that identifies the
 ## bytes. my-tm is COPIED to its installed path, so this is what tells the
@@ -219,6 +219,7 @@ EJECT_WAIT=5
 LSOF_TIMEOUT=10
 JOBS_RUN_WITH_FULL_DISK_ACCESS=0
 JOBS_LAUNCHER="/usr/local/sbin/my-tm-launcher"
+FDA_CMD="my-fda"
 
 ## how long a mount made on the way into a command lives if the command dies
 ## without cleaning up.  Not user-tunable: it is a leak-reaper, not a policy.
@@ -498,6 +499,9 @@ JOBS_RUN_WITH_FULL_DISK_ACCESS=0 # 1: the jobs run my-tm through JOBS_LAUNCHER,
                                 # access to look inside network volumes and for
                                 # HEALTH_VERIFY checksums.
 JOBS_LAUNCHER="/usr/local/sbin/my-tm-launcher"  # where --install puts it; root:TM_GROUP 0750
+FDA_CMD="my-fda"                # grants a new launcher Full Disk Access: --install
+                                # runs `<FDA_CMD> add` when someone is at the
+                                # terminal; "" or not found = it prints the step
 # --- backup control ---
 BACKUP_VOLUME=""                # "" = ask tmutil which destination this is.
                                 # Resolved ONCE at startup; the pre-backup
@@ -6938,6 +6942,26 @@ launcher_perms_ok() { # <path> <owner:group>
 	[ "$(ls -ld "$1" | cut -c1-10) $(ls -ld "$1" | awk '{ print $3 ":" $4 }')" = "-rwxr-x--- $2" ]
 }
 
+## Is someone at this terminal? (a remote --install over ssh is not; a
+## function, so the suite can answer it)
+at_terminal() { [ -t 0 ] && [ -t 1 ]; }
+
+## Hand a NEW launcher to FDA_CMD (my-fda) for its Full Disk Access grant:
+## the previous build's grant goes first -- macOS keeps it listed under the
+## same path, by the REAL path, and `add` would answer "already granted" --
+## then `add` opens the pane, shows the launcher to drag in and checks it.
+## 1 when that cannot happen here: no FDA_CMD, or nobody at the terminal.
+fda_add() { # <launcher>
+	_fa_c=$(command -v "$FDA_CMD" 2>/dev/null) || return 1
+	at_terminal || return 1
+	_fa_r="$(cd -P "$(dirname "$1")" 2>/dev/null && pwd)/$(basename "$1")"
+	_fa_ids=$("$_fa_c" list 2>/dev/null | grep -F "$_fa_r" | cut -f 1)
+	if [ -n "$_fa_ids" ]; then
+		printf '%s\n' "$_fa_ids" | run "$_fa_c" remove go || return 1
+	fi
+	run "$_fa_c" add "$1"
+}
+
 ## Put a launcher for MY-TM-PATH at LAUNCHER, owned root:GROUP 0750, unless
 ## the one there is current -- then only its owner and mode are put right
 ## (an older install made it root:wheel 0700). Built beside its destination,
@@ -6968,8 +6992,9 @@ launcher_install() {
 		return 1
 	fi
 	msg "built the launcher $_li_path"
-	todo "grant it Full Disk Access: System Settings > Privacy & Security > Full Disk Access > add $_li_path"
 	why "a rebuilt launcher is a new program to macOS -- an earlier grant does not carry over"
+	fda_add "$_li_path" \
+		|| todo "grant it Full Disk Access: System Settings > Privacy & Security > Full Disk Access > add $_li_path${FDA_CMD:+ (or: $FDA_CMD add $_li_path)}"
 	return 0
 }
 
@@ -9952,10 +9977,11 @@ t_test_attention_todo() {
 	t_eq "the colour variables are empty when output is captured" \
 		"[$C_RED][$C_OFF]" "[][]"
 
-	## and --install uses it for the one step ssh can never take. Anchored on
-	## the CALL -- a leading tab -- so these very lines cannot match themselves.
+	## and --install uses it for the one step ssh can never take -- when my-fda
+	## cannot do it. Anchored on the CALL, the fallback after fda_add, so these
+	## very lines cannot match themselves.
 	t_eq "the Full Disk Access grant is a TODO, not a note" \
-		"$(grep -c '^	todo "grant it Full Disk Access' "$T_MYTM")" "1"
+		"$(grep -c '^		|| todo "grant it Full Disk Access' "$T_MYTM")" "1"
 	t_eq "and no longer a plain note" \
 		"$(grep -c '^	note "grant it Full Disk Access' "$T_MYTM")" "0"
 }
@@ -12189,6 +12215,39 @@ t_test_install_launcher() {
 	JOBS_RUN_WITH_FULL_DISK_ACCESS="$_il_a"; JOBS_LAUNCHER="$_il_l"
 }
 
+t_test_fda_add() {
+	printf '\n--install hands a new launcher to my-fda\n'
+	_fd_c="$FDA_CMD"; _fd_d="$T_ROOT/fda"; mkdir -p "$_fd_d/bin"
+	: >"$_fd_d/launcher"; _fd_real="$(cd -P "$_fd_d" && pwd)/launcher"
+	cat >"$_fd_d/bin/fda" <<EOF
+#!/bin/sh
+printf '%s' "\$*" >>"$_fd_d/log"
+[ "\$1" = remove ] && { printf ' <' >>"$_fd_d/log"; tr -d '\n' >>"$_fd_d/log"; }
+echo >>"$_fd_d/log"
+[ "\$1" = list ] && printf 'abc123\t%s\tallowed[2]\t-\n' "$_fd_real"
+exit 0
+EOF
+	chmod 0755 "$_fd_d/bin/fda"
+	FDA_CMD="$_fd_d/bin/fda"
+	t_eq "at a terminal: the old grant goes (found by the REAL path), then my-fda add" \
+		"$( ( at_terminal() { return 0; }; fda_add "$_fd_d/launcher" >/dev/null 2>&1; echo "rc $?" ); cat "$_fd_d/log")" \
+		"rc 0
+list
+remove go <abc123
+add $_fd_d/launcher"
+	rm -f "$_fd_d/log"
+	t_eq "...nobody at the terminal (a remote --install): my-fda is not run, the step is printed" \
+		"$( ( at_terminal() { return 1; }; fda_add "$_fd_d/launcher" >/dev/null 2>&1; echo "rc $?" ); [ -e "$_fd_d/log" ] && echo ran)" \
+		"rc 1"
+	FDA_CMD="$_fd_d/bin/nosuch-fda"
+	t_eq "...no my-fda here: the same" \
+		"$( ( at_terminal() { return 0; }; fda_add "$_fd_d/launcher" >/dev/null 2>&1; echo "rc $?" ) )" "rc 1"
+	# shellcheck disable=SC2016  # the literal source text is matched, not a variable
+	t_eq "a NEW launcher is handed to fda_add; the printed step is only its fallback" \
+		"$(sed -n '/^launcher_install() {$/,/^}$/p' "$T_MYTM" | count_match 'fda_add "$_li_path"')" "1"
+	FDA_CMD="$_fd_c"; rm -rf "$_fd_d"
+}
+
 t_test_launcher() {
 	printf '\nThe Full Disk Access launcher\n'
 	_ln_c="$(dirname "$T_MYTM")/my-tm-launcher.c"
@@ -12958,6 +13017,7 @@ _rt_list() {
 	_rt vol_device                           && t_test_vol_device
 	_rt launcher                             && t_test_launcher
 	_rt install_launcher                     && t_test_install_launcher
+	_rt fda_add                              && t_test_fda_add
 	_rt job_guidance                         && t_test_job_guidance
 	_rt detection_dedup                      && t_test_detection_dedup
 	_rt ejected_destination                  && t_test_ejected_destination

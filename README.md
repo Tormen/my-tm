@@ -968,7 +968,11 @@ The launcher, `my-tm-launcher.c` (carried inside my-tm, byte for byte):
 
 **One manual step:** System Settings > Privacy & Security > Full Disk Access >
 add the launcher. macOS ties the grant to that exact build: a rebuild needs
-granting again, editing my-tm does not. Only the launcher's fixed my-tm gains
+granting again, editing my-tm does not. With `FDA_CMD` (default `my-fda`,
+looked up in PATH) and someone at the terminal, `--install` does the rest
+after a rebuild: the previous build's grant goes, `my-fda add` opens the pane
+and shows the launcher to drag in, then checks it. Otherwise -- no `my-fda`,
+or a remote install over ssh -- it prints the step. Only the launcher's fixed my-tm gains
 the access, and only root can change that file; run from Terminal, the
 launcher is covered by Terminal's grant, not its own.
 
