@@ -34,8 +34,8 @@ US="${0##*/}"
 ## so the ROOT-OWNED COPY the daemons run -- which has no git beside it -- can
 ## still say which release it is and whether it is one.
 MY_TM_VERSION="0.9.1"
-SCRIPT_COMMIT="77a21f8"
-SCRIPT_RELEASE="v0.9.1-93-g77a21f8"
+SCRIPT_COMMIT="8f06642"
+SCRIPT_RELEASE="v0.9.1-94-g8f06642"
 
 ## The first 12 hex of this file's own SHA-256: the value that identifies the
 ## bytes. my-tm is COPIED to its installed path, so this is what tells the
@@ -497,7 +497,7 @@ JOBS_RUN_WITH_FULL_DISK_ACCESS=0 # 1: the jobs run my-tm through JOBS_LAUNCHER,
                                 # codesign) and prints that step. The jobs need the
                                 # access to look inside network volumes and for
                                 # HEALTH_VERIFY checksums.
-JOBS_LAUNCHER="/usr/local/sbin/my-tm-launcher"  # where --install puts it; root:wheel 0700
+JOBS_LAUNCHER="/usr/local/sbin/my-tm-launcher"  # where --install puts it; root:TM_GROUP 0750
 # --- backup control ---
 BACKUP_VOLUME=""                # "" = ask tmutil which destination this is.
                                 # Resolved ONCE at startup; the pre-backup
@@ -6930,19 +6930,38 @@ launcher_is_current() {
 	[ "$("$1" --version 2>/dev/null)" = "my-tm-launcher (runs $2, source $(launcher_source_hash))" ]
 }
 
-## Put a launcher for MY-TM-PATH at LAUNCHER, unless the one there is current.
-## Built beside its destination, owned root:wheel 0700, then moved into place,
-## so a failed build never leaves a half-made launcher where the jobs look.
+## Is PATH -rwxr-x--- and owned OWNER:GROUP? The launcher's shape: the
+## screen's user, in the group, must READ it -- System Settings runs as that
+## user and cannot add to Full Disk Access a file it cannot read.
+launcher_perms_ok() { # <path> <owner:group>
+	# shellcheck disable=SC2012  # the mode, owner and group columns only
+	[ "$(ls -ld "$1" | cut -c1-10) $(ls -ld "$1" | awk '{ print $3 ":" $4 }')" = "-rwxr-x--- $2" ]
+}
+
+## Put a launcher for MY-TM-PATH at LAUNCHER, owned root:GROUP 0750, unless
+## the one there is current -- then only its owner and mode are put right
+## (an older install made it root:wheel 0700). Built beside its destination,
+## then moved into place, so a failed build never leaves a half-made launcher
+## where the jobs look.
 launcher_install() {
-	_li_path="$1"; _li_bin="$2"
+	_li_path="$1"; _li_bin="$2"; _li_grp="$3"
 	if launcher_is_current "$_li_path" "$_li_bin"; then
+		if ! launcher_perms_ok "$_li_path" "root:$_li_grp"; then
+			# shellcheck disable=SC2012  # the mode, owner and group columns only
+			_li_was=$(ls -ld "$_li_path" | awk '{ print substr($1, 1, 10) " " $3 ":" $4 }')
+			if ! run chown "root:$_li_grp" "$_li_path" || ! run chmod 0750 "$_li_path"; then
+				warn "could not make the launcher $_li_path root:$_li_grp 0750"
+				return 1
+			fi
+			msg "launcher:   $_li_path made root:$_li_grp 0750 (was $_li_was) -- the screen's user must read it to add it to Full Disk Access"
+		fi
 		minor "launcher:   $_li_path is current"
 		return 0
 	fi
 	need_dir "$(dirname "$_li_path")" || { warn "cannot create $(dirname "$_li_path")"; return 1; }
 	_li_new="$(dirname "$_li_path")/.my-tm-launcher.new.$$"
 	launcher_build "$_li_bin" "$_li_new" || return 1
-	if ! run chown root:wheel "$_li_new" || ! run chmod 0700 "$_li_new" ||
+	if ! run chown "root:$_li_grp" "$_li_new" || ! run chmod 0750 "$_li_new" ||
 	   ! run mv -f "$_li_new" "$_li_path"; then
 		rm -f "$_li_new"
 		warn "could not install the launcher at $_li_path"
@@ -7161,7 +7180,7 @@ cmd_install() {
 	## cannot be built, the jobs run my-tm directly and that is said
 	JOB_PROGRAM="$MY_TM_BIN"
 	if [ "$JOBS_RUN_WITH_FULL_DISK_ACCESS" = "1" ]; then
-		if launcher_install "$JOBS_LAUNCHER" "$MY_TM_BIN"; then
+		if launcher_install "$JOBS_LAUNCHER" "$MY_TM_BIN" "$_group"; then
 			JOB_PROGRAM="$JOBS_LAUNCHER"
 		else
 			warn "the jobs run my-tm directly, without Full Disk Access"
@@ -12145,6 +12164,26 @@ t_test_install_launcher() {
 	else
 		t_skip "launcher staleness" "needs clang and codesign"
 	fi
+	_il_f="$T_ROOT/perms"; : >"$_il_f"
+	# shellcheck disable=SC2012  # owner and group columns only
+	_il_og=$(ls -ld "$_il_f" | awk '{ print $3 ":" $4 }')   # a new file takes its DIRECTORY's group (BSD)
+	chmod 0750 "$_il_f"
+	t_eq "a launcher -rwxr-x--- of its owner and group has the launcher's shape" \
+		"$(launcher_perms_ok "$_il_f" "$_il_og" && echo ok || echo fix)" "ok"
+	chmod 0700 "$_il_f"
+	t_eq "...0700 (an older install's) does not: the screen's user cannot read it" \
+		"$(launcher_perms_ok "$_il_f" "$_il_og" && echo ok || echo fix)" "fix"
+	chmod 0750 "$_il_f"
+	t_eq "...nor another group" \
+		"$(launcher_perms_ok "$_il_f" "$(id -un):nosuchgroup" && echo ok || echo fix)" "fix"
+	rm -f "$_il_f"
+	_il_li=$(sed -n '/^launcher_install() {$/,/^}$/p' "$T_MYTM")
+	# shellcheck disable=SC2016  # the literal source text is matched, not a variable
+	t_eq "the launcher is built root:<the cache's group> 0750, and an existing one put right" \
+		"$(printf '%s\n' "$_il_li" | count_match 'run chown "root:$_li_grp"') $(printf '%s\n' "$_il_li" | count_match 'run chmod 0750')" "2 2"
+	# shellcheck disable=SC2016  # the literal source text is matched, not a variable
+	t_eq "...the group being the one --install gives the cache" \
+		"$(printf '%s\n' "$_il_body" | count_match 'launcher_install "$JOBS_LAUNCHER" "$MY_TM_BIN" "$_group"')" "1"
 
 	MY_TM_BIN="$_il_bin"; JOB_PROGRAM="$_il_prog"; LOG_DIR_ROOT="$_il_log"
 	JOBS_RUN_WITH_FULL_DISK_ACCESS="$_il_a"; JOBS_LAUNCHER="$_il_l"

@@ -958,8 +958,11 @@ The launcher, `my-tm-launcher.c` (carried inside my-tm, byte for byte):
 * with no arguments, or exactly `--help`, explains itself and runs nothing;
   `--version` prints the my-tm path and the hash of the source it was built from;
 * is built with `clang`, ad-hoc signed (`codesign -s -`) and installed at
-  `JOBS_LAUNCHER`, `0700 root:wheel`. `--install` rebuilds it only when it is
-  missing or its `--version` no longer matches, and refuses a `JOBS_LAUNCHER`
+  `JOBS_LAUNCHER`, `0750 root:TM_GROUP` -- the cache's group, so the screen's
+  user can read it, which System Settings needs to add it to Full Disk Access
+  (an existing launcher is put right by the next `--install`). `--install`
+  rebuilds it only when it is missing or its `--version` no longer matches,
+  and refuses a `JOBS_LAUNCHER`
   inside a group- or world-writable tree. Without `clang` or `codesign` the
   jobs run my-tm directly, and `--install` says so.
 
@@ -1526,7 +1529,7 @@ BACKUP_SCHEDULE="on-boot"       # space-separated, combinable. Examples:
                                 #   on-boot 03:30 15:30 -> RunAtLoad + both times
                                 #   Mon 03:30          -> weekly
 JOBS_RUN_WITH_FULL_DISK_ACCESS=0 # 1: the jobs run my-tm through JOBS_LAUNCHER (§9)
-JOBS_LAUNCHER="/usr/local/sbin/my-tm-launcher"  # built by --install; root:wheel 0700
+JOBS_LAUNCHER="/usr/local/sbin/my-tm-launcher"  # built by --install; root:TM_GROUP 0750
 # --- backup control (from the old my-tm.sh) ---
 BACKUP_VOLUME=""                # "" = ask tmutil. Resolved ONCE at startup
 POST_BACKUP_DEFAULT="eject"     # none | unmount | eject, when a backup ends
