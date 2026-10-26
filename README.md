@@ -1266,11 +1266,13 @@ my-tm --add /Volumes/<disk>/<host>.sparsebundle usbtm
   metadata — thousands of them, ~10 ms each on a rotating disk. Nothing my-tm
   does adds to it; the attach is already `-readonly -noverify -noautofsck`.
 
-  The first line comes once the attach is slow enough to worry about, then
-  every 15 s — with the gap doubling every four lines (15, 30, 60, 120 …), so a
-  ten-minute attach stays audible without filling the screen. A **daemon** says
-  it three times and then gets on with it: nobody is watching its log while it
-  waits.
+  The first line comes once the attach has run for `ATTACH_QUIET` (6 s — a line
+  about a wait that is already over is noise), then every 15 s, with the gap
+  doubling every four lines (15, 30, 60, 120 …), so a ten-minute attach stays
+  audible without filling the screen. `ATTACH_POLL` (2 s) is how often an attach
+  in flight is looked at, and so the step of those lines and of noticing that
+  another run has finished. A **daemon** says it three times and then gets on
+  with it: nobody is watching its log while it waits.
 * **Attached read-only, always** (`hdiutil attach -readonly -nobrowse -noverify`):
   the bundle belongs to the Mac that backs up into it, and a writable attach
   could collide with it. Read-only also means no `fsck` and no risk to a backup.
@@ -1738,7 +1740,7 @@ With that rule in place the remaining arguments all point one way:
 
 **Conclusion: POSIX `sh`, one self-contained file.** Structured data is read
 with `plutil -extract`, never a hand-rolled plist parser. BSD userland only — no
-GNU flags. `shellcheck -s sh` clean before every commit.
+GNU flags. `shellcheck -s dash` clean before every commit (the shebang's dialect).
 
 ## 16. Tests *(spec)*
 
@@ -1747,11 +1749,14 @@ takes its number from its place in the list and builds its own fixture tree, so
 the places are dealt out by stride over `MY_TM_TESTS_JOBS` processes (default:
 the core count), each with its own temp dir. The `ok K - name` lines stream as
 they arrive — that is what a watcher draws its row from — and each block's own
-output is printed in one piece when it ends, never interleaved. Measured on 120
-tests: **3m17s one after another, 34s in 16 blocks**, the same 767 checks either
-way. `MY_TM_TESTS_JOBS=1` runs them serially, which is what a confusing failure
-wants. A place lost between blocks would be tests that silently never run, so
-the union of the blocks is asserted against `1..N`.
+output is printed in one piece when it ends, never interleaved. Measured on
+120 tests, 2026-10-26: **3m17s one after another, 34s in 16 blocks**, the same
+checks either way — and that was before the attach thresholds became config
+keys, so both numbers are lower now. What a test used to wait out in real time
+it sets small instead (`ATTACH_QUIET`, `ATTACH_POLL`, `ATTACH_LOCK_MAX_WAIT`):
+the floor is work, not sleep. `MY_TM_TESTS_JOBS=1` runs them serially, which is
+what a confusing failure wants. A place lost between blocks would be tests that
+silently never run, so the union of the blocks is asserted against `1..N`.
 
 `my-tm --run-tests` is part of the one file and must run **with no network, no
 real backup disk, and no root**, against a fixture tree built in a temp dir:

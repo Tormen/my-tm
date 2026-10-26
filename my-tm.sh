@@ -174,6 +174,8 @@ USAGE_SAMPLE_INTERVAL=21600
 IMAGE_GRACE=600
 ATTACH_SECONDS_PER_TB_HDD=38
 ATTACH_SECONDS_PER_TB_SSD=8
+ATTACH_QUIET="6s"
+ATTACH_POLL="2s"
 ATTACH_LOCK_ORPHAN="20s"
 ATTACH_LOCK_MAX_WAIT="30m"
 IMAGE_SCAN_TTL=300
@@ -460,6 +462,14 @@ ATTACH_SECONDS_PER_TB_SSD=8     # the same for an SSD -- NOT measured here, a
                                 # starting point. Either way, once an image has
                                 # been attached once, its own measured time is
                                 # used instead of these
+ATTACH_QUIET="6s"               # an attach says nothing for this long: most
+                                # finish inside it, and a line about a wait
+                                # that is already over is noise. Past it, the
+                                # attach reports what it is doing -- and so
+                                # does a run waiting for another run's attach
+ATTACH_POLL="2s"                # how often an attach in flight is looked at:
+                                # the granularity of those lines, and of
+                                # noticing that the other run has finished
 ATTACH_LOCK_ORPHAN="20s"        # one attach per image: a second run waits for
                                 # the first. This long without the holder's pid
                                 # in the lock and the lock is taken over -- a
@@ -2250,6 +2260,9 @@ image_attach() {
 	_att_noown=0
 	_att_orph=$(parse_interval "${ATTACH_LOCK_ORPHAN:-20s}") || _att_orph=20
 	_att_max=$(parse_interval "${ATTACH_LOCK_MAX_WAIT:-30m}") || _att_max=1800
+	_att_quiet=$(parse_interval "${ATTACH_QUIET:-6s}") || _att_quiet=6
+	_att_poll=$(parse_interval "${ATTACH_POLL:-2s}") || _att_poll=2
+	[ "$_att_poll" -ge 1 ] || _att_poll=1
 	while ! mkdir "$_att_lock" 2>/dev/null; do
 		_att_own=$(cat "$_att_lock/owner" 2>/dev/null)
 		if [ -n "$_att_own" ] && ! kill -0 "$_att_own" 2>/dev/null; then
@@ -2264,7 +2277,7 @@ image_attach() {
 			## runs break each other's lock in a tight loop, for ever -- seen on
 			## ada, several runs at 100% CPU and a status that never returned.
 			## Only a lock that stays owner-less is taken over, and said out loud.
-			_att_noown=$(( _att_noown + 2 ))
+			_att_noown=$(( _att_noown + _att_poll ))
 			if [ "$_att_noown" -ge "$_att_orph" ]; then
 				warn "the attach lock for $(basename "$_img") has had no owner for ${_att_noown}s -- taking it over"
 				rm -f "$_att_lock/owner"; rmdir "$_att_lock" 2>/dev/null
@@ -2283,9 +2296,9 @@ image_attach() {
 		_att_waited=$(( $(now_epoch) - _att_w0 ))
 		[ "$_att_waited" -ge "$_att_max" ] &&
 			err "waited $(human_secs "$_att_waited") for another run to attach $(basename "$_img") and it never finished (ATTACH_LOCK_MAX_WAIT) -- check for a stuck hdiutil, or remove $_att_lock"
-		[ "$_att_waited" -ge 6 ] &&
+		[ "$_att_waited" -ge "$_att_quiet" ] &&
 			minor "another run is attaching $(basename "$_img"), ${_att_waited}s so far -- waiting for it"
-		sleep 2
+		sleep "$_att_poll"
 	done
 	printf '%s\n' "$$" >"$_att_lock/owner" 2>/dev/null
 	printf '%s\n' "$_att_lock" >"$ATTACH_LOCKFILE" 2>/dev/null
@@ -2322,9 +2335,9 @@ image_attach() {
 	_att_said=0
 	_att_n=0
 	while kill -0 "$_att_pid" 2>/dev/null; do
-		sleep 2
+		sleep "$_att_poll"
 		_att_el=$(( $(now_epoch) - _att_t0 ))
-		[ "$_att_el" -lt 6 ] && continue
+		[ "$_att_el" -lt "$_att_quiet" ] && continue
 		if [ "$_att_said" = "0" ]; then
 			## asked for HERE, not before the attach: reading the band names
 			## costs seconds on the very disk that makes an attach slow
@@ -8624,6 +8637,11 @@ t_test_config() {
 	t_true sh -n "$_f"
 	t_match "the default config carries no site-specific values" \
 		"$(count_match 'TM_GROUP=""' < "$_f")" "1"
+	## a tunable the body reads but the template never names is unreachable:
+	## nobody can set it, and nobody knows it is there
+	for _c_k in ATTACH_QUIET ATTACH_POLL; do
+		t_eq "$_c_k is in the default config" "$(count_match "$_c_k=" < "$_f")" "1"
+	done
 }
 
 ## One shared location list. Adversarial: a per-user copy used to be written
@@ -11188,20 +11206,22 @@ t_test_attach_lock_waits_for_an_owner() {
 	need_dir "$MOUNT_ROOT" >/dev/null 2>&1
 	_lw_lock="$MOUNT_ROOT/.attaching.$(slug "$_lw_img")"
 	rm -rf "$_lw_lock"; mkdir "$_lw_lock"             # a lock with no owner yet
-	_lw_out=$( ( ATTACH_LOCK_ORPHAN="60s"; ATTACH_LOCK_MAX_WAIT="4s"
+	_lw_out=$( ( ATTACH_LOCK_ORPHAN="60s"; ATTACH_LOCK_MAX_WAIT="2s"; ATTACH_POLL="1s"
 	             image_attach "$_lw_img" ) 2>&1 )
 	t_eq "it is NOT taken over while the grace lasts" \
 		"$(printf '%s\n' "$_lw_out" | count_match 'taking it over')" "0"
 	t_match "it waits, then says it waited too long" "$_lw_out" "waited .* and it never finished"
 	t_eq "(and the lock is left for its owner)" "$([ -d "$_lw_lock" ] && echo kept || echo gone)" "kept"
 	## ...and a lock that STAYS owner-less is taken over, once the grace is over
-	_lw_out2=$( ( ATTACH_LOCK_ORPHAN="2s"; ATTACH_LOCK_MAX_WAIT="30s"
+	_lw_out2=$( ( ATTACH_LOCK_ORPHAN="3s"; ATTACH_LOCK_MAX_WAIT="30s"; ATTACH_POLL="1s"
 	             image_attach "$_lw_img" ) 2>&1 )
+	## the number is the counter, one ATTACH_POLL per look: 3 one-second steps
+	## reach 3s exactly, where two-second steps would report 4s
 	t_match "a lock that stays owner-less is taken over, out loud" "$_lw_out2" \
-		"has had no owner for [0-9]*s -- taking it over"
+		"has had no owner for 3s -- taking it over"
 	## a LIVE owner is waited for, whatever the grace
 	rm -rf "$_lw_lock"; mkdir "$_lw_lock"; printf '%s\n' "$$" >"$_lw_lock/owner"
-	_lw_out3=$( ( ATTACH_LOCK_ORPHAN="2s"; ATTACH_LOCK_MAX_WAIT="4s"
+	_lw_out3=$( ( ATTACH_LOCK_ORPHAN="2s"; ATTACH_LOCK_MAX_WAIT="2s"; ATTACH_POLL="1s"
 	             image_attach "$_lw_img" ) 2>&1 )
 	t_eq "a live owner's lock is never taken over" \
 		"$(printf '%s\n' "$_lw_out3" | count_match 'taking it over')" "0"
@@ -11211,6 +11231,9 @@ t_test_attach_lock_waits_for_an_owner() {
 
 t_test_attach_one_at_a_time() {
 	printf '\nOne attach at a time per image\n'
+	## the handshake is what is tested, not the clock: a 1s poll and a stub
+	## that attaches for 3s show it as well as the defaults do, in a fifth
+	## of the time
 	_aol_img="$T_ROOT/shared.sparsebundle"; mkdir -p "$_aol_img"
 	_aol_n="$T_ROOT/attach.count"; : >"$_aol_n"
 	_aol_done="$T_ROOT/attach.done"; rm -f "$_aol_done"
@@ -11232,7 +11255,7 @@ t_test_attach_one_at_a_time() {
 		printf '  exit 0\n'
 		printf 'fi\n'
 		printf 'printf "attach\\n" >>"%s"\n' "$_aol_n"
-		printf 'sleep 8\n'
+		printf 'sleep 3\n'
 		printf 'touch "%s"\n' "$_aol_done"
 		printf '%s\n' 'cat <<XEOF'
 		printf '<?xml version="1.0" encoding="UTF-8"?>\n'
@@ -11246,13 +11269,15 @@ t_test_attach_one_at_a_time() {
 
 	_aol_lock="$MOUNT_ROOT/.attaching.$(slug "$_aol_img")"
 	attach_unlock "$_aol_lock"
-	image_attach "$_aol_img" >"$T_ROOT/attach.first" 2>/dev/null &
+	( ATTACH_QUIET="1s"; ATTACH_POLL="1s"
+	  image_attach "$_aol_img" ) >"$T_ROOT/attach.first" 2>/dev/null &
 	_aol_run=$!
 	_aol_i=0
 	while [ ! -d "$_aol_lock" ] && [ "$_aol_i" -lt 40 ]; do
 		_aol_i=$(( _aol_i + 1 )); sleep 0.25
 	done
-	_aol_second=$(image_attach "$_aol_img" 2>"$T_ROOT/attach.second.err")
+	_aol_second=$( ( ATTACH_QUIET="1s"; ATTACH_POLL="1s"
+	                 image_attach "$_aol_img" ) 2>"$T_ROOT/attach.second.err")
 	wait "$_aol_run" 2>/dev/null
 	t_eq "hdiutil was asked to attach it once, not twice" \
 		"$(count_lines < "$_aol_n")" "1"
@@ -11264,7 +11289,8 @@ t_test_attach_one_at_a_time() {
 	## a lock left by a run that died is taken over, and said so
 	mkdir -p "$_aol_lock"; printf '999999\n' >"$_aol_lock/owner"
 	rm -f "$_aol_done"; : >"$_aol_n"
-	_aol_third=$(image_attach "$_aol_img" 2>"$T_ROOT/attach.third.err")
+	_aol_third=$( ( ATTACH_QUIET="1s"; ATTACH_POLL="1s"
+	                image_attach "$_aol_img" ) 2>"$T_ROOT/attach.third.err")
 	t_match "a lock whose owner is gone is taken over, out loud" \
 		"$(cat "$T_ROOT/attach.third.err")" "interrupted run left the attach lock"
 	t_eq "and the attach then happens" "$_aol_third" "/Volumes/Shared"
@@ -12570,13 +12596,12 @@ t_test_attach_progress() {
 	mkdir -p "$_ap_img"
 	_ap_stub="$(t_stub_dir)/hdiutil"
 
-	## a stub that takes long enough to trip the 6s threshold, then answers
-	## like the real thing
+	## a stub that outlasts ATTACH_QUIET, then answers like the real thing
 	{
 		printf '#!/bin/sh\n'
 		# shellcheck disable=SC2016  # writing a script: $1 is the STUB's argument
 		printf 'if [ "$1" = "info" ]; then exit 0; fi\n'
-		printf 'sleep 9\n'
+		printf 'sleep 3\n'
 		printf '%s\n' 'cat <<XEOF'
 		printf '<?xml version="1.0" encoding="UTF-8"?>\n'
 		printf '<plist version="1.0"><dict><key>system-entities</key><array><dict>\n'
@@ -12588,7 +12613,8 @@ t_test_attach_progress() {
 	chmod 0755 "$_ap_stub"
 
 	_ap_err="$T_ROOT/attach.err"
-	_ap_val=$(image_attach "$_ap_img" 2>"$_ap_err")
+	_ap_val=$( ( ATTACH_QUIET="1s"; ATTACH_POLL="1s"
+	             image_attach "$_ap_img" ) 2>"$_ap_err")
 
 	t_eq "the captured value is the mountpoint and nothing else" \
 		"$_ap_val" "/Volumes/SlowOne"
