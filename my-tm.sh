@@ -7797,6 +7797,9 @@ INSTALL & SET UP
   --run-tests [<FILTER>]         run the built-in tests: the plan '1..N' first,
                                  then one 'ok K - name' line per test; only the
                                  tests whose name contains <FILTER>, if given.
+                                 They run in parallel BLOCKS, one process each
+                                 (3m17s -> 34s); MY_TM_TESTS_JOBS sets how many,
+                                 1 runs them one after another.
                                  Add --with-snapshots to take a real local snapshot
   --version | --help
 
@@ -13022,6 +13025,55 @@ t_test_version_output() {
 		"$(cd /tmp && abs_path ./x/y)" "/tmp/x/y"
 }
 
+## The suite runs in BLOCKS, in parallel. A place lost between them would be
+## tests that never run and nobody notices -- the suite would just be quicker.
+## Adversarial: the union of the blocks is checked against 1..n for sizes that
+## divide evenly and ones that do not, and for more blocks than tests; and the
+## pick is checked to RUN exactly its own places, by the numbers it gives them.
+t_test_parallel_blocks_cover_every_test() {
+	printf '\nThe blocks cover every test exactly once\n'
+	for _pb_case in "120 16" "120 7" "7 120" "1 1" "5 5"; do
+		_pb_n=${_pb_case% *}; _pb_j=${_pb_case#* }
+		[ "$_pb_j" -gt "$_pb_n" ] && _pb_j=$_pb_n
+		_pb_all=""
+		_pb_b=0
+		while [ "$_pb_b" -lt "$_pb_j" ]; do
+			_pb_all="$_pb_all$(_rt_slice "$_pb_b" "$_pb_j" "$_pb_n" | tr ',' '\n')
+"
+			_pb_b=$(( _pb_b + 1 ))
+		done
+		_pb_got=$(printf '%s' "$_pb_all" | awk 'NF' | sort -n | tr '\n' ' ')
+		_pb_want=$(awk -v n="$_pb_n" 'BEGIN{for (i = 1; i <= n; i++) printf "%d ", i}')
+		t_eq "$_pb_n tests in $_pb_j blocks: every place once, none twice, none lost" \
+			"$_pb_got" "$_pb_want"
+	done
+
+	## ...and a block RUNS the places it was dealt, under those numbers
+	## the state of the suite RUNNING this test is saved and put back around
+	## the probe: a subshell would do that by itself, but then shellcheck reads
+	## every later use of these in _rt as a lost change
+	_pb_sv_k=$_rt_k; _pb_sv_cur=$_rt_cur; _pb_sv_bad=$_rt_bad; _pb_sv_f=$_rt_filter
+	_pb_sv_pick=${_rt_pick:-}; _pb_sv_tap=${_rt_tap:-}
+	_rt_k=0; _rt_cur=""; _rt_bad=$T_FAIL; _rt_filter=""
+	_rt_pick="2 4"; _rt_tap="$T_ROOT/pick.tap"
+	{
+		for _pb_t in alpha beta gamma delta epsilon; do
+			if _rt "$_pb_t"; then printf 'ran %s as %s\n' "$_pb_t" "$_rt_k"; fi
+		done
+		_rt ""
+	} >"$T_ROOT/pick.out" 2>/dev/null
+	## back to THIS block's own pick and stream -- emptying them would send the
+	## next test's TAP line to stdout instead, and the number would be printed
+	## twice: once in the block's own output, once by nobody
+	_rt_pick=$_pb_sv_pick; _rt_tap=$_pb_sv_tap
+	_rt_k=$_pb_sv_k; _rt_cur=$_pb_sv_cur; _rt_bad=$_pb_sv_bad; _rt_filter=$_pb_sv_f
+	t_eq "a block runs its own places, numbered by place" \
+		"$(tr '\n' ' ' <"$T_ROOT/pick.out")" "ran beta as 2 ran delta as 4 "
+	t_eq "and its TAP lines carry those same numbers" \
+		"$(tr '\n' ' ' <"$T_ROOT/pick.tap")" "ok 2 - beta ok 4 - delta "
+	rm -f "$T_ROOT/pick.out" "$T_ROOT/pick.tap"
+}
+
 ## the guard: a test function left out of the run list would never run, and
 ## the suite would still end green -- so the list is held to the file
 t_test_run_list_is_complete() {
@@ -13163,6 +13215,7 @@ _rt_list() {
 	_rt maintenance_keeps_other_tables       && t_test_maintenance_keeps_other_tables
 	_rt commands_keep_other_tables           && t_test_commands_keep_other_tables
 	_rt local_snapshots                      && t_test_local_snapshots
+	_rt parallel_blocks_cover_every_test     && t_test_parallel_blocks_cover_every_test
 	_rt run_list_is_complete                 && t_test_run_list_is_complete
 	_rt ''
 }
@@ -13175,15 +13228,37 @@ _rt() {
 		return 1
 	fi
 	if [ -n "$_rt_cur" ]; then
-		if [ "$T_FAIL" = "$_rt_bad" ]; then printf 'ok %s - %s\n' "$_rt_k" "$_rt_cur"
-		else printf 'not ok %s - %s\n' "$_rt_k" "$_rt_cur"; fi
+		if [ "$T_FAIL" = "$_rt_bad" ]; then _rt_line="ok $_rt_k - $_rt_cur"
+		else _rt_line="not ok $_rt_k - $_rt_cur"; fi
+		## in a block, the TAP line goes to the shared stream the parent prints
+		## from -- one printf of one short line, so two blocks cannot interleave
+		if [ -n "${_rt_tap:-}" ]; then printf '%s\n' "$_rt_line" >>"$_rt_tap"
+		else printf '%s\n' "$_rt_line"; fi
 	fi
 	_rt_cur=""
 	{ [ -n "$1" ] && _rt_want "$1"; } || return 1
-	_rt_k=$(( _rt_k + 1 )); _rt_cur=$1; _rt_bad=$T_FAIL
+	## the number is the test's PLACE in the filtered list, not a count of the
+	## ones this process ran: the blocks run in parallel, and a test must carry
+	## the same number whatever block it lands in and whenever it finishes
+	_rt_k=$(( _rt_k + 1 ))
+	if [ -n "${_rt_pick:-}" ]; then     # no pick: this process runs them all
+		case " $_rt_pick " in
+			*" $_rt_k "*) : ;;
+			*) return 1 ;;              # another block's test
+		esac
+	fi
+	_rt_cur=$1; _rt_bad=$T_FAIL
 	return 0
 }
 _rt_want() { case "$1" in *"$_rt_filter"*) return 0 ;; esac; return 1; }
+
+## The places block <b> of <jobs> runs, of <n> tests: every place in exactly
+## one block, dealt out by stride so the slow tests do not pile up in one of
+## them. A place lost here would mean tests that silently never run.
+_rt_slice() {                   # <block> <jobs> <n>  -> "1,17,33,..."
+	awk -v b="$1" -v j="$2" -v n="$3" 'BEGIN{
+		s = ""; for (i = b + 1; i <= n; i += j) s = s (s == "" ? "" : ",") i; print s }'
+}
 
 run_tests() {
 	T_WITH_SNAPSHOTS=0
@@ -13202,16 +13277,106 @@ run_tests() {
 	fi
 	_rt_n=0; _rt_k=0; _rt_cur=""; _rt_bad=0
 	_rt_counting=1; _rt_list; _rt_counting=0
+
+	## A BLOCK of the suite (MY_TM_RT_PICK set by the parent below): it runs the
+	## tests whose places it was given, in its own temp root, and writes its TAP
+	## lines to the shared stream. Everything else it prints is its own output,
+	## read by the parent when the block ends.
+	if [ -n "${MY_TM_RT_PICK:-}" ]; then
+		_rt_pick=$(printf '%s' "$MY_TM_RT_PICK" | tr ',' ' ')
+		_rt_tap="${MY_TM_RT_TAP:-}"
+		_rt_k=0
+		printf '%s %s -- self test\n' "$US" "$MY_TM_VERSION"
+		t_setup
+		_rt_list
+		t_teardown
+		printf '\n%s passed, %s failed, %s skipped\n' "$T_PASS" "$T_FAIL" "$T_SKIP"
+		[ "$T_FAIL" -eq 0 ] || return 1
+		return 0
+	fi
+
 	printf '1..%s\n' "$_rt_n"
 	printf '%s %s -- self test\n' "$US" "$MY_TM_VERSION"
-	t_setup
 
-	## one line per test as it ends, numbered in list order: 'ok K - name'
-	_rt_list
+	## The tests are INDEPENDENT -- every one of them passes alone -- so the
+	## suite runs in BLOCKS, each its own process with its own temp root, all at
+	## once: 120 tests took 3m08s one after another and a third of that was
+	## waiting (a stub that sleeps, a bounded timeout). The places are dealt out
+	## by stride, so the slow ones do not pile up in one block.
+	_rt_jobs=${MY_TM_TESTS_JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || echo 4)}
+	case $_rt_jobs in ''|*[!0-9]*) _rt_jobs=4 ;; esac
+	[ "$_rt_jobs" -gt "$_rt_n" ] && _rt_jobs=$_rt_n
+	[ "$_rt_jobs" -lt 1 ] && _rt_jobs=1
+	if [ "$_rt_jobs" -eq 1 ]; then
+		t_setup
+		_rt_k=0
+		_rt_list
+		t_teardown
+		printf '\n%s passed, %s failed, %s skipped\n' "$T_PASS" "$T_FAIL" "$T_SKIP"
+		[ "$T_FAIL" -eq 0 ] || return 1
+		return 0
+	fi
+	_rt_self=$(abs_path "$0")
+	## "0" is NOT empty, so ${T_WITH_SNAPSHOTS:+...} would hand every block the
+	## flag and run the tests that take a REAL local snapshot
+	_rt_ws=""; [ "$T_WITH_SNAPSHOTS" = "1" ] && _rt_ws="--with-snapshots"
+	_rt_d=$(mktemp -d /tmp/my-tm.rt.XXXXXX) || err "cannot create the test run dir"
+	_rt_tapf="$_rt_d/tap"; : >"$_rt_tapf"
+	_rt_b=0
+	while [ "$_rt_b" -lt "$_rt_jobs" ]; do
+		_rt_sel=$(_rt_slice "$_rt_b" "$_rt_jobs" "$_rt_n")
+		if [ -n "$_rt_sel" ]; then
+			( MY_TM_RT_PICK="$_rt_sel" MY_TM_RT_TAP="$_rt_tapf" \
+			  "$_rt_self" --run-tests ${_rt_ws:+"$_rt_ws"} \
+			  ${_rt_filter:+"$_rt_filter"} >"$_rt_d/b$_rt_b.out" 2>&1
+			  printf '%s\n' "$?" >"$_rt_d/b$_rt_b.rc" ) &
+		else
+			printf '0\n' >"$_rt_d/b$_rt_b.rc"; : >"$_rt_d/b$_rt_b.out"
+		fi
+		_rt_b=$(( _rt_b + 1 ))
+	done
 
-	t_teardown
-	printf '\n%s passed, %s failed, %s skipped\n' "$T_PASS" "$T_FAIL" "$T_SKIP"
-	[ "$T_FAIL" -eq 0 ] || return 1
+	## the TAP lines as they arrive -- that is what a watcher (my-rollout go)
+	## draws its row from, so they are printed while the blocks still run
+	_rt_seen=0
+	while :; do
+		_rt_have=$(awk 'END{print NR+0}' "$_rt_tapf" 2>/dev/null || echo 0)
+		if [ "$_rt_have" -gt "$_rt_seen" ]; then
+			sed -n "$(( _rt_seen + 1 )),${_rt_have}p" "$_rt_tapf"
+			_rt_seen=$_rt_have
+		fi
+		_rt_left=0
+		_rt_b=0
+		while [ "$_rt_b" -lt "$_rt_jobs" ]; do
+			[ -f "$_rt_d/b$_rt_b.rc" ] || _rt_left=$(( _rt_left + 1 ))
+			_rt_b=$(( _rt_b + 1 ))
+		done
+		[ "$_rt_left" -eq 0 ] && break
+		sleep 0.2
+	done
+	wait
+	_rt_have=$(awk 'END{print NR+0}' "$_rt_tapf" 2>/dev/null || echo 0)
+	[ "$_rt_have" -gt "$_rt_seen" ] && sed -n "$(( _rt_seen + 1 )),${_rt_have}p" "$_rt_tapf"
+
+	## then each block's own output, in one piece: interleaved blocks are
+	## unreadable, and a reader wants the checks of one test together
+	_rt_p=0; _rt_f=0; _rt_s=0; _rt_rc=0
+	_rt_b=0
+	while [ "$_rt_b" -lt "$_rt_jobs" ]; do
+		printf '\n >>> block %s of %s\n' "$(( _rt_b + 1 ))" "$_rt_jobs"
+		grep -v -e '^1\.\.' -e "^$US $MY_TM_VERSION -- self test\$" "$_rt_d/b$_rt_b.out" 2>/dev/null |
+			grep -v -e '^[0-9][0-9]* passed, ' || true
+		_rt_sum=$(grep -e '^[0-9][0-9]* passed, ' "$_rt_d/b$_rt_b.out" 2>/dev/null | tail -n 1)
+		_rt_p=$(( _rt_p + $(printf '%s' "$_rt_sum" | awk '{print $1+0}') ))
+		_rt_f=$(( _rt_f + $(printf '%s' "$_rt_sum" | awk '{print $3+0}') ))
+		_rt_s=$(( _rt_s + $(printf '%s' "$_rt_sum" | awk '{print $5+0}') ))
+		[ "$(cat "$_rt_d/b$_rt_b.rc" 2>/dev/null || echo 1)" = "0" ] || _rt_rc=1
+		_rt_b=$(( _rt_b + 1 ))
+	done
+	rm -rf "$_rt_d"
+	printf '\n%s passed, %s failed, %s skipped  (in %s blocks)\n' \
+		"$_rt_p" "$_rt_f" "$_rt_s" "$_rt_jobs"
+	[ "$_rt_f" -eq 0 ] && [ "$_rt_rc" -eq 0 ] || return 1
 	return 0
 }
 

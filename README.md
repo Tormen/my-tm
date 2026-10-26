@@ -1742,6 +1742,17 @@ GNU flags. `shellcheck -s sh` clean before every commit.
 
 ## 16. Tests *(spec)*
 
+**Every test passes ALONE, and the suite runs in parallel BLOCKS.** A test
+takes its number from its place in the list and builds its own fixture tree, so
+the places are dealt out by stride over `MY_TM_TESTS_JOBS` processes (default:
+the core count), each with its own temp dir. The `ok K - name` lines stream as
+they arrive — that is what a watcher draws its row from — and each block's own
+output is printed in one piece when it ends, never interleaved. Measured on 120
+tests: **3m17s one after another, 34s in 16 blocks**, the same 767 checks either
+way. `MY_TM_TESTS_JOBS=1` runs them serially, which is what a confusing failure
+wants. A place lost between blocks would be tests that silently never run, so
+the union of the blocks is asserted against `1..N`.
+
 `my-tm --run-tests` is part of the one file and must run **with no network, no
 real backup disk, and no root**, against a fixture tree built in a temp dir:
 synthetic `backup_manifest.plist` files, dated snapshot directories, an
