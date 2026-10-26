@@ -1198,7 +1198,10 @@ command that is meant to be instant. An explicit `my-tm --ls horse@ada` still
 opens it, because there you asked for it. What ada has not read yet shows as a
 footnote naming that command. `--cached` goes before `--ls` on the wire, so a
 far side too old to know it refuses the call rather than opening the store —
-both Macs need this build for the row to fill.
+both Macs need this build for the row to fill. The flag holds for `-J` as
+well: the JSON table — the form the far side is actually asked for — reads
+from the cache like any other, so neither shape of the command can open a
+store behind the flag's back.
 
 **What the remote is doing shows up here.** The far side does the slow work —
 attaching a sparsebundle there takes minutes — and its progress used to be
@@ -1284,6 +1287,14 @@ my-tm --add /Volumes/<disk>/<host>.sparsebundle usbtm
   its attach lock — so the next run neither waits on a dead owner nor warns
   about an "interrupted run" that was your own Ctrl-C a second earlier. A lock
   held by another live run is never touched.
+* **A lock with no owner yet is WAITED for, not broken.** Between making the
+  lock and writing its pid into it, a holder looks owner-less — and a run that
+  broke it there would be racing that holder. Two runs did exactly that to each
+  other, in a tight loop, for ever. So an owner-less lock is only taken over
+  once it has stayed that way for `ATTACH_LOCK_ORPHAN` (20 s: longer than the
+  gap between those two writes, shorter than any attach), and the takeover is
+  printed. Waiting for another run's attach is bounded too: past
+  `ATTACH_LOCK_MAX_WAIT` (30 min) it is an error naming the lock, not patience.
 * **Kept for `IMAGE_GRACE` (default 10 min) after its last use**, then detached
   by the sweep. Measured against a NAS store: the first command costs **66 s**
   of attach and mount, and every command after it **1 s**. Detaching the moment

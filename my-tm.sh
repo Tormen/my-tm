@@ -174,6 +174,8 @@ USAGE_SAMPLE_INTERVAL=21600
 IMAGE_GRACE=600
 ATTACH_SECONDS_PER_TB_HDD=38
 ATTACH_SECONDS_PER_TB_SSD=8
+ATTACH_LOCK_ORPHAN="20s"
+ATTACH_LOCK_MAX_WAIT="30m"
 IMAGE_SCAN_TTL=300
 INDEX_BASELINES="newest oldest"
 INDEX_INC_MAX=16
@@ -458,6 +460,14 @@ ATTACH_SECONDS_PER_TB_SSD=8     # the same for an SSD -- NOT measured here, a
                                 # starting point. Either way, once an image has
                                 # been attached once, its own measured time is
                                 # used instead of these
+ATTACH_LOCK_ORPHAN="20s"        # one attach per image: a second run waits for
+                                # the first. This long without the holder's pid
+                                # in the lock and the lock is taken over -- a
+                                # run that died between making it and writing
+                                # its pid. Shorter than one attach, longer than
+                                # the moment between those two writes
+ATTACH_LOCK_MAX_WAIT="30m"      # waiting longer than this for another run's
+                                # attach is an error, not patience
 ID_LEN=6
 # --- retention ---
 THIN_POLICY_TO_KEEP_DEFAULT="24h:hourly 7d:daily 4w:weekly 2y:monthly"
@@ -2237,12 +2247,32 @@ image_attach() {
 	## them finished. The second run waits for the first and uses its result.
 	_att_lock="$MOUNT_ROOT/.attaching.$(slug "$_img")"
 	_att_w0=$(now_epoch)
+	_att_noown=0
+	_att_orph=$(parse_interval "${ATTACH_LOCK_ORPHAN:-20s}") || _att_orph=20
+	_att_max=$(parse_interval "${ATTACH_LOCK_MAX_WAIT:-30m}") || _att_max=1800
 	while ! mkdir "$_att_lock" 2>/dev/null; do
 		_att_own=$(cat "$_att_lock/owner" 2>/dev/null)
-		if [ -z "$_att_own" ] || ! kill -0 "$_att_own" 2>/dev/null; then
+		if [ -n "$_att_own" ] && ! kill -0 "$_att_own" 2>/dev/null; then
+			## the owner is PROVEN gone, so the lock is this run's to take
 			warn "an interrupted run left the attach lock for $(basename "$_img") -- taking it over"
 			rm -f "$_att_lock/owner"; rmdir "$_att_lock" 2>/dev/null
 			continue
+		fi
+		if [ -z "$_att_own" ]; then
+			## No owner yet is NOT a dead owner: the run that just made this
+			## directory has not written its pid. Breaking it on sight made two
+			## runs break each other's lock in a tight loop, for ever -- seen on
+			## ada, several runs at 100% CPU and a status that never returned.
+			## Only a lock that stays owner-less is taken over, and said out loud.
+			_att_noown=$(( _att_noown + 2 ))
+			if [ "$_att_noown" -ge "$_att_orph" ]; then
+				warn "the attach lock for $(basename "$_img") has had no owner for ${_att_noown}s -- taking it over"
+				rm -f "$_att_lock/owner"; rmdir "$_att_lock" 2>/dev/null
+				_att_noown=0
+				continue
+			fi
+		else
+			_att_noown=0
 		fi
 		if _mp=$(image_mountpoint "$_img"); then
 			msg "$(basename "$_img") was attached by another run after $(( $(now_epoch) - _att_w0 ))s"
@@ -2250,8 +2280,11 @@ image_attach() {
 			printf '%s\n' "$_mp"
 			return 0
 		fi
-		[ "$(( $(now_epoch) - _att_w0 ))" -ge 6 ] &&
-			minor "another run is attaching $(basename "$_img"), $(( $(now_epoch) - _att_w0 ))s so far -- waiting for it"
+		_att_waited=$(( $(now_epoch) - _att_w0 ))
+		[ "$_att_waited" -ge "$_att_max" ] &&
+			err "waited $(human_secs "$_att_waited") for another run to attach $(basename "$_img") and it never finished (ATTACH_LOCK_MAX_WAIT) -- check for a stuck hdiutil, or remove $_att_lock"
+		[ "$_att_waited" -ge 6 ] &&
+			minor "another run is attaching $(basename "$_img"), ${_att_waited}s so far -- waiting for it"
 		sleep 2
 	done
 	printf '%s\n' "$$" >"$_att_lock/owner" 2>/dev/null
@@ -4358,7 +4391,16 @@ json_ls() {
 		[ -n "$_h" ] || continue
 		_cached=false
 		loc_ready "$_h" 2>/dev/null || _cached=true
-		_rows=$(snapshots_get "$_h")
+		## --cached opens NOTHING, in JSON as on a terminal: this is the form a
+		## status on another Mac asks for (my-tm -J --cached --ls <path>), and
+		## reading it live there attached a sparsebundle for minutes -- the very
+		## wait --cached exists to prevent
+		if [ "${OPT_CACHED:-0}" = "1" ]; then
+			_cached=true
+			_rows=$(snapshots_cached_only "$_h")
+		else
+			_rows=$(snapshots_get "$_h")
+		fi
 		[ -n "$_rows" ] || continue
 		_covs=$(index_covered_list "$_h")
 		_prog=$(index_in_progress "$_h") || _prog=""
@@ -11096,6 +11138,74 @@ t_test_attach_is_not_orphaned() {
 ## Two runs asking for the same image at once started two attaches of it, which
 ## then competed and took longer than either alone. The second must wait for
 ## the first and use its result.
+## A status on another Mac asks it for `-J --cached --ls <path>`, and the JSON
+## table read it LIVE: on ada that attached the sparsebundle -- minutes of wait
+## for a line that must be instant, the very cost --cached exists to avoid.
+## Adversarial: the cache is made STALE, so anything but --cached does attach --
+## which is the control, and without it the check would pass on a fresh cache.
+t_test_json_cached_opens_nothing() {
+	printf '\nThe JSON table honours --cached: it opens nothing\n'
+	_jc_save=$(cat "$T_ROOT/cache/locations.tsv")
+	_jc_img="$T_ROOT/jcached.sparsebundle"; mkdir "$_jc_img"; : >"$_jc_img/Info.plist"
+	printf 'jcimg\t%s\t\n' "$_jc_img" >>"$T_ROOT/cache/locations.tsv"
+	locations_run_cache_drop
+	printf 'jcimg\t2025-01-01-000000\t1735689600\tjc0001\t-\t-\t-\t-\t-\tok\tData\n' | t_cache_add
+	## an hdiutil that RECORDS an attach (and fails it); the suite has none of
+	## its own, so this one is removed again at the end
+	_jc_h="$(t_stub_dir)/hdiutil"
+	{ printf '#!/bin/sh\n'; printf 'printf "hdiutil %%s\\n" "$*" >>"%s"\n' "$(t_calls)"; printf 'exit 1\n'; } >"$_jc_h"
+	chmod 0755 "$_jc_h"
+	touch -t 202001010000 "$(snapshots_cache_file)"
+	: >"$(t_calls)"
+	_jc_out=$( ( JSON=1; OPT_CACHED=0; cmd_ls jcimg ) 2>&1 )
+	t_ne "(without --cached the stale table IS read live: it attaches)" \
+		"$(grep -c 'hdiutil attach' "$(t_calls)")" "0"
+	touch -t 202001010000 "$(snapshots_cache_file)"
+	: >"$(t_calls)"
+	_jc_out=$( ( JSON=1; OPT_CACHED=1; cmd_ls jcimg ) 2>&1 )
+	t_eq "with --cached it attaches nothing" "$(grep -c 'hdiutil attach' "$(t_calls)")" "0"
+	t_match "and still answers from the cache" "$_jc_out" '"snapshot": "2025-01-01-000000"'
+	t_match "(saying the table is a cached one)" "$_jc_out" '"from_cache": true'
+	rm -f "$_jc_h"
+	printf '%s\n' "$_jc_save" >"$T_ROOT/cache/locations.tsv"
+	locations_run_cache_drop
+	rm -rf "$_jc_img"
+}
+
+## The attach lock broke an OWNER-LESS lock on sight, and that is exactly how a
+## holder looks in the moment between mkdir and writing its pid: two runs then
+## broke each other's lock in a tight loop, for ever (ada, 2026-10-26: several
+## my-tm at full CPU, a status that never returned). Adversarial: the lock is
+## left owner-less and the grace is LONGER than the wait -- the run must wait
+## and give up, never take it over; and a LIVE owner is never taken over either.
+t_test_attach_lock_waits_for_an_owner() {
+	printf '\nAn owner-less attach lock is waited for, not broken\n'
+	_lw_img="$T_ROOT/lockwait.sparsebundle"; rm -rf "$_lw_img"; mkdir "$_lw_img"
+	: >"$_lw_img/Info.plist"
+	need_dir "$MOUNT_ROOT" >/dev/null 2>&1
+	_lw_lock="$MOUNT_ROOT/.attaching.$(slug "$_lw_img")"
+	rm -rf "$_lw_lock"; mkdir "$_lw_lock"             # a lock with no owner yet
+	_lw_out=$( ( ATTACH_LOCK_ORPHAN="60s"; ATTACH_LOCK_MAX_WAIT="4s"
+	             image_attach "$_lw_img" ) 2>&1 )
+	t_eq "it is NOT taken over while the grace lasts" \
+		"$(printf '%s\n' "$_lw_out" | count_match 'taking it over')" "0"
+	t_match "it waits, then says it waited too long" "$_lw_out" "waited .* and it never finished"
+	t_eq "(and the lock is left for its owner)" "$([ -d "$_lw_lock" ] && echo kept || echo gone)" "kept"
+	## ...and a lock that STAYS owner-less is taken over, once the grace is over
+	_lw_out2=$( ( ATTACH_LOCK_ORPHAN="2s"; ATTACH_LOCK_MAX_WAIT="30s"
+	             image_attach "$_lw_img" ) 2>&1 )
+	t_match "a lock that stays owner-less is taken over, out loud" "$_lw_out2" \
+		"has had no owner for [0-9]*s -- taking it over"
+	## a LIVE owner is waited for, whatever the grace
+	rm -rf "$_lw_lock"; mkdir "$_lw_lock"; printf '%s\n' "$$" >"$_lw_lock/owner"
+	_lw_out3=$( ( ATTACH_LOCK_ORPHAN="2s"; ATTACH_LOCK_MAX_WAIT="4s"
+	             image_attach "$_lw_img" ) 2>&1 )
+	t_eq "a live owner's lock is never taken over" \
+		"$(printf '%s\n' "$_lw_out3" | count_match 'taking it over')" "0"
+	t_match "(it waits for it and gives up in the end)" "$_lw_out3" "waited .* and it never finished"
+	rm -rf "$_lw_lock" "$_lw_img"
+}
+
 t_test_attach_one_at_a_time() {
 	printf '\nOne attach at a time per image\n'
 	_aol_img="$T_ROOT/shared.sparsebundle"; mkdir -p "$_aol_img"
@@ -12985,6 +13095,8 @@ _rt_list() {
 	_rt attach_estimate                      && t_test_attach_estimate
 	_rt attach_message_is_about_this_disk    && t_test_attach_message_is_about_this_disk
 	_rt attach_is_not_orphaned               && t_test_attach_is_not_orphaned
+	_rt json_cached_opens_nothing            && t_test_json_cached_opens_nothing
+	_rt attach_lock_waits_for_an_owner       && t_test_attach_lock_waits_for_an_owner
 	_rt attach_one_at_a_time                 && t_test_attach_one_at_a_time
 	_rt remote_progress_reaches_the_caller   && t_test_remote_progress_reaches_the_caller
 	_rt lsof_never_answers                   && t_test_lsof_never_answers
