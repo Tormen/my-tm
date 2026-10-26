@@ -34,8 +34,8 @@ US="${0##*/}"
 ## so the ROOT-OWNED COPY the daemons run -- which has no git beside it -- can
 ## still say which release it is and whether it is one.
 MY_TM_VERSION="0.9.1"
-SCRIPT_COMMIT="c6642d8"
-SCRIPT_RELEASE="v0.9.1-95-gc6642d8"
+SCRIPT_COMMIT="1aaeb9e"
+SCRIPT_RELEASE="v0.9.1-100-g1aaeb9e"
 
 ## The first 12 hex of this file's own SHA-256: the value that identifies the
 ## bytes. my-tm is COPIED to its installed path, so this is what tells the
@@ -183,6 +183,7 @@ INDEX_BASELINES="newest oldest"
 INDEX_INC_MAX=16
 SHADOW_SSH_INDEX_FILES=1
 SSH_CONNECT_TIMEOUT=3
+SSH_RUN_TIMEOUT="10m"
 REMOTE_INSTALL_DIR_DEFAULT="/usr/local/sbin"
 REMOTE_MY_TM_PATHS="/usr/local/sbin/my-tm /sbin/my-tm"
 AUTO_INDEX_TM_BACKUP_DISKS=0
@@ -426,6 +427,16 @@ SHADOW_SSH_INDEX_FILES=1        # keep a shadow copy of an ssh location's index
 SSH_CONNECT_TIMEOUT=3           # s to wait for an ssh host before calling it
                                 # unreachable; a host that is off must not make
                                 # a command hang
+SSH_RUN_TIMEOUT="10m"           # ...and how long one remote command may RUN
+                                # before this side gives up on it. The timeout
+                                # above bounds the CONNECTION only: a my-tm
+                                # that looped on the far side kept it perfectly
+                                # healthy while a status here waited with it.
+                                # Generous on purpose -- a remote --ls that has
+                                # to attach a 4 T sparsebundle measured 2m46s.
+                                # 0 = no bound (what an --index or a --cat
+                                # over ssh runs with: those are hours of work,
+                                # not an unanswered question)
 REMOTE_INSTALL_DIR_DEFAULT="/usr/local/sbin"   # where --install <HOST> puts
                                 # my-tm on a host that has no directory recorded
                                 # for it yet. It must be writable by ROOT ONLY:
@@ -5212,7 +5223,7 @@ cmd_cat() {
 		## TWO arguments: the remote's --cat is <ID> <PATH>, and one string
 		## with the two run together is neither. The path is the one inside the
 		## volume, so the remote resolves it against its own mountpoint.
-		remote_run "$_loc" --cat "$_ts" "$_rel" && return 0
+		remote_job "$_loc" --cat "$_ts" "$_rel" && return 0
 		err "remote cat failed"
 	fi
 	[ -f "$_full" ] || err "$_rel: not in that snapshot"
@@ -5546,7 +5557,7 @@ index_remote() {
 	_t=$(loc_target "$_h")
 	_rhost=$(remote_host "$_t")
 	msg "indexing '$_h' on $_rhost (the walk stays where the disk is)"
-	remote_run "$_h" --index "$(remote_path "$_t")" || return 1
+	remote_job "$_h" --index "$(remote_path "$_t")" || return 1
 	if [ "${SHADOW_SSH_INDEX_FILES:-1}" = "1" ]; then
 		_dir=$(index_dir); need_dir "$_dir"
 		run scp_batch "$_rhost:$CACHE_DIR/index/*.db" "$_dir/" 2>/dev/null ||
@@ -5582,9 +5593,42 @@ index_remote() {
 ## Unattended calls (a probe, a question, a command that sends nothing) also
 ## never prompt, give up on a host that does not answer, and never read the
 ## terminal. Attended ones (--install, --uninstall) may ask: the reader is there.
-ssh_batch() {
+##
+## And they are BOUNDED: ConnectTimeout bounds the connection, SSH_RUN_TIMEOUT
+## the run. The two are not the same failure -- a my-tm that looped on ada held
+## a perfectly healthy connection while a status on horse waited with it, for
+## as long as it was left alone. A watchdog rather than a poll, so a call that
+## answers at once pays nothing for it; work with no honest bound (an index
+## walk is hours) sets SSH_RUN_TIMEOUT=0 where it is called.
+ssh_batch() {                   # <host> <command...>
+	ssh_bounded "${SSH_RUN_TIMEOUT:-10m}" "$@"
+}
+## <bound> is how long the command may RUN: an interval, or 0 for no bound.
+ssh_bounded() {                 # <bound> <host> <command...>
+	_sb_max=$(parse_interval "$1") || _sb_max=600
+	shift
 	ssh -n -o BatchMode=yes -o ConnectTimeout="${SSH_CONNECT_TIMEOUT:-3}" \
-		-o ControlMaster=no -o ClearAllForwardings=yes "$@"
+		-o ControlMaster=no -o ClearAllForwardings=yes "$@" &
+	_sb_pid=$!
+	_sb_dog=""
+	if [ "$_sb_max" -gt 0 ]; then
+		## with its own descriptors: a watchdog holding the caller's pipe open
+		## would be the hang it exists to prevent
+		( sleep "$_sb_max"; kill "$_sb_pid" 2>/dev/null ) </dev/null >/dev/null 2>&1 &
+		_sb_dog=$!
+	fi
+	wait "$_sb_pid"; _sb_rc=$?
+	if [ -n "$_sb_dog" ]; then
+		kill "$_sb_dog" 2>/dev/null; wait "$_sb_dog" 2>/dev/null
+		## 143 is SIGTERM, and the only TERM sent here is the watchdog's: ssh
+		## reports a remote failure as 255 and a remote signal as 255 too,
+		## never as a signal of its own
+		if [ "$_sb_rc" = "143" ]; then
+			warn "$1 did not answer in $(human_secs "$_sb_max") -- gave up (SSH_RUN_TIMEOUT)"
+			return 1
+		fi
+	fi
+	return "$_sb_rc"
 }
 scp_batch() {
 	scp -o BatchMode=yes -o ConnectTimeout="${SSH_CONNECT_TIMEOUT:-3}" \
@@ -5594,14 +5638,23 @@ ssh_attended() { ssh -o ControlMaster=no -o ClearAllForwardings=yes "$@"; }
 scp_attended() { scp -o ControlMaster=no -o ClearAllForwardings=yes "$@"; }
 
 remote_run() {                  # <handle> <args...>
-	_rr_h="$1"; shift
+	remote_cmd "${SSH_RUN_TIMEOUT:-10m}" "$@"
+}
+## ...and the same with no run bound, for work that takes as long as it takes:
+## a walk of every snapshot on the far side is hours, a file coming over the
+## wire is as big as it is, and the near side cannot tell slow from stuck.
+remote_job() {                  # <handle> <args...>
+	remote_cmd 0 "$@"
+}
+remote_cmd() {                  # <bound> <handle> <args...>
+	_rr_b="$1"; _rr_h="$2"; shift 2
 	_rr_t=$(loc_target "$_rr_h")
 	_rr_host=$(remote_host "$_rr_t")
 	_rr_dir=$(loc_install_dir "$_rr_h")
 	[ -n "$_rr_dir" ] ||
 		err "my-tm is not installed on $_rr_host -- run: $US --install $_rr_host"
 	# shellcheck disable=SC2029  # building the remote command line here is the point
-	ssh_batch "$_rr_host" "$_rr_dir/my-tm $*"
+	ssh_bounded "$_rr_b" "$_rr_host" "$_rr_dir/my-tm $*"
 }
 
 ## Why the last read of this location's host failed, if it did -- written by
@@ -9173,6 +9226,7 @@ t_test_commands_keep_other_tables() {
 	_ck_id=$(snapshots_get store 2>/dev/null | head -n 1 | awk -F'\t' '{print $4}')
 	if [ -n "$_ck_id" ]; then
 		_ck_away
+		# shellcheck disable=SC2329  # the redefinition is what makes it run as root
 		( is_root() { return 0; }; cmd_rm "$_ck_id" go ) >/dev/null 2>&1
 		t_eq "--rm go keeps the away disk's table" "$(_ck_count awaydisk)" "1"
 		t_eq "and drops the table of the store it deleted from" "$(_ck_count store)" "0"
@@ -11349,6 +11403,52 @@ _EOF
 	chmod 0755 "$_rpt_stub"
 }
 
+## REGRESSION: a my-tm that looped on ada held a status on horse with it for as
+## long as it was left alone. ConnectTimeout bounds the CONNECTION, and the
+## connection was healthy throughout -- so the RUN needs a bound of its own.
+t_test_remote_command_is_bounded() {
+	printf '\nA remote command that never answers is given up on\n'
+	_rb_stub="$(t_stub_dir)/ssh"; cp "$_rb_stub" "$T_ROOT/ssh.rb"
+	_rb_save="$SSH_RUN_TIMEOUT"; SSH_RUN_TIMEOUT="1s"
+
+	## A far side that answers nothing, ever. `exec`, so the stub IS the sleep:
+	## a real ssh has no local child, and a stub that left one would hold the
+	## caller's pipe open past the kill -- its own artefact, not my-tm's doing.
+	{ printf '#!/bin/sh\n'; printf 'exec sleep 30\n'; } >"$_rb_stub"
+	chmod 0755 "$_rb_stub"
+	_rb_t0=$(now_epoch)
+	_rb_err=$( ( remote_run remote --ls /x ) 2>&1 >/dev/null ) && _rb_rc=0 || _rb_rc=1
+	_rb_el=$(( $(now_epoch) - _rb_t0 ))
+	t_eq "it gives up instead of waiting with it" \
+		"$([ "$_rb_el" -le 8 ] && echo bounded || echo "waited ${_rb_el}s")" "bounded"
+	t_eq "and reports a failure, not a silent success" "$_rb_rc" "1"
+	t_match "naming the host and the bound" "$_rb_err" "host1 did not answer in 1s"
+
+	## ...while a JOB has none: an index walk on the far side is hours, and
+	## killing one for being slow is worse than waiting for it
+	{ printf '#!/bin/sh\n'; printf 'exec sleep 3\n'; } >"$_rb_stub"
+	chmod 0755 "$_rb_stub"
+	_rb_jerr=$( ( remote_job remote --index /x ) 2>&1 >/dev/null ) && _rb_jrc=0 || _rb_jrc=1
+	t_eq "a job outlives the bound" "$_rb_jrc" "0"
+	t_eq "and nothing is said about giving up" \
+		"$(printf '%s\n' "$_rb_jerr" | count_match 'did not answer')" "0"
+
+	## and a host that answers pays nothing for the watchdog: it must not hold
+	## the caller's pipe open, which is the very hang it exists to prevent
+	SSH_RUN_TIMEOUT="30s"
+	{ printf '#!/bin/sh\n'; printf 'printf "answer\\n"\n'; } >"$_rb_stub"
+	chmod 0755 "$_rb_stub"
+	_rb_t0=$(now_epoch)
+	_rb_out=$(remote_run remote --ls /x 2>/dev/null)
+	_rb_el=$(( $(now_epoch) - _rb_t0 ))
+	t_eq "the answer comes back at once, not when the bound is over" \
+		"$([ "$_rb_el" -le 3 ] && echo prompt || echo "waited ${_rb_el}s")" "prompt"
+	t_eq "(and it is the answer)" "$_rb_out" "answer"
+
+	SSH_RUN_TIMEOUT="$_rb_save"
+	cp "$T_ROOT/ssh.rb" "$_rb_stub"; chmod 0755 "$_rb_stub"; rm -f "$T_ROOT/ssh.rb"
+}
+
 ## REGRESSION: the design promised an "exclusive size" column from tmutil
 ## uniquesize. That tool refuses on an APFS Time Machine store
 ## ("pathInAPFSBackup"), and nothing else on macOS reports per-snapshot space,
@@ -13182,6 +13282,7 @@ _rt_list() {
 	_rt attach_lock_waits_for_an_owner       && t_test_attach_lock_waits_for_an_owner
 	_rt attach_one_at_a_time                 && t_test_attach_one_at_a_time
 	_rt remote_progress_reaches_the_caller   && t_test_remote_progress_reaches_the_caller
+	_rt remote_command_is_bounded            && t_test_remote_command_is_bounded
 	_rt lsof_never_answers                   && t_test_lsof_never_answers
 	_rt install_builds_no_tree               && t_test_install_builds_no_tree
 	_rt runs_without_home                    && t_test_runs_without_home

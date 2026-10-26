@@ -1185,6 +1185,12 @@ the command call beside it did not):
   (never a password prompt nobody answers), `SSH_CONNECT_TIMEOUT`, and `-n`
   (they never read your terminal).
 * `--install` and `--uninstall` on a host are attended: those may ask.
+* and they are BOUNDED: `SSH_CONNECT_TIMEOUT` bounds the connection,
+  `SSH_RUN_TIMEOUT` (10 min) the run. The two are different failures — a my-tm
+  that looped on ada held a perfectly healthy connection while a status on
+  horse waited with it. A watchdog, not a poll, so a host that answers pays
+  nothing. Work with no honest bound runs without one: an `--index` walk over
+  there is hours, and a `--cat` is as big as the file.
 
 Independently of my-tm, `ControlPersist 10m` beside `ControlMaster auto` in
 `~/.ssh/config` (yours and root's) stops ANY tool's ssh from becoming a
