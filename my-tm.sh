@@ -8255,6 +8255,10 @@ t_cache_add() {
 }
 t_calls()    { printf '%s/calls.log\n' "$T_ROOT"; }
 
+## The stubs every test may rely on. hdiutil, lsof and plutil are NOT among
+## them: a test that needs one writes it itself and REMOVES it again, because a
+## stub left behind is the next test's hdiutil -- one that slept 60s cost the
+## test after it exactly that.
 t_make_stubs() {
 	_s=$(t_stub_dir)
 	mkdir -p "$_s"
@@ -10509,7 +10513,7 @@ t_test_image_read_without_attaching() {
 	_ra_save=$(cat "$T_ROOT/cache/locations.tsv")
 	## an hdiutil that RECORDS an attach (and fails it): the default stub keeps
 	## no record, and a "nothing was attached" would then hold whatever ran
-	_ra_h="$(t_stub_dir)/hdiutil"; cp "$_ra_h" "$T_ROOT/hdiutil.orig"
+	_ra_h="$(t_stub_dir)/hdiutil"
 	{ printf '#!/bin/sh\n'; printf 'printf "hdiutil %%s\\n" "$*" >>"%s"\n' "$(t_calls)"; printf 'exit 1\n'; } >"$_ra_h"
 	chmod 0755 "$_ra_h"
 	: >"$(t_calls)"
@@ -10582,7 +10586,7 @@ t_test_image_read_without_attaching() {
 	t_eq "not Running: nothing to say" \
 		"$(cmd_status 2>&1 | count_match 'besideimg: Time Machine says')" "0"
 
-	cp "$T_ROOT/hdiutil.orig" "$_ra_h"; chmod 0755 "$_ra_h"; rm -f "$T_ROOT/hdiutil.orig"
+	rm -f "$_ra_h"
 	printf '%s\n' "$_ra_save" >"$T_ROOT/cache/locations.tsv"
 	locations_run_cache_drop
 	rm -rf "$_ra_img" "$T_ROOT/cache/read.$(slug "$_ra_img")"
@@ -10804,7 +10808,7 @@ t_test_status_asks_remotes_for_their_cache() {
 	## rescan it -- a fresh cache is answered from without opening anyway, and
 	## would prove nothing about --cached
 	touch -t 202001010000 "$(snapshots_cache_file)"
-	_sc_h="$(t_stub_dir)/hdiutil"; cp "$_sc_h" "$T_ROOT/hdiutil.orig"
+	_sc_h="$(t_stub_dir)/hdiutil"
 	{ printf '#!/bin/sh\n'; printf 'printf "hdiutil %%s\\n" "$*" >>"%s"\n' "$(t_calls)"; printf 'exit 1\n'; } >"$_sc_h"
 	chmod 0755 "$_sc_h"
 	: >"$(t_calls)"
@@ -10818,7 +10822,7 @@ t_test_status_asks_remotes_for_their_cache() {
 	_sc_out=$( ( OPT_CACHED=1; cmd_ls cimg ) 2>&1 )
 	t_eq "--cached attaches nothing" "$(grep -c 'hdiutil attach' "$(t_calls)")" "0"
 	t_match "and answers from the cache" "$_sc_out" "cimg01"
-	cp "$T_ROOT/hdiutil.orig" "$_sc_h"; chmod 0755 "$_sc_h"; rm -f "$T_ROOT/hdiutil.orig"
+	rm -f "$_sc_h"
 	printf '%s\n' "$_sc_save" >"$T_ROOT/cache/locations.tsv"
 	locations_run_cache_drop
 	rm -rf "$_sc_img"
@@ -11154,6 +11158,7 @@ t_test_attach_is_not_orphaned() {
 		"$([ -d "$_atn_lk" ] && echo held || echo released)" "held"
 	kill "$_atn_other" 2>/dev/null; wait "$_atn_other" 2>/dev/null
 	rm -f "$_atn_lk/owner"; rmdir "$_atn_lk" 2>/dev/null
+	rm -f "$_atn_stub"
 }
 
 ## Two runs asking for the same image at once started two attaches of it, which
@@ -11295,7 +11300,7 @@ t_test_attach_one_at_a_time() {
 		"$(cat "$T_ROOT/attach.third.err")" "interrupted run left the attach lock"
 	t_eq "and the attach then happens" "$_aol_third" "/Volumes/Shared"
 	attach_unlock "$_aol_lock"
-	rm -rf "$_aol_img"; rm -f "$_aol_n" "$_aol_done"
+	rm -rf "$_aol_img"; rm -f "$_aol_n" "$_aol_done" "$_aol_stub"
 }
 
 ## The remote does the slow work -- attaching a sparsebundle takes minutes --
