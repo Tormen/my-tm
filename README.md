@@ -48,7 +48,9 @@ unambiguous: a file called `status` in `$PWD` can never be mistaken for a verb.
 usage: my-tm [OPTIONS] [<LOCATION>|<ID>] [<PATH>|<GLOB>]
 
 A <LOCATION> is one Time Machine backup store, named either by its path or by
-the short handle you gave it in the CONFIG; an <ID> is a 6-char name for one
+the short handle you gave it in the CONFIG; a store named by PATH is READ,
+never attached -- attaching takes minutes, and --refresh, --index, --mount and
+--verify are the commands that open one. An <ID> is a 6-char name for one
 snapshot inside one location. Everything with -- is interpreted as a command.
 A bare `my-tm` runs $DEFAULT_CMD (default --status).
 
@@ -1208,6 +1210,19 @@ both Macs need this build for the row to fill. The flag holds for `-J` as
 well: the JSON table — the form the far side is actually asked for — reads
 from the cache like any other, so neither shape of the command can open a
 store behind the flag's back.
+
+**A store named by PATH is read, never opened.** `--cached` is the caller
+saying "open nothing"; this is the half the caller should not have to say. A
+path is nobody's registered destination, and whoever names one is usually
+waiting on a single status line — so `--ls /Volumes/backup/horse.sparsebundle`
+answers from the last table that was read and says it is not attached, while
+`--ls horse@ada`, a handle someone registered, still opens the store. `-J` and
+`--health` follow the same rule, and `--health` warns rather than failing: a
+store nothing may open says nothing about the backup. To open one by path:
+`--refresh <path>`, which is also what fills that cache, or `--index`,
+`--mount`, `--verify`. A store that is ALREADY attached is read live, and a
+path that is a plain directory costs nothing to read — the rule is about
+opening a store, not about the path.
 
 **What the remote is doing shows up here.** The far side does the slow work —
 attaching a sparsebundle there takes minutes — and its progress used to be

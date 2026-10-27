@@ -34,8 +34,8 @@ US="${0##*/}"
 ## so the ROOT-OWNED COPY the daemons run -- which has no git beside it -- can
 ## still say which release it is and whether it is one.
 MY_TM_VERSION="0.9.1"
-SCRIPT_COMMIT="1aaeb9e"
-SCRIPT_RELEASE="v0.9.1-100-g1aaeb9e"
+SCRIPT_COMMIT="88accef"
+SCRIPT_RELEASE="v0.9.1-101-g88accef"
 
 ## The first 12 hex of this file's own SHA-256: the value that identifies the
 ## bytes. my-tm is COPIED to its installed path, so this is what tells the
@@ -1209,7 +1209,7 @@ $_imgs
 _EOF
 	fi
 	## stores named by path this run (loc_resolve ... adhoc), never persisted
-	[ -f "$RUN_DIR/adhoc" ] && cat "$RUN_DIR/adhoc"
+	[ -f "$(loc_adhoc_file)" ] && cat "$(loc_adhoc_file)"
 	case " $_seen " in
 		*" local "*) : ;;
 		*) printf 'local\tlocal\t\n' ;;
@@ -1281,15 +1281,38 @@ loc_resolve() {                 # <name> [adhoc]
 	while loc_line "$_lv_n" >/dev/null 2>&1; do
 		_lv_i=$(( _lv_i + 1 )); _lv_n="$_lv_h-$_lv_i"
 	done
-	printf '%s\t%s\t\n' "$_lv_n" "$1" >>"$RUN_DIR/adhoc"
+	printf '%s\t%s\t\n' "$_lv_n" "$1" >>"$(loc_adhoc_file)"
 	locations_run_cache_drop
 	printf '%s\n' "$_lv_n"
 }
 
+## This run's list of stores named by PATH: handle <TAB> target. Never
+## persisted -- it lives and dies with the run directory.
+loc_adhoc_file() { printf '%s/adhoc\n' "$RUN_DIR"; }
+
 ## was this handle only named by path during this run?
 loc_is_adhoc() {
-	[ -f "$RUN_DIR/adhoc" ] || return 1
-	awk -F'\t' -v h="$1" '$1 == h {f = 1} END {exit(f ? 0 : 1)}' "$RUN_DIR/adhoc"
+	_la_f=$(loc_adhoc_file)
+	[ -f "$_la_f" ] || return 1
+	awk -F'\t' -v h="$1" '$1 == h {f = 1} END {exit(f ? 0 : 1)}' "$_la_f"
+}
+
+## A store named by a PATH is READ, never OPENED. Attaching a sparsebundle is
+## minutes, and the caller is usually another Mac waiting on one line of its
+## status: that is how a status on horse made ada attach a 4 TB bundle for a
+## day. --cached was the half of that the caller asks for; this is the half it
+## should not have to ask for. A path is also nobody's registered destination
+## -- a handle has an owner who chose to carry the cost of opening it, a path
+## someone typed has not.
+## Opening one is what --refresh, --index, --mount and --verify are for: they
+## name the store they open, and --refresh is what fills this cache.
+## A store that is ALREADY attached is read live like any other -- the rule is
+## about opening one, not about the path -- and a path that is a plain
+## directory costs nothing to read, so neither is refused here.
+loc_read_without_opening() {    # <handle>
+	loc_is_adhoc "$1" || return 1
+	[ "$(loc_kind "$1")" = "image" ] || return 1
+	! image_mountpoint "$(loc_target "$1")" >/dev/null 2>&1
 }
 
 ## one field of a location's row, in ONE awk: loc_line piped into a second awk
@@ -4422,6 +4445,11 @@ json_ls() {
 		if [ "${OPT_CACHED:-0}" = "1" ]; then
 			_cached=true
 			_rows=$(snapshots_cached_only "$_h")
+		elif loc_read_without_opening "$_h"; then
+			## the same answer for the same reason, without being asked: a
+			## store named by PATH is never opened by a read
+			_cached=true
+			_rows=$(snapshots_cached_only "$_h")
 		else
 			_rows=$(snapshots_get "$_h")
 		fi
@@ -4464,13 +4492,16 @@ cmd_ls() {
 	_now=$(now_epoch)
 	while IFS= read -r _h; do
 		[ -n "$_h" ] || continue
-		_detached=0; _cached_only=0
+		_detached=0; _cached_only=0; _bypath=0
 		if [ "$OPT_CACHED" = "1" ]; then
 			## asked for what is already known, and nothing more: nothing is
 			## mounted, attached or scanned. This is what a status on ANOTHER
 			## Mac asks, so its "instant" is not paid for in minutes here.
 			_rows=$(snapshots_cached_only "$_h")
 			_cached_only=1
+		elif loc_read_without_opening "$_h"; then
+			_rows=$(snapshots_cached_only "$_h")
+			_bypath=1
 		elif loc_ready "$_h"; then
 			_rows=$(snapshots_get "$_h")
 		else
@@ -4485,6 +4516,8 @@ cmd_ls() {
 			if [ -n "$_only" ]; then
 				if [ "$_cached_only" = "1" ]; then
 					note "$_h: nothing has been read from it yet -- $US --ls $_h opens it once"
+				elif [ "$_bypath" = "1" ]; then
+					note "$_h: not attached, and nothing is remembered about it -- a store named by PATH is never opened by a read. To open it: $US --refresh $(loc_target "$_h")"
 				elif [ "$_detached" = "1" ]; then
 					note "$_h is not attached, and nothing is remembered about it yet -- attach it, then: $US --refresh $_h"
 				else
@@ -4498,6 +4531,8 @@ cmd_ls() {
 			note "$_h is not attached -- this is the last known table"
 		[ "$_cached_only" = "1" ] &&
 			note "$_h: the last known table (--cached opens nothing)"
+		[ "$_bypath" = "1" ] &&
+			note "$_h is not attached -- the last known table (a store named by PATH is never opened by a read)"
 
 		_max="${LIMIT:-20}"
 		[ "$OPT_ALL" = "1" ] && _max=0
@@ -5889,7 +5924,7 @@ cmd_health() {
 		## it is exactly where it was left. Answer from the cache instead of
 		## spinning it up, and say so, because a cached age is a fact about
 		## the last time anyone looked.
-		_asleep=0
+		_asleep=0; _bypath=0
 		if ! loc_reachable "$_h"; then
 			if loc_is_quiet "$_h"; then
 				_asleep=1
@@ -5902,15 +5937,26 @@ cmd_health() {
 		_t=$(loc_target "$_h")
 		if [ "$_asleep" = "1" ]; then
 			_rows=$(snapshots_cached_only "$_h")
+		elif loc_read_without_opening "$_h"; then
+			_rows=$(snapshots_cached_only "$_h")
+			_bypath=1
 		else
 			_rows=$(snapshots_get "$_h")
 		fi
 		if [ -z "$_rows" ]; then
-			health_say fail "$_h: no snapshots found"
+			## "no snapshots found" would be a verdict about the STORE; what
+			## happened is that nothing here may open it, which is a fact about
+			## this run -- a warning, never a failure of the backup
+			if [ "$_bypath" = "1" ]; then
+				health_say warn "$_h: not attached, and nothing is remembered about it -- a store named by PATH is never opened by a read, so its state is unknown here"
+			else
+				health_say fail "$_h: no snapshots found"
+			fi
 			continue
 		fi
 		_from=""
 		[ "$_asleep" = "1" ] && _from=" [cached; disk asleep]"
+		[ "$_bypath" = "1" ] && _from=" [cached; not attached]"
 		_lastep=$(printf '%s\n' "$_rows" | sort -t"$(printf '\t')" -k3,3n | tail -n 1 | awk -F'\t' '{print $3}')
 		_agh=$(( (_now - _lastep) / 3600 ))
 		## the age this location's newest backup should stay under; 0 = none. A
@@ -7745,7 +7791,9 @@ usage() {
 usage: $US [OPTIONS] [<LOCATION>|<ID>] [<PATH>|<GLOB>]
 
 A <LOCATION> is one Time Machine backup store, named either by its path or by
-the short handle you gave it with --add; an <ID> is a 6-char name for one
+the short handle you gave it with --add; a store named by PATH is READ, never
+attached -- attaching takes minutes, and --refresh, --index, --mount and
+--verify are the commands that open one. An <ID> is a 6-char name for one
 snapshot inside one location. Everything with -- is interpreted as a command.
 A bare \`$US\` runs \$DEFAULT_CMD (default --status).
 
@@ -10883,6 +10931,108 @@ t_test_status_asks_remotes_for_their_cache() {
 	if [ -f "$T_ROOT/cache.save" ]; then mv -f "$T_ROOT/cache.save" "$_sc_cf"; else rm -f "$_sc_cf"; fi
 }
 
+## The OTHER half of the same bug (#7, decided 2026-10-27): --cached stopped a
+## status on horse from attaching ada's 4 TB bundle, but a plain `--ls <path>`
+## still attached it -- and nobody had asked it to. A store named by PATH is
+## READ, never opened.
+## Adversarial twice over. The cache is made STALE, so anything that does not
+## refuse DOES attach -- proven by the control, the SAME table named by a
+## HANDLE instead of a path. And the refusal is checked to be about OPENING a
+## store, not about images or about paths: a store already attached, and a path
+## that is a plain directory, both stay readable live.
+t_test_path_named_store_is_never_opened() {
+	printf '\nA store named by PATH is read, never opened\n'
+	_bp_save=$(cat "$T_ROOT/cache/locations.tsv")
+	_bp_cf=$(snapshots_cache_file)
+	[ -f "$_bp_cf" ] && cp "$_bp_cf" "$T_ROOT/bp.cache.save"
+	## the by-path list is this run's, shared with every other test in this
+	## block: put back exactly what was in it
+	_bp_ad=$(loc_adhoc_file)
+	[ -f "$_bp_ad" ] && cp "$_bp_ad" "$T_ROOT/bp.adhoc.save"
+
+	## two bundles, identical but for who names them
+	_bp_reg="$T_ROOT/bpreg.sparsebundle"; mkdir "$_bp_reg"; : >"$_bp_reg/Info.plist"
+	_bp_img="$T_ROOT/bypath.sparsebundle"; mkdir "$_bp_img"; : >"$_bp_img/Info.plist"
+	printf 'bpreg\t%s\t\n' "$_bp_reg" >>"$T_ROOT/cache/locations.tsv"
+	locations_run_cache_drop
+	_bp_h=$(loc_resolve "$_bp_img" adhoc)
+	t_eq "a path becomes a handle of its own" "$_bp_h" "path-bypath"
+	printf 'bpreg\t2025-02-02-000000\t1738454400\tbpr001\t-\t-\t-\t-\t-\tok\tData\n' | t_cache_add
+	printf '%s\t2025-03-03-000000\t1740960000\tbyp001\t-\t-\t-\t-\t-\tok\tData\n' "$_bp_h" | t_cache_add
+
+	## an hdiutil that RECORDS an attach (and fails it); the suite owns none,
+	## so this one is removed again at the end
+	_bp_hd="$(t_stub_dir)/hdiutil"
+	{ printf '#!/bin/sh\n'; printf 'printf "hdiutil %%s\\n" "$*" >>"%s"\n' "$(t_calls)"; printf 'exit 1\n'; } >"$_bp_hd"
+	chmod 0755 "$_bp_hd"
+
+	## the control: the same stale table, named by its HANDLE -- it IS opened
+	touch -t 202001010000 "$_bp_cf"
+	: >"$(t_calls)"
+	cmd_ls bpreg >/dev/null 2>&1
+	t_ne "(a handle with a stale table IS opened to rescan it)" \
+		"$(grep -c 'hdiutil attach' "$(t_calls)")" "0"
+
+	touch -t 202001010000 "$_bp_cf"
+	: >"$(t_calls)"
+	_bp_out=$(cmd_ls "$_bp_img" 2>&1)
+	t_eq "the same store named by PATH attaches nothing" \
+		"$(grep -c 'hdiutil attach' "$(t_calls)")" "0"
+	t_match "and answers from the last known table" "$_bp_out" "byp001"
+	t_match "saying it is not attached" "$_bp_out" "not attached"
+	t_match "and why nothing was opened" "$_bp_out" "named by PATH is never opened"
+
+	## -J is the form another Mac's status sends
+	touch -t 202001010000 "$_bp_cf"
+	: >"$(t_calls)"
+	_bp_js=$( ( JSON=1; cmd_ls "$_bp_img" ) 2>&1 )
+	t_eq "-J attaches nothing either" "$(grep -c 'hdiutil attach' "$(t_calls)")" "0"
+	t_match "and marks those rows as a cached read" "$_bp_js" '"from_cache": true'
+
+	## nothing remembered at all: the answer is "not attached", NEVER "no
+	## snapshots" -- which would read as "this store is empty"
+	cache_read_checked "$_bp_cf" 2>/dev/null |
+		awk -F'\t' -v l="$_bp_h" '$1 != l' | cache_write_checked "$_bp_cf"
+	: >"$(t_calls)"
+	_bp_none=$(cmd_ls "$_bp_img" 2>&1)
+	t_eq "with nothing remembered it still attaches nothing" \
+		"$(grep -c 'hdiutil attach' "$(t_calls)")" "0"
+	t_match "and says what is missing" "$_bp_none" "nothing is remembered about it"
+	t_eq "(never \"has no snapshots\": that would read as an empty store)" \
+		"$(printf '%s\n' "$_bp_none" | count_match 'has no snapshots')" "0"
+
+	## --health is a read too, so the same rule -- and it WARNS rather than
+	## failing: a store nothing may open says nothing about the backup
+	: >"$(t_calls)"
+	_bp_hout=$(cmd_health "$_bp_img" 2>&1)
+	t_eq "a health check attaches nothing either" \
+		"$(grep -c 'hdiutil attach' "$(t_calls)")" "0"
+	t_match "and warns instead of failing the backup" "$_bp_hout" "  >> .*not attached"
+
+	## the rule is about OPENING one: already attached, or a plain directory,
+	## and it is read live like any other store
+	# shellcheck disable=SC2329  # the redefinition is what makes it "attached"
+	t_eq "a store that is ALREADY attached is read live" \
+		"$( ( image_mountpoint() { printf '/Volumes/bp\n'; }
+		      loc_read_without_opening "$_bp_h" && echo refused || echo live ) )" "live"
+	_bp_dir="$T_ROOT/bypathdir"; mkdir "$_bp_dir"
+	: >"$_bp_dir/backup_manifest.plist"
+	_bp_dh=$(loc_resolve "$_bp_dir" adhoc)
+	t_eq "a plain directory named by path costs nothing: read live" \
+		"$(loc_read_without_opening "$_bp_dh" && echo refused || echo live)" "live"
+
+	rm -f "$_bp_hd"
+	rm -rf "$_bp_reg" "$_bp_img" "$_bp_dir"
+	printf '%s\n' "$_bp_save" >"$T_ROOT/cache/locations.tsv"
+	if [ -f "$T_ROOT/bp.adhoc.save" ]; then
+		mv -f "$T_ROOT/bp.adhoc.save" "$_bp_ad"
+	else
+		rm -f "$_bp_ad"
+	fi
+	locations_run_cache_drop
+	if [ -f "$T_ROOT/bp.cache.save" ]; then mv -f "$T_ROOT/bp.cache.save" "$_bp_cf"; else rm -f "$_bp_cf"; fi
+}
+
 ## A. --find added THIS Mac's live-disk database to every location's search. On
 ## ada, a search in horse's store -- never indexed there -- listed ada's own
 ## /Applications as horse's history: an answer that was confidently wrong.
@@ -13279,6 +13429,7 @@ _rt_list() {
 	_rt attach_message_is_about_this_disk    && t_test_attach_message_is_about_this_disk
 	_rt attach_is_not_orphaned               && t_test_attach_is_not_orphaned
 	_rt json_cached_opens_nothing            && t_test_json_cached_opens_nothing
+	_rt path_named_store_is_never_opened     && t_test_path_named_store_is_never_opened
 	_rt attach_lock_waits_for_an_owner       && t_test_attach_lock_waits_for_an_owner
 	_rt attach_one_at_a_time                 && t_test_attach_one_at_a_time
 	_rt remote_progress_reaches_the_caller   && t_test_remote_progress_reaches_the_caller
