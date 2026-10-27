@@ -1310,6 +1310,16 @@ my-tm --add /Volumes/<disk>/<host>.sparsebundle usbtm
   its attach lock — so the next run neither waits on a dead owner nor warns
   about an "interrupted run" that was your own Ctrl-C a second earlier. A lock
   held by another live run is never touched.
+* **Its temp files die with the run too.** Every scratch file a run needs goes
+  inside one private directory of its own (`mktemp -d`, mode 700, under
+  `TMPDIR`), and the trap that stops the attach removes it. Each call used to
+  name `/tmp` itself, so an interrupted run left its files there — 25 of them
+  in one Mac's `/tmp` on 2026-10-28, from five different steps, the oldest two
+  days old, one a 4.4 MB `.err`. A `kill -9` still leaves the directory, since
+  no trap can catch that; its name says which run, and each file inside says
+  which step. The exception is deliberate: `--open` fetches a remote file for
+  an application to open **after** my-tm has exited, so that one outlives the
+  run, and its path is printed.
 * **A lock with no owner yet is WAITED for, not broken.** Between making the
   lock and writing its pid into it, a holder looks owner-less — and a run that
   broke it there would be racing that holder. Two runs did exactly that to each

@@ -34,8 +34,8 @@ US="${0##*/}"
 ## so the ROOT-OWNED COPY the daemons run -- which has no git beside it -- can
 ## still say which release it is and whether it is one.
 MY_TM_VERSION="0.9.1"
-SCRIPT_COMMIT="88accef"
-SCRIPT_RELEASE="v0.9.1-101-g88accef"
+SCRIPT_COMMIT="aa63f62"
+SCRIPT_RELEASE="v0.9.1-102-gaa63f62"
 
 ## The first 12 hex of this file's own SHA-256: the value that identifies the
 ## bytes. my-tm is COPIED to its installed path, so this is what tells the
@@ -124,7 +124,7 @@ cmd_stamp_version() {
 	git -C "$_sv_dir" diff --quiet -- "$(basename "$0")" 2>/dev/null \
 		|| err "stamp-version: this script has uncommitted edits -- commit them first"
 	_sv_desc=$(git -c safe.directory='*' -C "$_sv_dir" describe --tags --long 2>/dev/null)
-	_sv_tmp=$(mktemp "${TMPDIR:-/tmp}/my-tm.stamp.XXXXXX") || err "stamp-version: mktemp failed"
+	_sv_tmp=$(tmp_file stamp) || err "stamp-version: cannot make its temp file"
 	cp -p "$_sv_self" "$_sv_tmp" 2>/dev/null
 	sed -e "s|^SCRIPT_COMMIT=.*|SCRIPT_COMMIT=\"$_sv_sha\"|" \
 	    -e "s|^SCRIPT_RELEASE=.*|SCRIPT_RELEASE=\"$_sv_desc\"|" "$_sv_self" > "$_sv_tmp" \
@@ -271,8 +271,13 @@ JOB_PROGRAM=""
 ## root run both appends to them AND acts on what they list at exit (unmount,
 ## detach). A symlink or a pre-filled file at that name let any local user
 ## point a root run at a write, an unmount or a detach of their choosing.
-RUN_DIR=$(mktemp -d "${TMPDIR:-/tmp}/my-tm.run.XXXXXX" 2>/dev/null) || {
-	printf ' !!! cannot create a private directory for this run under %s\n' "${TMPDIR:-/tmp}" >&2
+## No trailing slash: macOS sets TMPDIR to .../T/, and "$TMPDIR/my-tm.run.X"
+## would then hold a // that every path built from RUN_DIR carries along --
+## until it meets the same path with the // collapsed, and the two no longer
+## compare equal.
+RUN_TMPDIR=${TMPDIR:-/tmp}; RUN_TMPDIR=${RUN_TMPDIR%/}
+RUN_DIR=$(mktemp -d "$RUN_TMPDIR/my-tm.run.XXXXXX" 2>/dev/null) || {
+	printf ' !!! cannot create a private directory for this run under %s\n' "$RUN_TMPDIR" >&2
 	exit 1
 }
 ## per-run caches of answers that do not change during a run (the location
@@ -297,6 +302,18 @@ ATTACH_PIDFILE="$RUN_DIR/attach.pid"
 ## ...and the attach lock this run holds, so an interrupted run hands it back
 ## instead of leaving the next one to wait for a dead owner and then break it
 ATTACH_LOCKFILE="$RUN_DIR/attach.lock"
+
+## This run's temp files and directories: INSIDE RUN_DIR, so the one cleanup
+## that removes it takes every one of them along. Each call used to name /tmp
+## itself, and then an interrupted run left them there: 25 of them in horse's
+## /tmp on 2026-10-28, from five different steps (12 att, 9 rm, 2 rsn -- one a
+## 4.4 MB .err -- a test directory and a disk), the oldest two days old. TAG
+## names the step that made it, so even what a kill -9 leaves (no trap catches
+## that) says where it came from.
+## A file the run HANDS ON is not one of these: --open fetches a remote file
+## for an application to open after my-tm has exited.
+tmp_file() { mktemp "$RUN_DIR/$1.XXXXXX"; }     # <tag>
+tmp_dir()  { mktemp -d "$RUN_DIR/$1.XXXXXX"; }  # <tag>
 
 #############################################################################
 ## OUTPUT
@@ -1535,7 +1552,7 @@ vol_device() {
 		printf '%s\n' "$_vd"
 		return 0
 	fi
-	_plist=$(mktemp /tmp/my-tm.disk.XXXXXX) || return 1
+	_plist=$(tmp_file disk) || return 1
 	if diskutil info -plist "$1" >"$_plist" 2>/dev/null; then
 		plutil -extract DeviceIdentifier raw -o - "$_plist" 2>/dev/null
 	fi
@@ -1567,7 +1584,7 @@ loc_source_uuids() {
 }
 
 vol_uuid() {
-	_plist=$(mktemp /tmp/my-tm.disk.XXXXXX) || return 1
+	_plist=$(tmp_file disk) || return 1
 	if diskutil info -plist "$1" >"$_plist" 2>/dev/null; then
 		plutil -extract VolumeUUID raw -o - "$_plist" 2>/dev/null
 	fi
@@ -1739,7 +1756,7 @@ CACHE_MAGIC="#my-tm-cache 1"
 ## stdin -> <file>, with an integrity header
 cache_write_checked() {
 	_cf="$1"
-	_body=$(mktemp /tmp/my-tm.cw.XXXXXX) || return 1
+	_body=$(tmp_file cw) || return 1
 	cat >"$_body"
 	{
 		printf '%s %s\n' "$CACHE_MAGIC" "$(md5_file "$_body")"
@@ -1770,7 +1787,7 @@ cache_read_checked() {
 			;;
 	esac
 	_want=${_hdr##* }
-	_body=$(mktemp /tmp/my-tm.cr.XXXXXX) || return 1
+	_body=$(tmp_file cr) || return 1
 	tail -n +2 "$_cf" >"$_body"
 	_have=$(md5_file "$_body")
 	if [ "$_want" != "$_have" ]; then
@@ -1799,7 +1816,7 @@ snapshots_build() {
 	_names=$(snap_names "$_h")
 	[ -n "$_names" ] || return 0
 
-	_tmpd=$(mktemp -d /tmp/my-tm.snap.XXXXXX) || return 1
+	_tmpd=$(tmp_dir snap) || return 1
 	## snapshot name -> epoch.  One date(1) per snapshot, and only on a cache
 	## miss: BSD date takes a single value per call, and the local-time names
 	## cross DST boundaries, so no single offset would be correct.
@@ -2053,7 +2070,7 @@ snapshot_gone() {
 ## by anyone else. hdiutil knows; the mount table alone does not say which
 ## volume came from which image.
 image_mountpoint() {
-	_pl=$(mktemp /tmp/my-tm.hdi.XXXXXX) || return 1
+	_pl=$(tmp_file hdi) || return 1
 	hdiutil info -plist >"$_pl" 2>/dev/null || { rm -f "$_pl"; return 1; }
 	_mp=$(plutil -p "$_pl" 2>/dev/null | awk -v img="$1" '
 		/"image-path" =>/ { p = $0; sub(/^[^>]*=> /, "", p); gsub(/"/, "", p);
@@ -2346,7 +2363,7 @@ image_attach() {
 		return 0
 	fi
 
-	_pl=$(mktemp /tmp/my-tm.att.XXXXXX) || { attach_unlock "$_att_lock"; return 1; }
+	_pl=$(tmp_file att) || { attach_unlock "$_att_lock"; return 1; }
 	run_echo hdiutil attach -readonly -nobrowse -noverify -noautofsck "$_img"
 	why "read-only, so it cannot collide with the Mac that backs up into it"
 	## Attaching a big sparsebundle takes minutes -- on a spinning disk as
@@ -3015,13 +3032,13 @@ transient_snapshot() {
 ## them.  lsof costs seconds per call, so asking it once per mount turns
 ## releasing a few dozen into minutes.
 busy_mounts() {
-	_bl=$(mktemp /tmp/my-tm.busy.XXXXXX) || return 0
+	_bl=$(tmp_file busy) || return 0
 	cat >"$_bl"
 	if [ ! -s "$_bl" ]; then
 		rm -f "$_bl"
 		return 0
 	fi
-	_bo=$(mktemp /tmp/my-tm.busyout.XXXXXX) || { rm -f "$_bl"; return 0; }
+	_bo=$(tmp_file busyout) || { rm -f "$_bl"; return 0; }
 	_bd="$_bo.done"
 
 	## lsof enumerates EVERY mount on the machine, so one unresponsive
@@ -3102,7 +3119,7 @@ sweep() {
 	_urgent=0
 	tm_backup_running && _urgent=1
 
-	_tmp=$(mktemp /tmp/my-tm.sweep.XXXXXX) || return 1
+	_tmp=$(tmp_file sweep) || return 1
 	printf '%s\n' "$_records" >"$_tmp"
 	## one lsof for every recorded mountpoint, before touching any of them
 	_busy=$(awk -F'\t' '{print $3}' "$_tmp" | busy_mounts)
@@ -3215,7 +3232,7 @@ tm_refresh_loc() {
 	[ -n "$_rows" ] || return 0
 
 	## what should exist
-	_want=$(mktemp /tmp/my-tm.tree.XXXXXX) || return 1
+	_want=$(tmp_file tree) || return 1
 	printf '%s\n' "$_rows" | awk -F'\t' '{print $2}' | sort >"$_want"
 
 	## drop stale snapshot dirs (never touch anything we did not make)
@@ -3429,8 +3446,8 @@ vs_state() {                    # <dir> <ts> <out>
 ## absent row sorts before a real one (ASCII 45 before 48), so the phantom won
 ## every lookup. That is a backup reported as not holding a file it plainly holds.
 vs_diff() {                     # <old> <new>
-	_vf_o=$(mktemp /tmp/my-tm.op.XXXXXX) || return 1
-	_vf_n=$(mktemp /tmp/my-tm.np.XXXXXX) || { rm -f "$_vf_o"; return 1; }
+	_vf_o=$(tmp_file op) || return 1
+	_vf_n=$(tmp_file np) || { rm -f "$_vf_o"; return 1; }
 	LC_ALL=C cut -f1 "$1" | LC_ALL=C sort -u >"$_vf_o"
 	LC_ALL=C cut -f1 "$2" | LC_ALL=C sort -u >"$_vf_n"
 	{
@@ -3504,7 +3521,7 @@ vs_record_into() {              # <dir> <ts> <stats>
 	fi
 	_ri_p=$(printf '%s\n' "$_ri_chain" | LC_ALL=C awk -v t="$_ri_t" '$0 < t {p = $0} END {print p}')
 	_ri_n=$(printf '%s\n' "$_ri_chain" | LC_ALL=C awk -v t="$_ri_t" '$0 > t {print; exit}')
-	_ri_w=$(mktemp -d /tmp/my-tm.vs.XXXXXX) || return 1
+	_ri_w=$(tmp_dir vs) || return 1
 
 	if [ -z "$_ri_n" ]; then
 		## the usual case: newer than anything indexed, one delta appended
@@ -3573,7 +3590,7 @@ vs_migrate() {                  # <loc>
 	_mg_c="$_mg_d.new.$$"
 	rm -rf "$_mg_c"
 	mkdir "$_mg_c" || return 1
-	_mg_w=$(mktemp -d /tmp/my-tm.mg.XXXXXX) || { rm -rf "$_mg_c"; return 1; }
+	_mg_w=$(tmp_dir mg) || { rm -rf "$_mg_c"; return 1; }
 	for _mg_b in "$_mg_d"/base.*.gz; do
 		[ -f "$_mg_b" ] || continue
 		gzip -cd "$_mg_b" 2>/dev/null
@@ -3598,7 +3615,7 @@ _EOF
 ## bucket + compress a full snapshot listing
 vs_write_baseline() {
 	_wb_d="$1"; _wb_stats="$2"
-	_wb_tmp=$(mktemp -d /tmp/my-tm.base.XXXXXX) || return 1
+	_wb_tmp=$(tmp_dir base) || return 1
 	## Bucket on the last two characters of the path. Written by SORTING on the
 	## bucket and closing each file as the key changes: awk keeps every output
 	## file open otherwise and runs out of descriptors long before 256 buckets,
@@ -3606,7 +3623,7 @@ vs_write_baseline() {
 	## LC_ALL=C throughout: a real backup contains filenames that are not valid
 	## UTF-8, and awk aborts on those in a UTF-8 locale -- which produced an empty
 	## baseline while every command still reported success.
-	_wb_err=$(mktemp /tmp/my-tm.bkerr.XXXXXX) || return 1
+	_wb_err=$(tmp_file bkerr) || return 1
 	LC_ALL=C awk -F'\t' '{
 		n = length($1);
 		if (n == 0) next;
@@ -3663,7 +3680,7 @@ vs_repair_deltas() {
 	_fixed=0
 	for _df in "$_d"/d.*.tsv; do
 		[ -f "$_df" ] || continue
-		_rt=$(mktemp /tmp/my-tm.rep.XXXXXX) || continue
+		_rt=$(tmp_file rep) || continue
 		if awk -F'\t' '
 				NR == FNR { if ($2 != "-") real[$1] = 1; next }
 				$2 == "-" && ($1 in real) { dropped++; next }
@@ -3692,10 +3709,11 @@ vs_prune() {
 	_live=$(snap_names "$_loc" 2>/dev/null)
 	[ -n "$_live" ] || return 0          # cannot tell -- leave everything alone
 
-	## Scratch files go to /tmp, not inside $_d: a location can have coverage
-	## from an earlier run and no version store yet, and writing into a directory
-	## that does not exist failed the whole prune with a shell error.
-	_lf=$(mktemp /tmp/my-tm.live.XXXXXX) || return 0
+	## Scratch files go in the run's own directory, not inside $_d: a location
+	## can have coverage from an earlier run and no version store yet, and
+	## writing into a directory that does not exist failed the whole prune with
+	## a shell error.
+	_lf=$(tmp_file live) || return 0
 	printf '%s\n' "$_live" | LC_ALL=C sort >"$_lf"
 	_gone=""
 	[ -f "$_cov" ] && _gone=$(LC_ALL=C sort "$_cov" | LC_ALL=C comm -23 - "$_lf")
@@ -3711,8 +3729,8 @@ vs_prune() {
 		_next=$(vs_delta_ts "$_d" | LC_ALL=C awk -v g="$_gts" '$0 > g {print; exit}')
 		if [ -n "$_next" ]; then
 			_nd=$(vs_delta_file "$_d" "$_next")
-			_later=$(mktemp /tmp/my-tm.sqn.XXXXXX) || continue
-			_older=$(mktemp /tmp/my-tm.sqo.XXXXXX) || { rm -f "$_later"; continue; }
+			_later=$(tmp_file sqn) || continue
+			_older=$(tmp_file sqo) || { rm -f "$_later"; continue; }
 			gzip -cdf <"$_nd" >"$_later" 2>/dev/null
 			gzip -cdf <"$_gd" >"$_older" 2>/dev/null
 			LC_ALL=C awk -F'\t' '
@@ -3783,7 +3801,7 @@ vs_put() {
 	vs_check_generation
 	_f=$(vs_file)
 	need_dir "$(dirname "$_f")" || return 1
-	_new=$(mktemp /tmp/my-tm.vs.XXXXXX) || return 1
+	_new=$(tmp_file vs) || return 1
 	awk -F'\t' -v l="$_loc" '{printf "%s\t%s\t%s\t%s\t%s\t%s\n", l, $1, $2, $3, $4, $5}' >"$_new"
 	{
 		[ -f "$_f" ] && cat "$_f"
@@ -4766,7 +4784,7 @@ cmd_lookup() {
 		[ -n "$_rows" ] || continue
 		_any=1
 
-		_work=$(mktemp -d /tmp/my-tm.lk.XXXXXX) || return 1
+		_work=$(tmp_dir lk) || return 1
 		: >"$_work/known"; : >"$_work/todo"; : >"$_work/pending"; : >"$_work/indexed"
 		## 1. the answers already kept -- root's shared cache first, then this
 		##    user's own -- in ONE pass, not a process per snapshot
@@ -4883,7 +4901,7 @@ cmd_find() {
 		*) _pattern="*$_pattern*" ;;
 	esac
 
-	_hits=$(mktemp /tmp/my-tm.find.XXXXXX) || return 1
+	_hits=$(tmp_file find) || return 1
 	_noidx=""
 	while IFS= read -r _h; do
 		[ -n "$_h" ] || continue
@@ -5172,7 +5190,7 @@ cmd_umount() {
 	images_adopt_orphans
 	_records=$(mounts_read_all)
 	[ -n "$_records" ] || { note "nothing mounted by $US"; return 0; }
-	_tmp=$(mktemp /tmp/my-tm.um.XXXXXX) || return 1
+	_tmp=$(tmp_file um) || return 1
 	printf '%s\n' "$_records" >"$_tmp"
 	_hitloc=""; _hitid=""
 	if [ "$OPT_ALL" != "1" ] && [ -n "$_what" ]; then
@@ -5498,13 +5516,13 @@ index_one() {
 	while [ -f "$_dir/$_h.inc.$(printf '%02d' "$_n").db" ]; do _n=$(( _n + 1 )); done
 	_inc="$_dir/$_h.inc.$(printf '%02d' "$_n").db"
 
-	_paths=$(mktemp /tmp/my-tm.idx.XXXXXX) || { snap_umount "$_mp"; return 1; }
+	_paths=$(tmp_file idx) || { snap_umount "$_mp"; return 1; }
 	## One walk, stats included: path + size + mtime for every entry, batched
 	## through xargs so it is one stat exec per batch and not one per file. The
 	## stats are what makes "which versions of this file do I have" answerable
 	## later without mounting anything.
 	run_echo find "$_base" -print0 \| xargs -0 stat -f '%N%t%z%t%m'
-	_stats=$(mktemp /tmp/my-tm.stat.XXXXXX) || { snap_umount "$_mp"; return 1; }
+	_stats=$(tmp_file stat) || { snap_umount "$_mp"; return 1; }
 	## the same locale discipline for the walk itself
 	find "$_base" -print0 2>/dev/null |
 		xargs -0 stat -f '%N%t%z%t%m' 2>/dev/null |
@@ -5570,7 +5588,7 @@ index_consolidate() {
 		warn "locate.mklocatedb not found -- leaving the increments as they are"
 		return 1
 	}
-	_all=$(mktemp /tmp/my-tm.cons.XXXXXX) || return 1
+	_all=$(tmp_file cons) || return 1
 	for _f in "$_dir/$_h.db" "$_dir/$_h".inc.*.db; do
 		[ -f "$_f" ] || continue
 		locate -d "$_f" '*' 2>/dev/null >>"$_all"
@@ -5700,7 +5718,7 @@ remote_read_err() { cat "$(remote_read_err_file "$1")" 2>/dev/null; }
 remote_snap_names() {
 	_t=$(loc_target "$1")
 	_rsn_host=$(remote_host "$_t")
-	_rsn_out=$(mktemp /tmp/my-tm.rsn.XXXXXX) || return 1
+	_rsn_out=$(tmp_file rsn) || return 1
 	## What the remote says about ITS work belongs on this screen: attaching a
 	## sparsebundle there takes minutes, and swallowing its progress made that
 	## a silent hang here. Its lines are re-prefixed and named for the host, so
@@ -6123,7 +6141,7 @@ cmd_rm() {
 	done
 	[ -n "$_ids" ] || err "--rm needs one or more <ID> and the literal word go"
 
-	_plan=$(mktemp /tmp/my-tm.rm.XXXXXX) || return 1
+	_plan=$(tmp_file rm) || return 1
 	for _w in $_ids; do
 		_hit=$(resolve_id "$_w") || { warn "$_w: no such snapshot"; continue; }
 		[ -n "$_hit" ] || { warn "$_w: no such snapshot"; continue; }
@@ -7035,7 +7053,7 @@ _LAUNCHER_C_EOF
 ## md5 of that source -- what the launcher's --version reports, so a stale
 ## build is recognisable.
 launcher_source_hash() {
-	_lh_f=$(mktemp /tmp/my-tm.lsrc.XXXXXX) || return 1
+	_lh_f=$(tmp_file lsrc) || return 1
 	launcher_source >"$_lh_f"
 	md5_file "$_lh_f"
 	rm -f "$_lh_f"
@@ -7058,7 +7076,7 @@ launcher_build() {
 		command -v "$_lb_tool" >/dev/null 2>&1 ||
 			{ warn "cannot build the launcher: $_lb_tool is not installed"; return 1; }
 	done
-	_lb_dir=$(mktemp -d /tmp/my-tm.launcher.XXXXXX) || return 1
+	_lb_dir=$(tmp_dir launcher) || return 1
 	launcher_source >"$_lb_dir/my-tm-launcher.c"
 	_lb_hash=$(md5_file "$_lb_dir/my-tm-launcher.c")
 	if ! run clang -Wall -Wextra -Werror -O2 \
@@ -8501,7 +8519,7 @@ _EOF
 
 t_setup() {
 	RUN_CACHE=0
-	T_ROOT=$(mktemp -d /tmp/my-tm.test.XXXXXX) || err "cannot create a test dir"
+	T_ROOT=$(tmp_dir test) || err "cannot create a test dir"
 	T_MYTM=$(abs_path "$0")
 	mkdir -p "$T_ROOT/store" "$T_ROOT/cache" "$T_ROOT/ucache" "$T_ROOT/mount" "$T_ROOT/home"
 	mkdir -p "$T_ROOT/store/2026-08-23-101010.inprogress" "$T_ROOT/store/2026-08-19-090000.interrupted"
@@ -10369,6 +10387,25 @@ t_test_run_cache() {
 	TMPDIR="$_rc_td" "$T_MYTM" --version >/dev/null 2>&1
 	t_eq "and the directory is gone when the run ends" \
 		"$(find "$_rc_td" -name 'my-tm.run.*' 2>/dev/null | count_lines)" "0"
+	## EVERY temp of a run goes inside it, or a run that is interrupted leaves
+	## it in /tmp -- which is what happened, 21 files deep, until each call
+	## stopped naming /tmp itself. The word is built in two pieces so this
+	## check cannot match itself; a failure names the lines.
+	_rc_mk='mk''temp'
+	t_eq "every temp of a run is made inside the run directory" \
+		"$(awk -v k="$_rc_mk" '
+			$0 !~ (k " (-d )?[\"/]") { next }
+			/^[[:space:]]*#/ { next }
+			index($0, "\"$RUN_DIR/") { next }
+			index($0, "\"$T_ROOT/") { next }
+			index($0, "my-tm.run.XXXXXX") { next }
+			index($0, ".my-tm.XXXXXX") { next }
+			{ printf "line %d: %s\n", NR, $0 }
+		' "$T_MYTM")" ""
+	_rc_t=$(tmp_file rctest)
+	t_eq "...and that is where tmp_file puts one" \
+		"$(printf '%s\n' "$_rc_t" | grep -cF "$RUN_DIR/")" "1"
+	rm -f "$_rc_t"
 
 	_rc_log="$T_ROOT/rc.calls"; : >"$_rc_log"
 	_rc_save=$(cat "$T_ROOT/cache/locations.tsv")
@@ -10395,6 +10432,49 @@ t_test_run_cache() {
 	t_match "each host is asked once, whatever the answer" "$_rc_out" "ssh_up=1 ssh_down=1"
 	t_match "and the remembered answers are the real ones" "$_rc_out" "up=yes down=no"
 	printf '%s\n' "$_rc_save" | cache_write_locations
+}
+
+## REGRESSION: a run made its temps in /tmp, so a run that did NOT reach its
+## own cleanup left them there -- 12 my-tm.att.*, 9 my-tm.rm.* and a 4.4 MB
+## .err on horse, from one night of interrupted attach loops.
+## Adversarial on three counts: the private directory must EXIST while the run
+## lives (or "nothing left behind" is equally true of a run that never
+## started), the signal is a REAL SIGINT and not a call to the handler, and it
+## reaches the whole process GROUP -- my-tm blocks deep inside nested $(...)
+## subshells, and a signal to the top shell alone reaches none of them.
+t_test_interrupted_run_leaves_nothing() {
+	printf '\nAn interrupted run leaves no temp file behind\n'
+	_ir_d="$T_ROOT/int"; mkdir "$_ir_d" "$_ir_d/tmp" "$_ir_d/stub"
+	## --version is the vehicle: no config, no cache, no store, and shasum is
+	## the first thing it runs -- so the run is certainly alive, and its
+	## directory certainly made, when the signal arrives. The stub waits on a
+	## marker rather than for ever: the cleanup the trap runs calls commands
+	## too, and a stub that never answers would hang that instead.
+	_ir_mark="$_ir_d/block"; : >"$_ir_mark"
+	printf '#!/bin/sh\nwhile [ -e "%s" ]; do sleep 0.1; done\nexit 0\n' "$_ir_mark" >"$_ir_d/stub/shasum"
+	chmod 0755 "$_ir_d/stub/shasum"
+	## perl does two things dash cannot here: `set -m` needs a tty, so this is
+	## the only way to give the run a process group of its own to signal; and a
+	## non-interactive shell starts a BACKGROUND job with SIGINT IGNORED, which
+	## no later trap can take back -- so the default disposition goes back on.
+	# shellcheck disable=SC2016  # single quotes on purpose: perl's own $SIG
+	TMPDIR="$_ir_d/tmp" PATH="$_ir_d/stub:$PATH" \
+		perl -e '$SIG{INT} = "DEFAULT"; setpgrp(0, 0); exec @ARGV' \
+		"$T_MYTM" --version >/dev/null 2>&1 &
+	_ir_pid=$!
+	_ir_i=0; _ir_saw=0
+	while [ "$_ir_i" -lt 100 ]; do
+		[ -n "$(find "$_ir_d/tmp" -name 'my-tm.run.*' 2>/dev/null)" ] && { _ir_saw=1; break; }
+		_ir_i=$(( _ir_i + 1 )); sleep 0.1
+	done
+	t_eq "the run's private directory is there while it runs" "$_ir_saw" "1"
+	kill -INT -"$_ir_pid" 2>/dev/null
+	rm -f "$_ir_mark"
+	wait "$_ir_pid"; _ir_rc=$?
+	t_eq "an interrupted run ends 130, as an interrupt does" "$_ir_rc" "130"
+	t_eq "and leaves nothing of itself behind" \
+		"$(find "$_ir_d/tmp" -mindepth 1 2>/dev/null | count_lines)" "0"
+	rm -rf "$_ir_d"
 }
 
 ## Naming a location by its path. Adversarial, from horse@ada: ada's my-tm was
@@ -13460,6 +13540,7 @@ _rt_list() {
 	_rt index_progress_visible               && t_test_index_progress_visible
 	_rt status_index_size                    && t_test_status_index_size
 	_rt run_cache                            && t_test_run_cache
+	_rt interrupted_run_leaves_nothing       && t_test_interrupted_run_leaves_nothing
 	_rt loc_resolve                          && t_test_loc_resolve
 	_rt vol_device                           && t_test_vol_device
 	_rt launcher                             && t_test_launcher
@@ -13603,7 +13684,7 @@ run_tests() {
 	## "0" is NOT empty, so ${T_WITH_SNAPSHOTS:+...} would hand every block the
 	## flag and run the tests that take a REAL local snapshot
 	_rt_ws=""; [ "$T_WITH_SNAPSHOTS" = "1" ] && _rt_ws="--with-snapshots"
-	_rt_d=$(mktemp -d /tmp/my-tm.rt.XXXXXX) || err "cannot create the test run dir"
+	_rt_d=$(tmp_dir rt) || err "cannot create the test run dir"
 	_rt_tapf="$_rt_d/tap"; : >"$_rt_tapf"
 	_rt_b=0
 	while [ "$_rt_b" -lt "$_rt_jobs" ]; do
