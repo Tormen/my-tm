@@ -225,6 +225,7 @@ LSOF_TIMEOUT=10
 JOBS_RUN_WITH_FULL_DISK_ACCESS=0
 JOBS_LAUNCHER="/usr/local/sbin/my-tm-launcher"
 FDA_CMD="my-fda"
+LITTLE_SNITCH="my-little-snitch"
 
 ## how long a mount made on the way into a command lives if the command dies
 ## without cleaning up.  Not user-tunable: it is a leak-reaper, not a policy.
@@ -564,6 +565,13 @@ JOBS_LAUNCHER="/usr/local/sbin/my-tm-launcher"  # where --install puts it; root:
 FDA_CMD="my-fda"                # grants a new launcher Full Disk Access: --install
                                 # runs `<FDA_CMD> add` when someone is at the
                                 # terminal; "" or not found = it prints the step
+LITTLE_SNITCH="my-little-snitch" # writes the Little Snitch rules the jobs need
+                                # (macOS): they reach the ssh locations as root,
+                                # with nobody at the screen to answer an alert.
+                                # --install shows them, writes the missing ones
+                                # on go: any program via ssh, any host, each port
+                                # `ssh -G <host>` gives, owner root. "" or not
+                                # found = none checked or written
 # --- backup control ---
 BACKUP_VOLUME=""                # "" = ask tmutil which destination this is.
                                 # Resolved ONCE at startup; the pre-backup
@@ -7199,6 +7207,53 @@ install_access_plan() {
 	return 0
 }
 
+## The Little Snitch rules the jobs need, one line each, and which are
+## missing (SNITCH_MISSING: their ports). The jobs reach every ssh location
+## with ssh -- scp runs ssh too -- as root, and nobody is at the screen to
+## answer an alert, so the rule must be there first: any program via ssh (the
+## launcher or my-tm in front of it), owner root, on the port ssh itself
+## resolves for the host. ANY host, not the location's: Little Snitch names one
+## address differently from one connection to the next, and a rule for the
+## other name still holds the job. Nothing when LITTLE_SNITCH is "" or absent.
+snitch_plan() {
+	SNITCH_MISSING=""; SNITCH_CMD=""
+	[ -n "$LITTLE_SNITCH" ] || return 0
+	SNITCH_CMD=$(command -v "$LITTLE_SNITCH" 2>/dev/null) || {
+		minor "snitch:     $LITTLE_SNITCH not found -- no Little Snitch rule checked (LITTLE_SNITCH)"
+		return 0
+	}
+	_sp_ports=$(locations_all | awk -F'\t' '{print $2}' | while IFS= read -r _sp_t; do
+		is_remote_target "$_sp_t" || continue
+		ssh -G "$(remote_host "$_sp_t")" </dev/null 2>/dev/null | awk '$1 == "port" { print $2; exit }'
+	done | sort -n -u)
+	[ -n "$_sp_ports" ] || return 0
+	## only this shape counts: a rule for one script misses the launcher, one
+	## for an address misses the next name the same host is given
+	_sp_have=$("$SNITCH_CMD" list 2>/dev/null | grep '	any via [^ ]*ssh ' | grep ' any ' |
+		grep -E ' (root|anyone)( |$)')
+	for _sp_p in $_sp_ports; do
+		if printf '%s\n' "$_sp_have" | grep -q " tcp/$_sp_p "; then
+			minor "snitch:     any via ssh -> any host, tcp/$_sp_p, owner root: in place"
+		else
+			minor "snitch:     any via ssh -> any host, tcp/$_sp_p, owner root: missing"
+			SNITCH_MISSING="$SNITCH_MISSING $_sp_p"
+		fi
+	done
+	return 0
+}
+
+## Write the rules snitch_plan found missing.
+snitch_write() {
+	for _sw_p in $SNITCH_MISSING; do
+		if "$SNITCH_CMD" allow go any any --port "$_sw_p" --via ssh --owner root; then
+			msg "allowed in Little Snitch: any via ssh -> any host, tcp/$_sw_p, owner root"
+		else
+			warn "the Little Snitch rule any via ssh -> any host, tcp/$_sw_p was not written -- a job reaching an ssh location waits for an alert nobody answers"
+		fi
+	done
+	return 0
+}
+
 ## The LaunchDaemon plist for one job, on stdout. Both output streams are
 ## captured -- <label>.log for stdout, <label>.err for stderr: a job without
 ## StandardOutPath discards everything it prints, and --health reports on stdout.
@@ -7378,6 +7433,7 @@ cmd_install() {
 	minor "logs:       $LOG_DIR_ROOT"
 	minor "exclude:    $CACHE_DIR from Time Machine backups"
 	install_access_plan
+	snitch_plan
 
 	## a job must not run a binary anyone but root can rewrite
 	if path_is_user_writable "$MY_TM_BIN"; then
@@ -7437,6 +7493,8 @@ cmd_install() {
 			warn "the jobs run my-tm directly, without Full Disk Access"
 		fi
 	fi
+	## before the jobs are loaded: one that starts at once must find its rule
+	snitch_write
 
 	## 4. the /tm README + jobs
 	## The browse tree is NOT built here. Building it reads every store, and
@@ -7969,7 +8027,11 @@ INSTALL & SET UP
                                  JOBS_RUN_WITH_FULL_DISK_ACCESS=1 -- through a
                                  launcher --install builds, granted once in
                                  System Settings. A command says so where that
-                                 changed what it did
+                                 changed what it did. With LITTLE_SNITCH it
+                                 also allows, in Little Snitch, any program via
+                                 ssh to any host on each ssh location's port
+                                 (ssh -G), owner root -- nobody answers an
+                                 alert for a job
   --setup                        interactive setup of Time Machine itself --
                                  destinations, exclusions, quota.
                                  See \`--setup --help\` for the flags to do it
@@ -12822,6 +12884,68 @@ add $_fd_d/launcher"
 	FDA_CMD="$_fd_c"; rm -rf "$_fd_d"
 }
 
+## The jobs reach an ssh location as root with nobody at the screen, so a
+## Little Snitch alert holds them for ever. The rule that counts is ONE shape:
+## any program via ssh, any host, the port ssh itself resolves, owner root (or
+## anyone). Anything narrower covers some other caller, not the job.
+t_test_little_snitch() {
+	printf '\n--install writes the Little Snitch rules the jobs need\n'
+	_ls_c="$LITTLE_SNITCH"; _ls_d="$T_ROOT/lsn"; mkdir -p -- "$_ls_d"
+	_ls_stub="$(t_stub_dir)/ssh"; cp "$_ls_stub" "$T_ROOT/ssh.ls"
+	## host1's port is ssh's answer, and an unusual one: a guess of 22 fails
+	{
+		printf '#!/bin/sh\n'
+		# shellcheck disable=SC2016  # the stub's own $1 and $2, expanded when IT runs
+		printf '%s\n' '[ "$1" = -G ] && { [ "$2" = host1 ] && printf "user me\nhostname 10.0.0.1\nport 2222\n"; exit 0; }'
+		printf 'exec "%s" "$@"\n' "$T_ROOT/ssh.ls"
+	} >"$_ls_stub"
+	chmod 0755 "$_ls_stub"
+	cat >"$_ls_d/lsn" <<EOF
+#!/bin/sh
+[ "\$1" = list ] && { cat "$_ls_d/list"; exit 0; }
+printf '%s\n' "\$*" >>"$_ls_d/log"
+exit 0
+EOF
+	chmod 0755 "$_ls_d/lsn"
+	LITTLE_SNITCH="$_ls_d/lsn"
+
+	: >"$_ls_d/list"
+	t_eq "no rule: the one for host1's port, as ssh -G resolves it, is missing" \
+		"$(snitch_plan 2>&1; printf '[%s]' "$SNITCH_MISSING")" \
+		"$(minor "snitch:     any via ssh -> any host, tcp/2222, owner root: missing" 2>&1)
+[ 2222]"
+	printf 'f0f0f0\tscript /LINKS/bin/my-tm via com.apple.openssh  allow  any  tcp/2222  root
+a1a1a1\tany via com.apple.openssh  allow  10.0.0.1  tcp/2222  root
+b2b2b2\tany via com.apple.openssh  allow  any  tcp/22  root
+c3c3c3\tany via com.apple.openssh  allow  any  tcp/2222  me
+d4d4d4\tany via com.apple.curl  allow  any  tcp/2222  root
+' >"$_ls_d/list"
+	t_eq "...rules of another shape (one script, one address, another port, another owner, curl): still missing" \
+		"$(snitch_plan >/dev/null 2>&1; printf '[%s]' "$SNITCH_MISSING")" "[ 2222]"
+	printf 'e5e5e5\tany via com.apple.openssh  allow  any  tcp/2222  root\n' >"$_ls_d/list"
+	t_eq "...the rule there: in place, nothing missing" \
+		"$(snitch_plan 2>&1; printf '[%s]' "$SNITCH_MISSING")" \
+		"$(minor "snitch:     any via ssh -> any host, tcp/2222, owner root: in place" 2>&1)
+[]"
+	printf 'e5e5e5\tany via com.apple.openssh  allow  any  tcp/2222  anyone\n' >"$_ls_d/list"
+	t_eq "...owner anyone covers root too" \
+		"$(snitch_plan >/dev/null 2>&1; printf '[%s]' "$SNITCH_MISSING")" "[]"
+
+	: >"$_ls_d/list"; rm -f "$_ls_d/log"
+	snitch_plan >/dev/null 2>&1; snitch_write >/dev/null 2>&1
+	t_eq "go: writes exactly the missing rule" \
+		"$(cat "$_ls_d/log" 2>/dev/null)" "allow go any any --port 2222 --via ssh --owner root"
+	rm -f "$_ls_d/log"
+	LITTLE_SNITCH=""
+	t_eq "LITTLE_SNITCH empty: no line, no rule" \
+		"$(snitch_plan 2>&1; printf '[%s]' "$SNITCH_MISSING"; snitch_write 2>&1; cat "$_ls_d/log" 2>/dev/null)" "[]"
+	# shellcheck disable=SC2016  # the literal source text is matched, not a variable
+	t_eq "--install shows the rules in its plan and writes them on go" \
+		"$(sed -n '/^cmd_install() {$/,/^}$/p' "$T_MYTM" | count_match 'snitch_plan'):$(sed -n '/^cmd_install() {$/,/^}$/p' "$T_MYTM" | count_match 'snitch_write')" "1:1"
+
+	LITTLE_SNITCH="$_ls_c"; mv -f "$T_ROOT/ssh.ls" "$_ls_stub"; rm -rf "$_ls_d"
+}
+
 t_test_launcher() {
 	printf '\nThe Full Disk Access launcher\n'
 	_ln_c="$(dirname "$T_MYTM")/my-tm-launcher.c"
@@ -13701,6 +13825,7 @@ _rt_list() {
 	_rt launcher                             && t_test_launcher
 	_rt install_launcher                     && t_test_install_launcher
 	_rt fda_add                              && t_test_fda_add
+	_rt little_snitch                        && t_test_little_snitch
 	_rt job_guidance                         && t_test_job_guidance
 	_rt detection_dedup                      && t_test_detection_dedup
 	_rt ejected_destination                  && t_test_ejected_destination

@@ -997,6 +997,24 @@ that run, in one line naming the value to flip:
 
 Every other command runs with your own access, and says nothing about it.
 
+### Little Snitch for the jobs
+
+The jobs reach every ssh location with ssh (scp runs ssh too), as root, and
+nobody is at the screen to answer a Little Snitch alert -- the job just waits.
+So `--install` shows, beside the access, one rule per port and whether it is
+there, and with `go` writes the missing ones through `LITTLE_SNITCH` (default
+`my-little-snitch`, looked up in PATH; `""` or not found: none checked):
+
+    my-little-snitch allow go any any --port <PORT> --via ssh --owner root
+
+* **any program** via ssh: Little Snitch names the program at the top of the
+  tree, which is the launcher, or my-tm when it runs directly;
+* **any host**, on the port `ssh -G <host>` resolves: Little Snitch names one
+  address differently from one connection to the next, so a rule for one name
+  still holds the job;
+* a rule of a narrower shape -- one script, one address, another owner than
+  root or anyone -- is not counted: it covers another caller, not the job.
+
 ## 10. Managing the backups *(spec)*
 
 * **`--setup`** — one place for everything that *changes Time Machine's own*
