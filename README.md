@@ -548,7 +548,13 @@ $CACHE_DIR/index/<loc>.versions/ -> the version store: a baseline plus one
 * **Cost, honestly**: one snapshot walk is minutes, and there is no cheap delta
   — `tmutil compare` walks both trees too. So `--index --all` over 412 snapshots
   is an overnight job. It runs detached, prints progress, and is resumable;
-  `.covered` means a re-run only does what is missing.
+  `.covered` means a re-run only does what is missing. Resumable includes the
+  snapshot that was in flight: a walk that did not finish — the disk pulled
+  under it, or `find` failing on an entry — is reported with the reason and
+  the snapshot is left OUT of `.covered`, so the next run walks it again. The
+  pipeline ends in `sort`, which succeeds on a truncated read just as well, so
+  `find`'s own status is kept and checked; nothing is written from half a walk,
+  neither the name index nor the version store's delta.
 * **`--index --all` and the sweep.** It starts with a warning naming the
   snapshot count and the ETA, because while it runs Time Machine's thinning is
   blocked on whatever it currently holds. That is acceptable for a run you do

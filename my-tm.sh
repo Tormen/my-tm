@@ -34,8 +34,8 @@ US="${0##*/}"
 ## so the ROOT-OWNED COPY the daemons run -- which has no git beside it -- can
 ## still say which release it is and whether it is one.
 MY_TM_VERSION="0.9.1"
-SCRIPT_COMMIT="7117877"
-SCRIPT_RELEASE="v0.9.1-109-g7117877"
+SCRIPT_COMMIT="81a9b16"
+SCRIPT_RELEASE="v0.9.1-110-g81a9b16"
 
 ## The first 12 hex of this file's own SHA-256: the value that identifies the
 ## bytes. my-tm is COPIED to its installed path, so this is what tells the
@@ -10885,6 +10885,79 @@ t_test_index_increment_only_new() {
 	rm -f "$_tinc_ix"/store.*db "$(index_covered_file store)"; rm -rf "$(vs_dir store)" "$_tinc_fs"
 }
 
+## A walk cut short must leave its snapshot UNINDEXED. Adversarial: the walk
+## pipeline ends in sort, and sort succeeds just as well on the half a list a
+## disk pulled mid-walk leaves -- so the tempting shape, mark it covered and
+## move on, closes the snapshot for good and --find answers from half of it,
+## confidently, for ever. The two cases that matter both look like success
+## from inside the pipeline: find itself failing, and the location going away.
+## The third is what keeps the guard from being worse than the bug: a healthy
+## walk must still be covered, or nothing is ever indexed again.
+t_test_a_cut_short_walk_stays_unindexed() {
+	printf '\nA walk cut short leaves its snapshot to the next run\n'
+	_cw_ix=$(index_dir); rm -f "$_cw_ix"/store.*db "$(index_covered_file store)"
+	rm -rf "$(vs_dir store)"
+	_cw_fs="$T_ROOT/cutfs"
+	_cw_ts=2026-05-01-000000
+	mkdir -p -- "$_cw_fs/$_cw_ts/a"
+	: >"$_cw_fs/$_cw_ts/a/one.txt"; : >"$_cw_fs/$_cw_ts/a/two.txt"
+
+	## 1. find failed half-way, the disk is still there: a partial list
+	_cw_out=$( (
+		# shellcheck disable=SC2329  # called by index_one
+		snap_mount() { return 0; }
+		# shellcheck disable=SC2329
+		snap_umount() { return 0; }
+		# shellcheck disable=SC2329
+		mnt_volume_path() { printf '%s/%s\n' "$_cw_fs" "$2"; }
+		# shellcheck disable=SC2329
+		find() { command find "$@"; return 1; }
+		index_one store "$_cw_ts"; printf 'rc=%s\n' "$?"
+	) 2>&1 )
+	t_eq "a walk whose find failed is reported as unfinished" \
+		"$(printf '%s\n' "$_cw_out" | count_match 'the walk did not finish')" "1"
+	t_eq "...naming find's own status, which the pipeline threw away" \
+		"$(printf '%s\n' "$_cw_out" | count_match 'find exited 1')" "1"
+	t_eq "...and index_one fails instead of reporting success" \
+		"$(printf '%s\n' "$_cw_out" | count_match 'rc=1')" "1"
+	t_eq "...and the snapshot is NOT written off as covered" \
+		"$(index_covered_count store)" "0"
+
+	## 2. the location went away under the walk: say which, do not guess
+	_cw_gone=$( (
+		# shellcheck disable=SC2329
+		snap_mount() { return 0; }
+		# shellcheck disable=SC2329
+		snap_umount() { return 0; }
+		# shellcheck disable=SC2329
+		mnt_volume_path() { printf '%s/%s\n' "$_cw_fs" "$2"; }
+		# shellcheck disable=SC2329
+		loc_reachable() { return 1; }
+		index_one store "$_cw_ts"
+	) 2>&1 )
+	t_eq "a location that went away is named as the reason" \
+		"$(printf '%s\n' "$_cw_gone" | count_match 'is no longer reachable')" "1"
+	t_eq "...and that snapshot stays uncovered too" "$(index_covered_count store)" "0"
+
+	## 3. the same snapshot walked cleanly -- this is what resuming IS
+	_cw_ok=$( (
+		# shellcheck disable=SC2329
+		snap_mount() { return 0; }
+		# shellcheck disable=SC2329
+		snap_umount() { return 0; }
+		# shellcheck disable=SC2329
+		mnt_volume_path() { printf '%s/%s\n' "$_cw_fs" "$2"; }
+		index_one store "$_cw_ts"; printf 'rc=%s\n' "$?"
+	) 2>&1 )
+	t_eq "the next run walks it, with nothing to say about an unfinished walk" \
+		"$(printf '%s\n' "$_cw_ok" | count_match 'the walk did not finish')" "0"
+	t_eq "...and succeeds" "$(printf '%s\n' "$_cw_ok" | count_match 'rc=0')" "1"
+	t_eq "...and ONLY THEN is it covered" "$(index_covered_count store)" "1"
+
+	rm -f "$_cw_ix"/store.*db "$(index_covered_file store)"
+	rm -rf "$(vs_dir store)" "$_cw_fs"
+}
+
 ## A row with nothing in it used to be a wall of "-": no snapshots, no span, no
 ## last backup, and no way to tell whether the store was empty, unreadable, or
 ## simply never opened -- which is exactly what was asked about a registered
@@ -13978,6 +14051,7 @@ _rt_list() {
 	_rt snapshot_set_is_validated            && t_test_snapshot_set_is_validated
 	_rt no_exclusive_size_claims             && t_test_no_exclusive_size_claims
 	_rt index_increment_only_new             && t_test_index_increment_only_new
+	_rt a_cut_short_walk_stays_unindexed     && t_test_a_cut_short_walk_stays_unindexed
 	_rt site_conf_dir_from_env               && t_test_site_conf_dir_from_env
 	_rt detached_store_still_answers         && t_test_detached_store_still_answers
 	_rt rm_needs_the_store                   && t_test_rm_needs_the_store
