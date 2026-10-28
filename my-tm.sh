@@ -8028,10 +8028,10 @@ INSTALL & SET UP
                                  launcher --install builds, granted once in
                                  System Settings. A command says so where that
                                  changed what it did. With LITTLE_SNITCH it
-                                 also allows, in Little Snitch, any program via
-                                 ssh to any host on each ssh location's port
-                                 (ssh -G), owner root -- nobody answers an
-                                 alert for a job
+                                 also allows, in Little Snitch, any program
+                                 via ssh to any host on each ssh location's
+                                 port (from ssh -G), owner root -- nobody
+                                 answers an alert for a job
   --setup                        interactive setup of Time Machine itself --
                                  destinations, exclusions, quota.
                                  See \`--setup --help\` for the flags to do it
@@ -11081,6 +11081,7 @@ t_test_ssh_never_becomes_a_master() {
 	_sm_bad=$(awk -v t="$_sm_t" '
 		NR >= t { exit }
 		/^[[:space:]]*#/ { next }
+		/(^|[{;&|(]|if |run |! )[[:space:]]*ssh -G[[:space:]]/ { next }   # prints the config, connects nowhere
 		/(^|[{;&|(]|if |run |! )[[:space:]]*(ssh|scp)[[:space:]]/ {
 			line = $0; n = NR
 			while (line ~ /\\$/ && (getline nx) > 0) line = line nx
