@@ -2939,7 +2939,9 @@ snap_mount() {
 	## echo the command, then silence only ITS output: "run cmd >/dev/null 2>&1"
 	## swallows the echo too, which made -V hide the very calls it exists to show
 	run_echo mount_apfs -s "$_apfs" "$_vol_src" "$_mp"
-	if mount_apfs -s "$_apfs" "$_vol_src" "$_mp" >/dev/null 2>&1; then
+	## its error is KEPT for the warning below: without it a failure cannot
+	## say whether the disk went away, was busy, or refused the snapshot
+	if _sm_err=$(mount_apfs -s "$_apfs" "$_vol_src" "$_mp" 2>&1 >/dev/null); then
 		why "read-only snapshot mount; no root needed, and it pins the snapshot until released"
 		mount_record_add "$_id" "$_loc" "$_mp" "$_ttl" "$_flags"
 		printf '%s\n' "$_mp"
@@ -2950,7 +2952,7 @@ snap_mount() {
 		## purgeable at any age: a list read a minute ago can already be wrong
 		warn "$(ts_display "$_ts"): gone from '$_loc' since the list was read ($US --refresh $_loc)"
 	else
-		warn "mount failed: $_apfs on $_vol_src"
+		warn "mount failed: $_apfs on $_vol_src${_sm_err:+: $(printf '%s' "$_sm_err" | tr '\n' ' ')}"
 	fi
 	rmdir "$_mp" 2>/dev/null
 	return 1
@@ -13038,6 +13040,21 @@ d4d4d4\tany via com.apple.curl  allow  any  tcp/2222  root
 	LITTLE_SNITCH="$_ls_c"; mv -f "$T_ROOT/ssh.ls" "$_ls_stub"; rm -rf "$_ls_d"
 }
 
+## A walk on horse ended with 47 lines of "mount failed" and not one word of
+## WHY: mount_apfs's own message was thrown away, so the run that failed could
+## not say whether the disk had gone, was busy, or the snapshot was refused.
+t_test_mount_failure_says_why() {
+	printf '\nA failed snapshot mount says what mount_apfs said\n'
+	_mw_stub="$(t_stub_dir)/mount_apfs"; cp "$_mw_stub" "$T_ROOT/mount_apfs.mw"
+	printf '#!/bin/sh\necho "mount_apfs: volume could not be mounted: Resource busy" >&2\nexit 75\n' >"$_mw_stub"
+	chmod 0755 "$_mw_stub"
+	_mw_out=$(snap_mount store 2026-08-20-155805 60 "" "$T_ROOT/mw.mp" 2>&1 >/dev/null; echo "rc $?")
+	t_match "the snapshot is still listed: the warning carries mount_apfs's reason" \
+		"$_mw_out" "mount failed: com[.]apple[.]TimeMachine[.]2026-08-20-155805[.]backup on .*: mount_apfs: volume could not be mounted: Resource busy"
+	t_match "...and the run goes on: snap_mount answers 1" "$_mw_out" "rc 1\$"
+	mv -f "$T_ROOT/mount_apfs.mw" "$_mw_stub"
+}
+
 t_test_launcher() {
 	printf '\nThe Full Disk Access launcher\n'
 	_ln_c="$(dirname "$T_MYTM")/my-tm-launcher.c"
@@ -13919,6 +13936,7 @@ _rt_list() {
 	_rt install_launcher                     && t_test_install_launcher
 	_rt fda_add                              && t_test_fda_add
 	_rt little_snitch                        && t_test_little_snitch
+	_rt mount_failure_says_why               && t_test_mount_failure_says_why
 	_rt job_guidance                         && t_test_job_guidance
 	_rt detection_dedup                      && t_test_detection_dedup
 	_rt ejected_destination                  && t_test_ejected_destination
