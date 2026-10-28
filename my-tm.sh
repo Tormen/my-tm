@@ -34,8 +34,8 @@ US="${0##*/}"
 ## so the ROOT-OWNED COPY the daemons run -- which has no git beside it -- can
 ## still say which release it is and whether it is one.
 MY_TM_VERSION="0.9.1"
-SCRIPT_COMMIT="b9f62d2"
-SCRIPT_RELEASE="v0.9.1-107-gb9f62d2"
+SCRIPT_COMMIT="7117877"
+SCRIPT_RELEASE="v0.9.1-109-g7117877"
 
 ## The first 12 hex of this file's own SHA-256: the value that identifies the
 ## bytes. my-tm is COPIED to its installed path, so this is what tells the
@@ -577,7 +577,7 @@ LITTLE_SNITCH="my-little-snitch" # writes the Little Snitch rules the jobs need
                                 # with nobody at the screen to answer an alert.
                                 # --install shows them, writes the missing ones
                                 # on go: any program via ssh, any host, each port
-                                # `ssh -G <host>` gives, owner root. "" or not
+                                # `ssh -G <host>` gives, owner system. "" or not
                                 # found = none checked or written
 # --- backup control ---
 BACKUP_VOLUME=""                # "" = ask tmutil which destination this is.
@@ -5586,13 +5586,31 @@ index_one() {
 	## later without mounting anything.
 	run_echo find "$_base" -print0 \| xargs -0 stat -f '%N%t%z%t%m'
 	_stats=$(tmp_file stat) || { snap_umount "$_mp"; return 1; }
-	## the same locale discipline for the walk itself
-	find "$_base" -print0 2>/dev/null |
+	_walkrc=$(tmp_file walkrc) || { snap_umount "$_mp"; return 1; }
+	## the same locale discipline for the walk itself. find's OWN status is
+	## kept (dash has no pipefail): the pipeline's status is sort's, and sort
+	## succeeds just as well on the half a list a disk pulled mid-walk leaves.
+	{ find "$_base" -print0 2>/dev/null; echo $? >"$_walkrc"; } |
 		xargs -0 stat -f '%N%t%z%t%m' 2>/dev/null |
 		LC_ALL=C sed "s|^$_base||" |
 		LC_ALL=C awk -F'\t' 'length($1) > 0' |
 		LC_ALL=C sort >"$_stats"
 	_count=$(count_lines < "$_stats")
+
+	## NOTHING below may run on a partial walk: the version store would record
+	## a delta that is missing paths, and index_mark_covered would close this
+	## snapshot for good -- --find would answer from half of it, for ever.
+	## Leaving it unindexed costs one more walk; the next run resumes here.
+	_wrc=$(cat "$_walkrc" 2>/dev/null); rm -f "$_walkrc"
+	_why=""
+	loc_reachable "$_h" || _why="'$_h' is no longer reachable"
+	[ -z "$_why" ] && [ "${_wrc:-1}" != "0" ] && _why="find exited ${_wrc:-?}"
+	if [ -n "$_why" ]; then
+		warn "$_ts: the walk did not finish ($_why) -- the snapshot stays unindexed, so the next --index walks it again"
+		rm -f "$_stats" "$_paths"
+		snap_umount "$_mp" >/dev/null 2>&1
+		return 1
+	fi
 
 	## No exclusive size here: macOS does not expose one for an APFS Time
 	## Machine snapshot (tmutil uniquesize refuses with pathInAPFSBackup, and
@@ -7249,7 +7267,7 @@ install_access_plan() {
 ## missing (SNITCH_MISSING: their ports). The jobs reach every ssh location
 ## with ssh -- scp runs ssh too -- as root, and nobody is at the screen to
 ## answer an alert, so the rule must be there first: any program via ssh (the
-## launcher or my-tm in front of it), owner root, on the port ssh itself
+## launcher or my-tm in front of it), owner system (root, in Little Snitch), on the port ssh itself
 ## resolves for the host. ANY host, not the location's: Little Snitch names one
 ## address differently from one connection to the next, and a rule for the
 ## other name still holds the job. Nothing when LITTLE_SNITCH is "" or absent.
@@ -7268,12 +7286,12 @@ snitch_plan() {
 	## only this shape counts: a rule for one script misses the launcher, one
 	## for an address misses the next name the same host is given
 	_sp_have=$("$SNITCH_CMD" list 2>/dev/null | grep '	any via [^ ]*ssh ' | grep ' any ' |
-		grep -E ' (root|anyone)( |$)')
+		grep -E ' (system|anyone)( |$)')
 	for _sp_p in $_sp_ports; do
 		if printf '%s\n' "$_sp_have" | grep -q " tcp/$_sp_p "; then
-			minor "snitch:     any via ssh -> any host, tcp/$_sp_p, owner root: in place"
+			minor "snitch:     any via ssh -> any host, tcp/$_sp_p, owner system: in place"
 		else
-			minor "snitch:     any via ssh -> any host, tcp/$_sp_p, owner root: missing"
+			minor "snitch:     any via ssh -> any host, tcp/$_sp_p, owner system: missing"
 			SNITCH_MISSING="$SNITCH_MISSING $_sp_p"
 		fi
 	done
@@ -7283,8 +7301,8 @@ snitch_plan() {
 ## Write the rules snitch_plan found missing.
 snitch_write() {
 	for _sw_p in $SNITCH_MISSING; do
-		if "$SNITCH_CMD" allow go any any --port "$_sw_p" --via ssh --owner root; then
-			msg "allowed in Little Snitch: any via ssh -> any host, tcp/$_sw_p, owner root"
+		if "$SNITCH_CMD" allow go any any --port "$_sw_p" --via ssh --owner system; then
+			msg "allowed in Little Snitch: any via ssh -> any host, tcp/$_sw_p, owner system"
 		else
 			warn "the Little Snitch rule any via ssh -> any host, tcp/$_sw_p was not written -- a job reaching an ssh location waits for an alert nobody answers"
 		fi
@@ -8071,7 +8089,7 @@ INSTALL & SET UP
                                  changed what it did. With LITTLE_SNITCH it
                                  also allows, in Little Snitch, any program
                                  via ssh to any host on each ssh location's
-                                 port (from ssh -G), owner root -- nobody
+                                 port (from ssh -G), owner system -- nobody
                                  answers an alert for a job
   --setup                        interactive setup of Time Machine itself --
                                  destinations, exclusions, quota.
@@ -12980,7 +12998,7 @@ add $_fd_d/launcher"
 
 ## The jobs reach an ssh location as root with nobody at the screen, so a
 ## Little Snitch alert holds them for ever. The rule that counts is ONE shape:
-## any program via ssh, any host, the port ssh itself resolves, owner root (or
+## any program via ssh, any host, the port ssh itself resolves, owner system (or
 ## anyone). Anything narrower covers some other caller, not the job.
 t_test_little_snitch() {
 	printf '\n--install writes the Little Snitch rules the jobs need\n'
@@ -13006,29 +13024,29 @@ EOF
 	: >"$_ls_d/list"
 	t_eq "no rule: the one for host1's port, as ssh -G resolves it, is missing" \
 		"$(snitch_plan 2>&1; printf '[%s]' "$SNITCH_MISSING")" \
-		"$(minor "snitch:     any via ssh -> any host, tcp/2222, owner root: missing" 2>&1)
+		"$(minor "snitch:     any via ssh -> any host, tcp/2222, owner system: missing" 2>&1)
 [ 2222]"
-	printf 'f0f0f0\tscript /LINKS/bin/my-tm via com.apple.openssh  allow  any  tcp/2222  root
-a1a1a1\tany via com.apple.openssh  allow  10.0.0.1  tcp/2222  root
-b2b2b2\tany via com.apple.openssh  allow  any  tcp/22  root
+	printf 'f0f0f0\tscript /LINKS/bin/my-tm via com.apple.openssh  allow  any  tcp/2222  system
+a1a1a1\tany via com.apple.openssh  allow  10.0.0.1  tcp/2222  system
+b2b2b2\tany via com.apple.openssh  allow  any  tcp/22  system
 c3c3c3\tany via com.apple.openssh  allow  any  tcp/2222  me
-d4d4d4\tany via com.apple.curl  allow  any  tcp/2222  root
+d4d4d4\tany via com.apple.curl  allow  any  tcp/2222  system
 ' >"$_ls_d/list"
 	t_eq "...rules of another shape (one script, one address, another port, another owner, curl): still missing" \
 		"$(snitch_plan >/dev/null 2>&1; printf '[%s]' "$SNITCH_MISSING")" "[ 2222]"
-	printf 'e5e5e5\tany via com.apple.openssh  allow  any  tcp/2222  root\n' >"$_ls_d/list"
+	printf 'e5e5e5\tany via com.apple.openssh  allow  any  tcp/2222  system\n' >"$_ls_d/list"
 	t_eq "...the rule there: in place, nothing missing" \
 		"$(snitch_plan 2>&1; printf '[%s]' "$SNITCH_MISSING")" \
-		"$(minor "snitch:     any via ssh -> any host, tcp/2222, owner root: in place" 2>&1)
+		"$(minor "snitch:     any via ssh -> any host, tcp/2222, owner system: in place" 2>&1)
 []"
 	printf 'e5e5e5\tany via com.apple.openssh  allow  any  tcp/2222  anyone\n' >"$_ls_d/list"
-	t_eq "...owner anyone covers root too" \
+	t_eq "...owner anyone covers system too" \
 		"$(snitch_plan >/dev/null 2>&1; printf '[%s]' "$SNITCH_MISSING")" "[]"
 
 	: >"$_ls_d/list"; rm -f "$_ls_d/log"
 	snitch_plan >/dev/null 2>&1; snitch_write >/dev/null 2>&1
 	t_eq "go: writes exactly the missing rule" \
-		"$(cat "$_ls_d/log" 2>/dev/null)" "allow go any any --port 2222 --via ssh --owner root"
+		"$(cat "$_ls_d/log" 2>/dev/null)" "allow go any any --port 2222 --via ssh --owner system"
 	rm -f "$_ls_d/log"
 	LITTLE_SNITCH=""
 	t_eq "LITTLE_SNITCH empty: no line, no rule" \

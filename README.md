@@ -1009,7 +1009,7 @@ So `--install` shows, beside the access, one rule per port and whether it is
 there, and with `go` writes the missing ones through `LITTLE_SNITCH` (default
 `my-little-snitch`, looked up in PATH; `""` or not found: none checked):
 
-    my-little-snitch allow go any any --port <PORT> --via ssh --owner root
+    my-little-snitch allow go any any --port <PORT> --via ssh --owner system
 
 * **any program** via ssh: Little Snitch names the program at the top of the
   tree, which is the launcher, or my-tm when it runs directly;
