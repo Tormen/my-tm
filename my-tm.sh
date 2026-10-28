@@ -34,8 +34,8 @@ US="${0##*/}"
 ## so the ROOT-OWNED COPY the daemons run -- which has no git beside it -- can
 ## still say which release it is and whether it is one.
 MY_TM_VERSION="0.9.1"
-SCRIPT_COMMIT="aa63f62"
-SCRIPT_RELEASE="v0.9.1-102-gaa63f62"
+SCRIPT_COMMIT="bcac231"
+SCRIPT_RELEASE="v0.9.1-103-gbcac231"
 
 ## The first 12 hex of this file's own SHA-256: the value that identifies the
 ## bytes. my-tm is COPIED to its installed path, so this is what tells the
@@ -314,6 +314,16 @@ ATTACH_LOCKFILE="$RUN_DIR/attach.lock"
 ## for an application to open after my-tm has exited.
 tmp_file() { mktemp "$RUN_DIR/$1.XXXXXX"; }     # <tag>
 tmp_dir()  { mktemp -d "$RUN_DIR/$1.XXXXXX"; }  # <tag>
+
+## ...and the one exception, for a file the run HANDS ON: --open fetches a
+## remote file for an application to open after my-tm has exited, so RUN_DIR
+## would take it away at exactly the wrong moment. NOTHING removes this one --
+## that is the point -- so it is said out loud when it is made.
+## A directory from mktemp, not a name built from the file's own: it used to
+## write "$TMPDIR/<the file's name>", which anyone can predict, and with TMPDIR
+## unset -- a root cron job, a LaunchDaemon -- that is /tmp/<name>, where a
+## planted symlink has a root run write wherever it points.
+tmp_kept_dir() { mktemp -d "$RUN_TMPDIR/my-tm.$1.XXXXXX"; }   # <tag>
 
 #############################################################################
 ## OUTPUT
@@ -5290,9 +5300,12 @@ cmd_open() {
 	_rel=$(printf '%s' "$_i" | awk -F'\t' '{print $5}')
 	_loc=$(printf '%s' "$_i" | awk -F'\t' '{print $1}')
 	if loc_is_remote "$_loc"; then
-		_tmpf="${TMPDIR:-/tmp}/$(basename "$_rel")"
+		## The file keeps its OWN name inside that directory, so the
+		## application still recognises it by extension.
+		_od=$(tmp_kept_dir open) || err "cannot make a directory for the fetched file"
+		_tmpf="$_od/$(basename "$_rel")"
 		cmd_cat "$1" "$2" >"$_tmpf" || err "could not fetch the remote file"
-		msg "fetched to $_tmpf"
+		msg "fetched to $_tmpf -- it stays there, nothing cleans it up"
 		run open "$_tmpf"
 		return 0
 	fi
@@ -7854,7 +7867,9 @@ USE
                                  release it early (they expire on their own).
                                  If something still has files open, prints what
                                  is holding it and refuses; -f unmounts anyway
-  --open    <ID> <PATH>          open that version (prints the command first)
+  --open    <ID> <PATH>          open that version (prints the command first).
+                                 From an ssh location it is fetched to a temp
+                                 directory of its own and KEPT -- path printed
   --cat     <ID> <PATH>          write that version to stdout
   --cp [-f] <ID> <PATH> [<DEST>] copy it out; <DEST> defaults to \$PWD under the
                                  original name. Refuses to overwrite without -f
@@ -10392,14 +10407,14 @@ t_test_run_cache() {
 	## stopped naming /tmp itself. The word is built in two pieces so this
 	## check cannot match itself; a failure names the lines.
 	_rc_mk='mk''temp'
-	t_eq "every temp of a run is made inside the run directory" \
+	t_eq "every temp is made by the tmp_* family" \
 		"$(awk -v k="$_rc_mk" '
-			$0 !~ (k " (-d )?[\"/]") { next }
-			/^[[:space:]]*#/ { next }
-			index($0, "\"$RUN_DIR/") { next }
-			index($0, "\"$T_ROOT/") { next }
-			index($0, "my-tm.run.XXXXXX") { next }
-			index($0, ".my-tm.XXXXXX") { next }
+			$0 !~ (k " (-d )?[\"/]") { next }    # prose about it, not a call
+			/^[[:space:]]*#/           { next }    # a comment about one
+			/^tmp_[a-z_]+\(\)/         { next }    # the family itself
+			/^RUN_DIR=/                { next }    # the run directory, made once
+			index($0, ".my-tm.XXXXXX") { next }    # atomic_write: beside its target
+			index($0, "\"$T_ROOT/")    { next }    # the suite own fixtures
 			{ printf "line %d: %s\n", NR, $0 }
 		' "$T_MYTM")" ""
 	_rc_t=$(tmp_file rctest)
@@ -10432,6 +10447,50 @@ t_test_run_cache() {
 	t_match "each host is asked once, whatever the answer" "$_rc_out" "ssh_up=1 ssh_down=1"
 	t_match "and the remembered answers are the real ones" "$_rc_out" "up=yes down=no"
 	printf '%s\n' "$_rc_save" | cache_write_locations
+}
+
+## REGRESSION: --open wrote the file it fetches to "$TMPDIR/<the file's name>",
+## a name anyone can predict -- and with TMPDIR unset (a root cron job, a
+## LaunchDaemon) that is /tmp/<name>, where any local user can plant a symlink
+## and have the root run write through it, wherever it points.
+## Adversarial: that predictable name IS planted here, as a symlink to a file
+## that must still be empty afterwards. This is also the one temp that may NOT
+## live in RUN_DIR -- an application opens it after my-tm has exited -- so the
+## test holds both halves: unpredictable, and kept.
+t_test_open_keeps_what_it_hands_over() {
+	printf '\n--open keeps the file it hands to an application\n'
+	_op_k=$(tmp_kept_dir opencheck)
+	t_eq "a kept directory sits BESIDE the run's own, never inside it" \
+		"$(dirname "$_op_k")" "$RUN_TMPDIR"
+	rmdir "$_op_k"
+	_op_t="$T_ROOT/op"; mkdir "$_op_t"
+	_op_bait="$T_ROOT/op.bait"; : >"$_op_bait"
+	ln -s "$_op_bait" "$_op_t/report.pdf"
+	_op_calls="$T_ROOT/op.calls"; : >"$_op_calls"
+	## the seam: no ssh, no application, just the branch under test
+	# shellcheck disable=SC2329  # deliberate overrides, inside a subshell
+	_op_out=$( (
+		RUN_TMPDIR="$_op_t"; TMPDIR="$_op_t"
+		snapshot_file() {
+			printf 'remote\t2026-08-23-005931\tABC123\t/mnt/x/report.pdf\treport.pdf\n'
+		}
+		cmd_cat() { printf 'the fetched bytes\n'; }
+		open() { printf '%s\n' "$1" >>"$_op_calls"; }
+		cmd_open ABC123 report.pdf
+	) 2>&1 )
+	_op_path=$(cat "$_op_calls")
+	t_eq "the planted name is not written through" \
+		"$(wc -c <"$_op_bait" | tr -d ' ')" "0"
+	t_eq "the file goes in a directory of its own, named by mktemp" \
+		"$(printf '%s\n' "$_op_path" | grep -cE "^$_op_t/my-tm\.open\.[A-Za-z0-9]{6}/report\.pdf\$")" "1"
+	t_eq "...which only its owner can read" \
+		"$(stat -f '%Lp' "$(dirname "$_op_path")" 2>/dev/null)" "700"
+	t_eq "the file keeps its own name, so the application knows it" \
+		"$(basename "$_op_path")" "report.pdf"
+	t_eq "and holds what was fetched" "$(cat "$_op_path")" "the fetched bytes"
+F2
+	t_match "and the run says it stays" "$_op_out" "stays there"
+	rm -rf "$_op_t" "$_op_bait" "$_op_calls"
 }
 
 ## REGRESSION: a run made its temps in /tmp, so a run that did NOT reach its
@@ -13541,6 +13600,7 @@ _rt_list() {
 	_rt status_index_size                    && t_test_status_index_size
 	_rt run_cache                            && t_test_run_cache
 	_rt interrupted_run_leaves_nothing       && t_test_interrupted_run_leaves_nothing
+	_rt open_keeps_what_it_hands_over        && t_test_open_keeps_what_it_hands_over
 	_rt loc_resolve                          && t_test_loc_resolve
 	_rt vol_device                           && t_test_vol_device
 	_rt launcher                             && t_test_launcher

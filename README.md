@@ -874,12 +874,14 @@ They exist because they resolve `<ID>` for you and mount the snapshot
 transiently on the way in; each prints the command it is about to run before
 running it. On an `ssh` location they run remotely: `--cat` streams the file
 back over `ssh`, `--cp` lands it at the local `<DEST>`, and `--open` fetches it
-to a local temp file first and opens that, printing the path. `--cp` **refuses
-to overwrite an existing destination** and needs `-f` to do it — deliberately
-stricter than `/bin/cp`, since the whole point of pulling a file out of a backup
-is that the live copy is the one you are worried about. There is
-deliberately **no `--restore`** — `tmutil restore` strips Time Machine metadata
-in ways plain `cp` does not, and that surprise is not worth wrapping.
+into a temp directory of its own first and opens it there, printing the path
+— that file is kept, since the application reads it after my-tm has gone.
+`--cp` **refuses to overwrite an existing destination** and needs `-f` to do
+it — deliberately stricter than `/bin/cp`, since the whole point of pulling a
+file out of a backup is that the live copy is the one you are worried about.
+There is deliberately **no `--restore`** — `tmutil restore` strips Time
+Machine metadata in ways plain `cp` does not, and that surprise is not worth
+wrapping.
 
 ## 9. `--install` / `--uninstall` *(spec, root-only)*
 
@@ -1319,7 +1321,11 @@ my-tm --add /Volumes/<disk>/<host>.sparsebundle usbtm
   no trap can catch that; its name says which run, and each file inside says
   which step. The exception is deliberate: `--open` fetches a remote file for
   an application to open **after** my-tm has exited, so that one outlives the
-  run, and its path is printed.
+  run — it goes in a `mktemp -d` of its own, beside the run's directory rather
+  than inside it, and its path is printed. Not under its own name in `TMPDIR`,
+  as it used to be: that is a name anyone can predict, and with `TMPDIR` unset
+  (a root cron job, a LaunchDaemon) it is `/tmp/<name>`, where a planted
+  symlink would have a root run write wherever it points.
 * **A lock with no owner yet is WAITED for, not broken.** Between making the
   lock and writing its pid into it, a holder looks owner-less — and a run that
   broke it there would be racing that holder. Two runs did exactly that to each
