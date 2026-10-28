@@ -34,8 +34,8 @@ US="${0##*/}"
 ## so the ROOT-OWNED COPY the daemons run -- which has no git beside it -- can
 ## still say which release it is and whether it is one.
 MY_TM_VERSION="0.9.1"
-SCRIPT_COMMIT="6125a7a"
-SCRIPT_RELEASE="v0.9.1-104-g6125a7a"
+SCRIPT_COMMIT="b9f62d2"
+SCRIPT_RELEASE="v0.9.1-107-gb9f62d2"
 
 ## The first 12 hex of this file's own SHA-256: the value that identifies the
 ## bytes. my-tm is COPIED to its installed path, so this is what tells the
@@ -181,6 +181,8 @@ ATTACH_LOCK_MAX_WAIT="30m"
 IMAGE_SCAN_TTL=300
 INDEX_BASELINES="newest oldest"
 INDEX_INC_MAX=16
+INDEX_BACKUP_POLL="5m"
+INDEX_BACKUP_MAX_WAIT="4h"
 SHADOW_SSH_INDEX_FILES=1
 SSH_CONNECT_TIMEOUT=3
 SSH_RUN_TIMEOUT="10m"
@@ -452,6 +454,11 @@ IMAGE_SCAN_TTL=300              # s to cache the scan for this Mac's own
 INDEX_BASELINES="newest oldest" # snapshots --index walks when none are named
 INDEX_INC_MAX=16                # consolidate the increments once there are
                                 # this many
+INDEX_BACKUP_POLL="5m"          # how often --index --all looks at a running
+                                # Time Machine backup it is waiting for, and
+                                # the cadence of the lines saying it still is
+INDEX_BACKUP_MAX_WAIT="4h"      # waiting longer than this for a backup to
+                                # finish is an error, not patience
 SHADOW_SSH_INDEX_FILES=1        # keep a shadow copy of an ssh location's index
                                 # here as well, so --find answers while that
                                 # host is offline. The index itself lives on the
@@ -3992,6 +3999,31 @@ index_is_due() {
 	[ "$(index_age "$1")" -ge "$_iu_iv" ]
 }
 
+## --all walks every snapshot, mounting one at a time for minutes, and Time
+## Machine cannot thin the one that is mounted. Writing to the same disk at the
+## same time makes both slow, so a walk does not START a snapshot while a
+## backup runs: it says so and waits for it. Ctrl-C is the way out -- an
+## interrupted walk loses nothing, and the next one takes up where it stopped.
+## The DAEMON's guard is index_is_due, which SKIPS rather than waits: it has a
+## next time, a walk asked for by hand does not.
+index_wait_for_backup() {
+	tm_backup_running || return 0
+	_iwb_w0=$(now_epoch)
+	_iwb_max=$(parse_interval "${INDEX_BACKUP_MAX_WAIT:-4h}") || _iwb_max=14400
+	_iwb_poll=$(parse_interval "${INDEX_BACKUP_POLL:-5m}") || _iwb_poll=300
+	[ "$_iwb_poll" -ge 1 ] || _iwb_poll=1
+	warn "$1: a Time Machine backup is running -- waiting for it to finish before the next snapshot, so the walk does not block its thinning. Ctrl-C is safe."
+	while tm_backup_running; do
+		_iwb_waited=$(( $(now_epoch) - _iwb_w0 ))
+		[ "$_iwb_waited" -ge "$_iwb_max" ] &&
+			err "waited $(human_secs "$_iwb_waited") for the Time Machine backup to finish and it is still running (INDEX_BACKUP_MAX_WAIT) -- index once it has, or raise that key"
+		[ "$_iwb_waited" -gt 0 ] &&
+			minor "the backup is still running, $(human_secs "$_iwb_waited") so far -- waiting"
+		sleep "$_iwb_poll"
+	done
+	minor "the backup finished after $(human_secs "$(( $(now_epoch) - _iwb_w0 ))") -- walking on"
+}
+
 ## Everything indexed FOR one location: the consolidated db, the increments not
 ## folded in yet, the record of which snapshots are covered, and the version
 ## store built on the same walk. Only this location's -- never the directory.
@@ -5465,6 +5497,10 @@ $(printf '%s\n' "$_rows" | head -n 1 | awk -F'\t' '{print $2}')" ;;
 		fi
 		while IFS= read -r _ts; do
 			[ -n "$_ts" ] || continue
+			## the baseline walk is two snapshots and the post-backup one
+			## runs while the disk is deliberately still spinning: only the
+			## hours-long --all walk steps aside for a running backup
+			[ "$OPT_ALL" = "1" ] && index_wait_for_backup "$_h"
 			index_one "$_h" "$_ts"
 		done <<_EOF
 $_list
@@ -7987,7 +8023,10 @@ MAINTAIN
                                  already opted in. AUTO_INDEX_TM_BACKUP_DISKS=1
                                  opts in this Mac's backup disks instead.
                                  With --all: every snapshot -- an overnight
-                                 job, warns first. The index is expensive, so
+                                 job, warns first, and waits while a Time
+                                 Machine backup runs rather than blocking its
+                                 thinning (Ctrl-C is safe). The index is
+                                 expensive, so
                                  it exists once, shared: only root builds it
                                  (anyone else is told the command). Caches
                                  are cheap: each user keeps their own
@@ -9875,6 +9914,58 @@ t_test_index_timing() {
 	rm -f "$(index_covered_file store)"
 	printf '%s\n' "$_it_save" | cache_write_locations
 	AUTO_INDEX_TM_BACKUP_DISKS="$_it_a"
+}
+
+## A walk asked for by hand WAITS for a running backup instead of skipping it.
+## Adversarial: a wait that never ends is worse than no wait at all, so the
+## cases that matter are the ones where the backup does not stop -- it must
+## give up naming the key that governs it -- and where it stops while nobody
+## is looking, which must resume the walk rather than sit there. And a wait
+## nobody was told about is the bug the feature exists to fix: the line has to
+## say a backup is running AND that Ctrl-C is safe.
+t_test_index_waits_out_a_backup() {
+	printf '\nA hand-run --all walk waits for a Time Machine backup\n'
+	_iw_d=$(mktemp -d "$T_ROOT/iwb.XXXXXX")
+
+	## no backup: not a word, and no waiting
+	t_eq "with no backup running it says nothing and walks straight on" \
+		"$( ( tm_backup_running() { return 1; }
+		      index_wait_for_backup horse ) 2>&1 | count_lines)" "0"
+
+	## a backup that ends after two looks
+	printf '2\n' >"$_iw_d/left"
+	_iw_out=$( ( INDEX_BACKUP_POLL="1s"; INDEX_BACKUP_MAX_WAIT="60s"
+		tm_backup_running() {
+			_n=$(cat "$_iw_d/left")
+			[ "$_n" -le 0 ] && return 1
+			printf '%s\n' "$(( _n - 1 ))" >"$_iw_d/left"
+			return 0
+		}
+		index_wait_for_backup horse ) 2>&1 )
+	t_eq "it says a Time Machine backup is running" \
+		"$(printf '%s\n' "$_iw_out" | count_match 'a Time Machine backup is running')" "1"
+	t_eq "...and that Ctrl-C is safe" \
+		"$(printf '%s\n' "$_iw_out" | count_match 'Ctrl-C is safe')" "1"
+	t_eq "...and it walks on by itself once the backup has finished" \
+		"$(printf '%s\n' "$_iw_out" | count_match 'walking on')" "1"
+
+	## a backup that never ends: patience has a bound, and it names the key
+	_iw_slow=$( ( INDEX_BACKUP_POLL="1s"; INDEX_BACKUP_MAX_WAIT="1s"
+		tm_backup_running() { return 0; }
+		index_wait_for_backup horse ) 2>&1 )
+	t_eq "a backup that never finishes ends the run, naming the key to raise" \
+		"$(printf '%s\n' "$_iw_slow" | count_match 'INDEX_BACKUP_MAX_WAIT')" "1"
+
+	## the waiter is wired into the --all walk, and ONLY there: the baseline
+	## walk is two snapshots, and the post-backup one runs on purpose while
+	## the disk is still spinning
+	_iw_body=$(sed -n '/^cmd_index() {$/,/^}$/p' "$T_MYTM")
+	# shellcheck disable=SC2016  # the source line is matched literally, not expanded
+	t_eq "the --all walk calls it before each snapshot" \
+		"$(printf '%s\n' "$_iw_body" | count_match 'index_wait_for_backup "$_h"')" "1"
+	# shellcheck disable=SC2016  # same: this is the text of the guard in cmd_index
+	t_eq "...guarded by --all" \
+		"$(printf '%s\n' "$_iw_body" | count_match '[ "$OPT_ALL" = "1" ] && index_wait_for_backup')" "1"
 }
 
 ## A --health nobody is watching, and how long an attach talks for.
@@ -13804,6 +13895,7 @@ _rt_list() {
 	_rt network_volume_of                    && t_test_network_volume_of
 	_rt opt_in_indexing                      && t_test_opt_in_indexing
 	_rt index_timing                         && t_test_index_timing
+	_rt index_waits_out_a_backup             && t_test_index_waits_out_a_backup
 	_rt headless_health_notifies             && t_test_headless_health_notifies
 	_rt ssh_locations                        && t_test_ssh_locations
 	_rt health_scope                         && t_test_health_scope
