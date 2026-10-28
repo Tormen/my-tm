@@ -34,8 +34,8 @@ US="${0##*/}"
 ## so the ROOT-OWNED COPY the daemons run -- which has no git beside it -- can
 ## still say which release it is and whether it is one.
 MY_TM_VERSION="0.9.1"
-SCRIPT_COMMIT="bcac231"
-SCRIPT_RELEASE="v0.9.1-103-gbcac231"
+SCRIPT_COMMIT="6125a7a"
+SCRIPT_RELEASE="v0.9.1-104-g6125a7a"
 
 ## The first 12 hex of this file's own SHA-256: the value that identifies the
 ## bytes. my-tm is COPIED to its installed path, so this is what tells the
@@ -261,6 +261,10 @@ MOUNT_TABLE_FILE=""
 ## The program the job plists run: the launcher when the jobs have Full Disk
 ## Access, otherwise my-tm itself. Set by --install; empty means my-tm.
 JOB_PROGRAM=""
+## Where launchd reads its system jobs. Not a config key -- it is where macOS
+## looks -- and only the suite points it elsewhere, the way it sets
+## MOUNT_TABLE_FILE.
+JOBS_DIR="/Library/LaunchDaemons"
 ## Mountpoints to release when this run ends.  A FILE, not a variable: every
 ## caller reaches transient_snapshot through $(...), which is a subshell, and a
 ## variable set there dies with it -- leaving the snapshot mounted, which is
@@ -4265,7 +4269,7 @@ _EOF
 			else
 				_ixs="idle, not indexed yet"
 			fi
-			if [ -f "/Library/LaunchDaemons/$MAINT_JOB.plist" ]; then
+			if [ -f "$JOBS_DIR/$MAINT_JOB.plist" ]; then
 				_ixs="$_ixs · new backups follow automatically"
 			else
 				_ixs="$_ixs · new backups: $US --index $_h"
@@ -6114,7 +6118,7 @@ _EOF
 
 	## the jobs we installed
 	for _j in "$MAINT_JOB" "$HEALTH_JOB" "$BACKUP_JOB"; do
-		_pl="/Library/LaunchDaemons/$_j.plist"
+		_pl="$JOBS_DIR/$_j.plist"
 		[ -f "$_pl" ] || continue
 		_prog=$(plutil -extract ProgramArguments.0 raw -o - "$_pl" 2>/dev/null)
 		[ -n "$_prog" ] && [ ! -x "$_prog" ] &&
@@ -7207,6 +7211,14 @@ job_plist() {
 	done
 	printf '<?xml version="1.0" encoding="UTF-8"?>\n'
 	printf '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+	## WHO installed this job, so it has one owner. my-rollout owns every
+	## eu.no-panic.* job it finds in the LINKS; a job a TOOL writes says so in
+	## this one line and is left to the tool. Without it, these three were
+	## "nobody's", and every run offered to adopt them -- which would have made
+	## two owners of each. Every comparison ignores the line (same_plist).
+	printf '<!-- installed by %s --install (%s) on %s, %s: generated, build %s -->\n' \
+		"$US" "$(id -un)" "$(hostname -s 2>/dev/null || hostname)" \
+		"$(date '+%Y-%m-%d %H:%M %z')" "$(build_id)"
 	printf '<plist version="1.0">\n<dict>\n'
 	printf '\t<key>Label</key>\n\t<string>%s</string>\n' "$_jp_label"
 	printf '\t<key>ProgramArguments</key>\n\t<array>\n\t\t<string>%s</string>\n%s\t</array>\n' \
@@ -7217,12 +7229,41 @@ job_plist() {
 	printf '</dict>\n</plist>\n'
 }
 
+## same_plist <new> <installed> -- the same job: equal but for the installer
+## line, which the installed one must HAVE. So a stamp written a day later is
+## not a change, and a copy from before this line existed IS one -- it gets
+## the line on the next --install.
+same_plist() {
+	grep -q '^<!-- installed by ' "$2" 2>/dev/null &&
+		[ "$(grep -v '^<!-- installed by ' "$1")" = "$(grep -v '^<!-- installed by ' "$2")" ]
+}
+
 write_job() {
 	_label="$1"; _sched="$2"; shift 2
 	_prog="${JOB_PROGRAM:-$MY_TM_BIN}"
-	_pl="/Library/LaunchDaemons/$_label.plist"
-	job_plist "$_label" "$_sched" "$@" >"$_pl" || return 1
-	plutil -lint "$_pl" >/dev/null 2>&1 || { warn "$_pl did not lint"; return 1; }
+	_pl="$JOBS_DIR/$_label.plist"
+	_wj_new=$(tmp_file job) || return 1
+	job_plist "$_label" "$_sched" "$@" >"$_wj_new" || { rm -f "$_wj_new"; return 1; }
+	## the RENDERED plist is linted, before anything is installed: a plist that
+	## does not parse, written straight to its place, is a job launchd drops
+	if ! plutil -lint "$_wj_new" >/dev/null 2>&1; then
+		rm -f "$_wj_new"
+		warn "the plist for $_label did not lint -- $_pl left as it was"
+		return 1
+	fi
+	## Nothing to do is the common case, and reloading a job that did not
+	## change stops a backup or an index walk for no reason.
+	if same_plist "$_wj_new" "$_pl"; then
+		minor "job $_label is current"
+		rm -f "$_wj_new"
+		return 0
+	fi
+	atomic_write "$_pl" <"$_wj_new" || { rm -f "$_wj_new"; return 1; }
+	rm -f "$_wj_new"
+	## 0644 root:wheel, as every job of this kind: atomic_write takes the mode
+	## from the directory, which gives 0640 here, and an installed job is the
+	## one thing anyone must be able to compare with its source without root.
+	chmod 0644 "$_pl" 2>/dev/null
 	msg "installed job $_label"
 	minor "$_pl -> $_prog $*"
 	run launchctl unload "$_pl" >/dev/null 2>&1
@@ -7574,7 +7615,7 @@ cmd_uninstall() {
 	fi
 
 	for _j in "$MAINT_JOB" "$HEALTH_JOB" "$BACKUP_JOB"; do
-		_pl="/Library/LaunchDaemons/$_j.plist"
+		_pl="$JOBS_DIR/$_j.plist"
 		[ -f "$_pl" ] || continue
 		run launchctl unload "$_pl" >/dev/null 2>&1
 		run rm -f "$_pl"
@@ -8259,7 +8300,7 @@ main() {
 	case "${CMD:-}" in
 		--run-tests|--maintenance|--sweep|--umount) : ;;
 		*)
-			if [ ! -f "/Library/LaunchDaemons/$MAINT_JOB.plist" ] &&
+			if [ ! -f "$JOBS_DIR/$MAINT_JOB.plist" ] &&
 			   [ -n "$(mounts_read_all)" ]; then
 				dbg "no maintenance daemon installed -- sweeping opportunistically"
 				sweep >/dev/null 2>&1 || true
@@ -12888,6 +12929,59 @@ t_test_job_plist_streams() {
 	MY_TM_BIN="$_jt_bin"; LOG_DIR_ROOT="$_jt_log"
 }
 
+## REGRESSION: the three jobs --install writes carried no installer comment, so
+## my-rollout could not tell whose they were -- it reported all three as
+## nobody's and offered to adopt them into the LINKS, which would have given
+## each of them a second owner. Every other tool that writes a job says so in
+## that one line (my-send, my-bb, my-acme-cert, my-appleRAID).
+## Adversarial on the part that is easy to get wrong: the line carries a
+## TIMESTAMP, so comparing bytes would call every run a change and restart all
+## three jobs. The copy here is stamped with ANOTHER day's date -- and a copy
+## with no stamp at all, which is what every machine has today, must still be
+## written again.
+t_test_job_says_who_installed_it() {
+	printf '\nA job my-tm installs says who installed it\n'
+	_js_bin="${MY_TM_BIN:-}"; _js_log="${LOG_DIR_ROOT:-}"; _js_dir="$JOBS_DIR"
+	MY_TM_BIN="/usr/local/sbin/my-tm"; LOG_DIR_ROOT="$T_ROOT/logs"
+	JOBS_DIR="$T_ROOT/ld"; mkdir "$JOBS_DIR"
+	_js_f="$JOBS_DIR/test.my-tm.stamp.plist"
+
+	job_plist test.my-tm.stamp 120s --maintenance >"$T_ROOT/js.plist"
+	t_eq "ONE installer comment, right after the DOCTYPE" \
+		"$(sed -n '3p' "$T_ROOT/js.plist" | cut -c1-17) $(grep -c '^<!-- installed by ' "$T_ROOT/js.plist")" \
+		"<!-- installed by 1"
+	t_eq "...naming this tool, which is what my-rollout reads as the owner" \
+		"$(sed -n 's/^<!-- installed by \([^ ]*\) .*/\1/p' "$T_ROOT/js.plist")" "$US"
+	t_eq "and the plist still lints" \
+		"$(plutil -lint "$T_ROOT/js.plist" >/dev/null 2>&1 && echo ok)" "ok"
+
+	sed 's/^\(<!-- installed by .*\), [0-9-]* [0-9:]* [-+][0-9]*:/\1, 1999-01-01 00:00 +0000:/' \
+		"$T_ROOT/js.plist" >"$T_ROOT/js.aged"
+	t_eq "a stamp from another day is not a change" \
+		"$(same_plist "$T_ROOT/js.plist" "$T_ROOT/js.aged" && echo same || echo differs)" "same"
+	grep -v '^<!-- installed by ' "$T_ROOT/js.plist" >"$T_ROOT/js.bare"
+	t_eq "a copy with no stamp at all IS one (what every machine has today)" \
+		"$(same_plist "$T_ROOT/js.plist" "$T_ROOT/js.bare" && echo same || echo differs)" "differs"
+
+	## and write_job acts on that -- the second call must not touch launchctl
+	rm -f "$_js_f"
+	: >"$(t_calls)"
+	write_job test.my-tm.stamp 120s --maintenance >/dev/null 2>&1
+	t_eq "the first write installs it 0644 and loads it" \
+		"$(count_match launchctl <"$(t_calls)") $(stat -f '%Lp' "$_js_f" 2>/dev/null)" "2 644"
+	: >"$(t_calls)"
+	write_job test.my-tm.stamp 120s --maintenance >/dev/null 2>&1
+	t_eq "the second changes nothing and does NOT restart the job" \
+		"$(count_match launchctl <"$(t_calls)")" "0"
+	: >"$(t_calls)"
+	write_job test.my-tm.stamp 300s --maintenance >/dev/null 2>&1
+	t_eq "a real change installs and reloads it" \
+		"$(count_match launchctl <"$(t_calls)")" "2"
+
+	MY_TM_BIN="$_js_bin"; LOG_DIR_ROOT="$_js_log"; JOBS_DIR="$_js_dir"
+	rm -rf "$T_ROOT/ld" "$T_ROOT/js.plist" "$T_ROOT/js.aged" "$T_ROOT/js.bare"
+}
+
 t_test_install_logs() {
 	printf '\nDaemon logs follow LOG_DIR\n'
 	_il=$(sed -n '/^cmd_install() {$/,/^}$/p' "$T_MYTM")
@@ -13581,6 +13675,7 @@ _rt_list() {
 	_rt install_config                       && t_test_install_config
 	_rt install_logs                         && t_test_install_logs
 	_rt job_plist_streams                    && t_test_job_plist_streams
+	_rt job_says_who_installed_it            && t_test_job_says_who_installed_it
 	_rt network_volume_of                    && t_test_network_volume_of
 	_rt opt_in_indexing                      && t_test_opt_in_indexing
 	_rt index_timing                         && t_test_index_timing

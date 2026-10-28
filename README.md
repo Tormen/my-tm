@@ -920,6 +920,13 @@ change before making it.
    binary it registers and refuses a path inside any user-writable tree (such
    as a source checkout), naming the fix.
 
+   Each plist carries ONE comment after its DOCTYPE — `<!-- installed by
+   my-tm --install (root) on ada, 2026-10-28 18:40 +0100: generated, build
+   a3aa3cfd549c -->`. That line is what makes the job **my-tm's**, so my-rollout
+   reports it instead of offering to adopt it into the LINKS (two owners); every
+   comparison ignores the line, so a job that did not change is neither
+   rewritten nor reloaded. The installed copy is `root:wheel 0644`.
+
    It does **not** build the `/tm` tree. Building it reads every store, and on
    a fresh install nothing is cached, so a sparsebundle on a share would have
    to be attached — minutes of waiting, for a tree that `$MAINT_JOB` builds on
