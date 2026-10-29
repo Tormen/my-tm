@@ -13257,7 +13257,7 @@ t_test_job_plist_streams() {
 ## my-rollout could not tell whose they were -- it reported all three as
 ## nobody's and offered to adopt them into the LINKS, which would have given
 ## each of them a second owner. Every other tool that writes a job says so in
-## that one line (my-send, my-bb, my-acme-cert, my-appleRAID).
+## that one line (my-warn, my-bb, my-acme-cert, my-appleRAID).
 ## Adversarial on the part that is easy to get wrong: the line carries a
 ## TIMESTAMP, so comparing bytes would call every run a change and restart all
 ## three jobs. The copy here is stamped with ANOTHER day's date -- and a copy
