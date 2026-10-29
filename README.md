@@ -144,7 +144,8 @@ MAINTAIN -- these need root + Full Disk Access
                                  policy if omitted. Dry-run unless you type `go`
   backup  [--eject|--no-eject]   run a backup now and wait for it, then do
                                  what POST_BACKUP says with the disk:
-                                 none | unmount | eject.
+                                 none | unmount | eject -- unless the no-eject
+                                 list covers it.
                                  [daemon: run on BACKUP_SCHEDULE]
   stop                           stop the backup that is running
   trigger                        ask the backup job to run one, and return at
@@ -200,9 +201,13 @@ OPTIONS
   --cached               ls answers from what is already known, and opens
                          nothing: no mount, no attach, no scan. What a status on
                          another Mac asks, so its "instant" costs nothing here
-  --eject|--no-eject     with `backup`: eject the disk after it, or leave it
-                         mounted. Both persist until the other is given --
-                         the unattended run included
+  --eject|--no-eject [<NAME>...]
+                         with `backup`: which disks are parked afterwards.
+                         --no-eject adds the names that follow it to the
+                         no-eject list, --eject takes them off; bare, they
+                         mean every set and none at all. A <NAME> is a
+                         backup set or an engine, and `all` is every set.
+                         Persists, the unattended run included
   -f|--force             overwrite an existing destination (cp),
                          force a busy unmount (umount)
   -V|--verbose           echo each tmutil / mount_apfs / find command before it runs
@@ -1747,7 +1752,7 @@ as does any destination that is not there right now.
 single-instance lockfile with a signal trap, optional `diskutil mount` of
 `BACKUP_VOLUME`, `tmutil startbackup --block`, notification on the three
 outcomes (ok / already running / failed), then whatever `POST_BACKUP` says
-unless `--no-eject` planted the flag file. `my-tm stop` = `tmutil stopbackup`
+unless the no-eject list covers it. `my-tm stop` = `tmutil stopbackup`
 plus the same post-backup logic. Both are root-only; everything else runs unprivileged
 wherever the OS allows.
 
@@ -1776,9 +1781,18 @@ startup; the pre-backup mount, the post-backup action and the rule below all
 use that one value. More than one destination and my-tm refuses and asks,
 rather than picking one.
 
-`backup --no-eject` leaves the disk mounted from now on, the unattended
-run included, until `--eject` undoes it. Both persist — they plant and remove
-`$NO_EJECT_FLAGFILE`, and say so.
+### The no-eject list
+
+`$NO_EJECT_FLAGFILE` LISTS what is not ejected — one name per line, a backup
+set or an engine, with `all` for every set. A list that names nothing
+suppresses nothing. `backup --no-eject [<NAME>...]` adds the names that
+follow it and `--eject [<NAME>...]` takes them off; bare, they mean every set
+and none at all. Both persist, the unattended run included, and whatever ran
+prints what the list holds afterwards.
+
+The file used to mean "never eject" by merely existing, and was empty. Under
+the list rule that empty file would mean the opposite, so the first run to
+meet one writes `all` into it and says why.
 
 **A disk that was put to sleep stays asleep.** `--maintenance` runs every
 `MAINT_INTERVAL` seconds and would otherwise mount each destination and stat

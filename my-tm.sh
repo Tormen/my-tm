@@ -34,8 +34,8 @@ US="${0##*/}"
 ## so the ROOT-OWNED COPY the daemons run -- which has no git beside it -- can
 ## still say which release it is and whether it is one.
 MY_TM_VERSION="0.9.1"
-SCRIPT_COMMIT="393d23c"
-SCRIPT_RELEASE="v0.9.1-116-g393d23c"
+SCRIPT_COMMIT="87c853e"
+SCRIPT_RELEASE="v0.9.1-117-g87c853e"
 
 ## The first 12 hex of this file's own SHA-256: the value that identifies the
 ## bytes. my-tm is COPIED to its installed path, so this is what tells the
@@ -6687,6 +6687,65 @@ backup_leftovers_hint() {
 	return 0
 }
 
+## The no-eject file LISTS what must not be ejected -- one name per line, a
+## SET or an ENGINE, with the reserved name `all` for every set. The same
+## two-level key space set_backup_parameters() uses, so there is no second
+## vocabulary. A file that lists nothing suppresses nothing.
+no_eject_names() {
+	[ -f "$NO_EJECT_FLAGFILE" ] || return 0
+	sed -e 's/#.*//' -e 's/[[:space:]]//g' "$NO_EJECT_FLAGFILE" 2>/dev/null | grep -v '^$'
+}
+
+## Is this backup's disk to be left alone? Its set's name, its engine's name
+## or `all` -- any of the three.
+no_eject_covers() {             # <set> [<engine>]
+	no_eject_names | grep -qx -e all -e "${1:-}" ${2:+-e "$2"}
+}
+
+## Until the file became a list its EXISTENCE meant "never eject" and it was
+## empty, which under the list rule would mean the opposite -- so a machine
+## that had ejecting suppressed would start ejecting. The first run that meets
+## an empty one writes `all` into it and says why.
+no_eject_migrate() {
+	[ -f "$NO_EJECT_FLAGFILE" ] && [ ! -s "$NO_EJECT_FLAGFILE" ] || return 0
+	printf 'all\n' >"$NO_EJECT_FLAGFILE" 2>/dev/null ||
+		{ warn "cannot write $NO_EJECT_FLAGFILE -- it is empty, which now means nothing is suppressed"; return 0; }
+	msg "$NO_EJECT_FLAGFILE: wrote \`all\` (it was empty, and an empty list now suppresses nothing -- it used to suppress everything)"
+}
+
+## Add or remove names, and say what the file holds afterwards.
+no_eject_set() {                # add|rm [<name>...]
+	_nes_op="$1"; shift
+	need_dir "$(dirname "$NO_EJECT_FLAGFILE")"
+	_nes_now=$(no_eject_names)
+	case "$_nes_op" in
+		add)
+			[ "$#" -gt 0 ] || set -- all
+			for _nes_n in "$@"; do
+				printf '%s\n' "$_nes_now" | grep -qx "$_nes_n" ||
+					_nes_now=$(printf '%s\n%s\n' "$_nes_now" "$_nes_n")
+			done ;;
+		rm)
+			if [ "$#" -eq 0 ]; then
+				_nes_now=""
+			else
+				for _nes_n in "$@"; do
+					_nes_now=$(printf '%s\n' "$_nes_now" | grep -vx "$_nes_n" || true)
+				done
+			fi ;;
+	esac
+	printf '%s\n' "$_nes_now" | grep -v '^$' | atomic_write "$NO_EJECT_FLAGFILE" ||
+		err "cannot write $NO_EJECT_FLAGFILE"
+	_nes_left=$(no_eject_names | tr '\n' ' ')
+	if [ -n "$_nes_left" ]; then
+		msg "not ejected from now on: ${_nes_left% }"
+		why "including the unattended $BACKUP_JOB run -- \`$US backup --eject <name>\` takes one off the list"
+	else
+		msg "POST_BACKUP applies again after every backup"
+		why "nothing is on the no-eject list any more"
+	fi
+}
+
 do_post_backup() {
 	_pv=$(backup_volume)
 	[ -n "$_pv" ] || {
@@ -6701,9 +6760,10 @@ do_post_backup() {
 		$2 == "local" || $2 ~ /:/ { next }
 		{ n = $2; sub(/.*\//, "", n) } n == v && !f { print $1; f = 1 }')
 	_pol=$(post_backup_policy "$_pv_h")
-	if [ -f "$NO_EJECT_FLAGFILE" ]; then
-		msg "leaving $_pv mounted [policy $_pol suppressed by $NO_EJECT_FLAGFILE]"
-		why "--eject removes that file and the policy applies again"
+	no_eject_migrate
+	if no_eject_covers "${BACKUP_SET:-timemachine}" "${BACKUP_ENGINE:-timemachine}"; then
+		msg "leaving $_pv mounted [policy $_pol suppressed by $NO_EJECT_FLAGFILE: $(no_eject_names | tr '\n' ' ')]"
+		why "\`$US backup --eject <name>\` takes a name off that list and the policy applies again"
 		return 0
 	fi
 	case "$_pol" in
@@ -6755,20 +6815,28 @@ cmd_trigger() {
 cmd_backup() {
 	_action="${1:-}"
 	shift 2>/dev/null || true
+	## Each flag takes the names that FOLLOW it, so `--no-eject nightly` names
+	## a set while `backup nightly --no-eject` suppresses every one. Bare
+	## --no-eject writes `all`; bare --eject clears the list.
+	## --set-* are the old spellings, kept working. The flag is named for what
+	## it does; that it PERSISTS is said in the output.
+	_be_op=""; _be_names=""
 	for _a in "$@"; do
 		case "$_a" in
-			## --set-* are the old spellings, kept working.  The flag is named
-			## for what it does; that it PERSISTS is said in the output.
 			--no-eject|--set-no-eject)
-				run touch "$NO_EJECT_FLAGFILE" || err "cannot create $NO_EJECT_FLAGFILE"
-				msg "the disk is left mounted after every backup from now on"
-				why "including the unattended $BACKUP_JOB run -- until --eject clears it" ;;
+				# shellcheck disable=SC2086  # a list of names, split on purpose
+				[ -n "$_be_op" ] && no_eject_set "$_be_op" $_be_names
+				_be_op="add"; _be_names="" ;;
 			--eject|--set-eject)
-				run rm -f "$NO_EJECT_FLAGFILE"
-				msg "POST_BACKUP applies again after every backup"
-				why "the disk is put back the way POST_BACKUP says, from now on" ;;
+				# shellcheck disable=SC2086  # a list of names, split on purpose
+				[ -n "$_be_op" ] && no_eject_set "$_be_op" $_be_names
+				_be_op="rm"; _be_names="" ;;
+			-*) : ;;
+			*)  [ -n "$_be_op" ] && _be_names="$_be_names $_a" ;;
 		esac
 	done
+	# shellcheck disable=SC2086  # a list of names, split on purpose
+	[ -n "$_be_op" ] && no_eject_set "$_be_op" $_be_names
 	case "$_action" in
 		start|stop) : ;;
 		"") return 0 ;;
@@ -8199,7 +8267,8 @@ MAINTAIN -- these need root + Full Disk Access
                                  policy if omitted. Dry-run unless you type \`go\`
   backup  [--eject|--no-eject]   run a backup now and wait for it, then do
                                  what POST_BACKUP says with the disk:
-                                 none | unmount | eject.
+                                 none | unmount | eject -- unless the no-eject
+                                 list covers it.
                                  [daemon: run on BACKUP_SCHEDULE]
   stop                           stop the backup that is running
   trigger                        ask the backup job to run one, and return at
@@ -8255,9 +8324,13 @@ OPTIONS
   --cached               ls answers from what is already known, and opens
                          nothing: no mount, no attach, no scan. What a status on
                          another Mac asks, so its "instant" costs nothing here
-  --eject|--no-eject     with \`backup\`: eject the disk after it, or leave it
-                         mounted. Both persist until the other is given --
-                         the unattended run included
+  --eject|--no-eject [<NAME>...]
+                         with \`backup\`: which disks are parked afterwards.
+                         --no-eject adds the names that follow it to the
+                         no-eject list, --eject takes them off; bare, they
+                         mean every set and none at all. A <NAME> is a
+                         backup set or an engine, and \`all\` is every set.
+                         Persists, the unattended run included
   -f|--force             overwrite an existing destination (cp),
                          force a busy unmount (umount)
   -V|--verbose           echo each tmutil / mount_apfs / find command before it runs
@@ -14146,12 +14219,43 @@ t_test_post_backup() {
 	t_eq "POST_BACKUP=none touches the disk with nothing" \
 		"$(printf '%s\n' "$_new" | count_match 'diskutil')" "0"
 
+	## The file LISTS what is not ejected, one SET or ENGINE name per line.
+	## Adversarial: the EMPTY file of the old meaning ("exists = never eject")
+	## would read as "suppress nothing" under the list rule, and a machine
+	## that had ejecting turned off would start ejecting at 03:00. It has to
+	## migrate instead.
 	POST_BACKUP_DEFAULT="eject"; unset BACKUP_VOLUME_RESOLVED
 	: >"$NO_EJECT_FLAGFILE"
 	_b=$(_pb_n); do_post_backup >/dev/null 2>&1
+	t_eq "an empty file is written as \`all\`, not read as nothing" \
+		"$(cat "$NO_EJECT_FLAGFILE")" "all"
 	_new=$(sed -n "$(( _b + 1 )),\$p" "$(t_calls)")
-	t_eq "the flag file suppresses the policy entirely" \
+	t_eq "(so it still suppresses the policy entirely)" \
 		"$(printf '%s\n' "$_new" | count_match 'diskutil')" "0"
+
+	printf 'nightly\n' >"$NO_EJECT_FLAGFILE"
+	_b=$(_pb_n); do_post_backup >/dev/null 2>&1
+	_new=$(sed -n "$(( _b + 1 )),\$p" "$(t_calls)")
+	t_match "a name that is not this backup's leaves the policy alone" "$_new" "diskutil eject"
+	BACKUP_SET="nightly"
+	_b=$(_pb_n); do_post_backup >/dev/null 2>&1
+	_new=$(sed -n "$(( _b + 1 )),\$p" "$(t_calls)")
+	t_eq "its own name suppresses it" "$(printf '%s\n' "$_new" | count_match 'diskutil')" "0"
+	BACKUP_SET="other"; BACKUP_ENGINE="nightly"
+	_b=$(_pb_n); do_post_backup >/dev/null 2>&1
+	_new=$(sed -n "$(( _b + 1 )),\$p" "$(t_calls)")
+	t_eq "and so does its engine's" "$(printf '%s\n' "$_new" | count_match 'diskutil')" "0"
+	unset BACKUP_SET BACKUP_ENGINE
+
+	## the list is edited by name, and bare means everything / nothing
+	no_eject_set add nightly weekly >/dev/null 2>&1
+	t_eq "two names are added" "$(no_eject_names | tr '\n' ' ')" "nightly weekly "
+	no_eject_set rm nightly >/dev/null 2>&1
+	t_eq "one is taken off" "$(no_eject_names | tr '\n' ' ')" "weekly "
+	no_eject_set add >/dev/null 2>&1
+	t_eq "bare --no-eject writes all" "$(no_eject_names | grep -cx all)" "1"
+	no_eject_set rm >/dev/null 2>&1
+	t_eq "bare --eject clears the list" "$(no_eject_names | count_lines)" "0"
 	rm -f "$NO_EJECT_FLAGFILE"
 
 	POST_BACKUP_DEFAULT="eject"
