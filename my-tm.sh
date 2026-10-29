@@ -34,8 +34,8 @@ US="${0##*/}"
 ## so the ROOT-OWNED COPY the daemons run -- which has no git beside it -- can
 ## still say which release it is and whether it is one.
 MY_TM_VERSION="0.9.1"
-SCRIPT_COMMIT="e4943d9"
-SCRIPT_RELEASE="v0.9.1-113-ge4943d9"
+SCRIPT_COMMIT="0db1dce"
+SCRIPT_RELEASE="v0.9.1-114-g0db1dce"
 
 ## The first 12 hex of this file's own SHA-256: the value that identifies the
 ## bytes. my-tm is COPIED to its installed path, so this is what tells the
@@ -2951,6 +2951,15 @@ snap_mount() {
 		printf '%s\n' "$_mp"
 		return 0
 	fi
+	## "Operation not permitted" is not a mount problem: macOS refused this
+	## process the Time Machine volume. Every other snapshot here will be
+	## refused the same way, so it is reported as the one thing it is and the
+	## caller is told to stop rather than hear it 57 times.
+	case "$_sm_err" in
+		*"Operation not permitted"*)
+			warn "$_loc: Full Disk Access is missing -- macOS refuses every snapshot mount here. The jobs run through a launcher that holds the grant; run this the same way ($US --install builds it, my-fda list shows it)."
+			return 3 ;;
+	esac
 	if ! snap_names "$_loc" 2>/dev/null | grep -qx "$_ts"; then
 		## Time Machine adds and thins constantly, and local snapshots are
 		## purgeable at any age: a list read a minute ago can already be wrong
@@ -5555,7 +5564,11 @@ $(printf '%s\n' "$_rows" | head -n 1 | awk -F'\t' '{print $2}')" ;;
 			## runs while the disk is deliberately still spinning: only the
 			## hours-long --all walk steps aside for a running backup
 			[ "$OPT_ALL" = "1" ] && index_wait_for_backup "$_h"
-			index_one "$_h" "$_ts"
+			index_one "$_h" "$_ts" || {
+				[ "$?" = "3" ] || continue
+				warn "$_h: stopping -- nothing here can be indexed until that is fixed"
+				break
+			}
 		done <<_EOF
 $_list
 _EOF
@@ -5621,7 +5634,12 @@ index_one() {
 	_id=$(snap_id "$(loc_uuid "$_h")" "$_ts")
 	_mp=$(mnt_point_for "$_h" "$_ts")
 	msg "indexing $(ts_display "$_ts") of '$_h'"
-	snap_mount "$_h" "$_ts" 86400 "indexer" >/dev/null || { warn "$_ts: mount failed"; return 1; }
+	snap_mount "$_h" "$_ts" 86400 "indexer" >/dev/null || {
+		## 3 is the refusal above: it belongs to the LOCATION, not this snapshot
+		[ "$?" = "3" ] && return 3
+		warn "$_ts: mount failed"
+		return 1
+	}
 	why "held only while this one snapshot is walked, and exempt from the sweep meanwhile"
 
 	_base=$(mnt_volume_path "$_h" "$_ts" "$_vol")
@@ -11108,6 +11126,60 @@ t_test_status_says_waiting_not_idle() {
 			count_match 'elif _ixw=$(index_waiting_age')" "1"
 }
 
+## macOS refusing the Time Machine volume is a GRANT problem, not a mount
+## problem, and it is the same answer for every snapshot. Adversarial: the way
+## this hurt was not an error nobody saw -- each refusal WAS printed -- it was
+## that the run looked busy for hours and indexed nothing, because the walk
+## treated 57 identical refusals as 57 unrelated mount failures. So the checks
+## are: is it NAMED, and does the walk STOP; and, the other way round, an
+## ordinary mount failure must still be just that and not end the run.
+t_test_refused_access_stops_the_walk() {
+	printf '\nmacOS refusing the volume stops the walk, by name\n'
+	_fa_err="mount_apfs: volume could not be mounted: Operation not permitted"
+	_fa_out=$( (
+		# shellcheck disable=SC2329  # called by snap_mount
+		mount_apfs() { printf '%s\n' "$_fa_err" >&2; return 1; }
+		snap_mount store 2026-08-20-155805 60 "indexer" "$T_ROOT/fa.mp"
+		printf 'rc=%s\n' "$?" ) 2>&1 )
+	t_eq "snap_mount names Full Disk Access, not the mount" \
+		"$(printf '%s\n' "$_fa_out" | count_match 'Full Disk Access is missing')" "1"
+	t_eq "...and answers 3, which belongs to the location" \
+		"$(printf '%s\n' "$_fa_out" | count_match 'rc=3')" "1"
+
+	t_eq "index_one hands that 3 on instead of flattening it to a failure" \
+		"$( ( # shellcheck disable=SC2329
+		      snap_mount() { return 3; }
+		      index_one store 2026-08-20-155805 >/dev/null 2>&1; echo $?) )" "3"
+
+	## the walk: ONE snapshot attempted, then it stops
+	rm -f "$(index_covered_file store)"
+	_fa_walk=$( ( OPT_ALL=1
+		# shellcheck disable=SC2329
+		tm_backup_running() { return 1; }
+		# shellcheck disable=SC2329
+		snap_mount() { return 3; }
+		# shellcheck disable=SC2329
+		snap_umount() { return 0; }
+		cmd_index store ) 2>&1 )
+	t_eq "the walk stops at the first refusal instead of trying every snapshot" \
+		"$(printf '%s\n' "$_fa_walk" | count_match 'indexing ')" "1"
+	t_eq "...and says why it stopped" \
+		"$(printf '%s\n' "$_fa_walk" | count_match 'stopping -- nothing here can be indexed')" "1"
+
+	## an ordinary mount failure is still one snapshot's problem
+	_fa_one=$( ( OPT_ALL=1
+		# shellcheck disable=SC2329
+		tm_backup_running() { return 1; }
+		# shellcheck disable=SC2329
+		snap_mount() { return 1; }
+		# shellcheck disable=SC2329
+		snap_umount() { return 0; }
+		cmd_index store ) 2>&1 )
+	t_eq "a plain mount failure does not end the walk" \
+		"$(printf '%s\n' "$_fa_one" | count_match 'stopping -- nothing here can be indexed')" "0"
+	rm -f "$(index_covered_file store)"
+}
+
 ## A row with nothing in it used to be a wall of "-": no snapshots, no span, no
 ## last backup, and no way to tell whether the store was empty, unreadable, or
 ## simply never opened -- which is exactly what was asked about a registered
@@ -14205,6 +14277,7 @@ _rt_list() {
 	_rt snapshot_mounts_are_nobrowse         && t_test_snapshot_mounts_are_nobrowse
 	_rt increment_names_are_claimed          && t_test_increment_names_are_claimed
 	_rt status_says_waiting_not_idle         && t_test_status_says_waiting_not_idle
+	_rt refused_access_stops_the_walk        && t_test_refused_access_stops_the_walk
 	_rt site_conf_dir_from_env               && t_test_site_conf_dir_from_env
 	_rt detached_store_still_answers         && t_test_detached_store_still_answers
 	_rt rm_needs_the_store                   && t_test_rm_needs_the_store
