@@ -34,8 +34,8 @@ US="${0##*/}"
 ## so the ROOT-OWNED COPY the daemons run -- which has no git beside it -- can
 ## still say which release it is and whether it is one.
 MY_TM_VERSION="0.9.1"
-SCRIPT_COMMIT="62feb22"
-SCRIPT_RELEASE="v0.9.1-115-g62feb22"
+SCRIPT_COMMIT="393d23c"
+SCRIPT_RELEASE="v0.9.1-116-g393d23c"
 
 ## The first 12 hex of this file's own SHA-256: the value that identifies the
 ## bytes. my-tm is COPIED to its installed path, so this is what tells the
@@ -110,7 +110,7 @@ cmd_stamp_version() {
 	git -C "$_sv_dir" rev-parse --git-dir >/dev/null 2>&1 || err "stamp-version: not a git checkout"
 	_sv_sha=$(git -C "$_sv_dir" rev-parse --short HEAD 2>/dev/null)
 	[ -n "$_sv_sha" ] || err "stamp-version: no commit to stamp from"
-	if git -C "$_sv_dir" rev-parse -q --verify '@{upstream}' >/dev/null 2>&1 \
+	if git -C "$_sv_dir" rev-parse -q verify '@{upstream}' >/dev/null 2>&1 \
 	   && git -C "$_sv_dir" merge-base --is-ancestor HEAD '@{upstream}' 2>/dev/null; then
 		err "stamp-version: HEAD $_sv_sha is already pushed -- amending it would rewrite published history. Commit, stamp, THEN push"
 	fi
@@ -144,7 +144,7 @@ cmd_stamp_version() {
 #############################################################################
 
 AUTO_MOUNT_DESTINATIONS=1
-DEFAULT_CMD="--status"
+DEFAULT_CMD="status"
 TM_GROUP=""
 CACHE_DIR="/var/lib/my-tm"
 CACHE_MODE=0750
@@ -233,7 +233,7 @@ LITTLE_SNITCH="my-little-snitch"
 ## without cleaning up.  Not user-tunable: it is a leak-reaper, not a policy.
 TRANSIENT_TTL=900
 
-## how many snapshots --lookup holds mounted at once.  Bounded on purpose: each
+## how many snapshots lookup holds mounted at once.  Bounded on purpose: each
 ## mount pins its snapshot against thinning, and releasing one is not free.
 LOOKUP_CHUNK=16
 
@@ -317,12 +317,12 @@ ATTACH_LOCKFILE="$RUN_DIR/attach.lock"
 ## 4.4 MB .err -- a test directory and a disk), the oldest two days old. TAG
 ## names the step that made it, so even what a kill -9 leaves (no trap catches
 ## that) says where it came from.
-## A file the run HANDS ON is not one of these: --open fetches a remote file
+## A file the run HANDS ON is not one of these: open fetches a remote file
 ## for an application to open after my-tm has exited.
 tmp_file() { mktemp "$RUN_DIR/$1.XXXXXX"; }     # <tag>
 tmp_dir()  { mktemp -d "$RUN_DIR/$1.XXXXXX"; }  # <tag>
 
-## ...and the one exception, for a file the run HANDS ON: --open fetches a
+## ...and the one exception, for a file the run HANDS ON: open fetches a
 ## remote file for an application to open after my-tm has exited, so RUN_DIR
 ## would take it away at exactly the wrong moment. NOTHING removes this one --
 ## that is the point -- so it is said out loud when it is made.
@@ -430,12 +430,12 @@ _default_config_content() {
 # host-specific one is my-tm.conf and the shared one is my-tm.conf.GLOBAL;
 # my-tm sources .GLOBAL first, then my-tm.conf on top.
 
-# Locations live in $CACHE_DIR/locations.tsv, maintained by --add / --forget --
+# Locations live in $CACHE_DIR/locations.tsv, maintained by add / forget --
 # not in this file.
 AUTO_MOUNT_DESTINATIONS=1       # a destination that is attached but not
                                 # mounted is invisible to every read; mount
                                 # it, use it, and put it back as it was
-DEFAULT_CMD="--status"          # what a bare `my-tm` runs; params allowed
+DEFAULT_CMD="status"            # what a bare `my-tm` runs; params allowed
 TM_GROUP=""                     # group with read access to the shared cache;
                                 # "" = the invoking user's primary group
 CACHE_DIR="/var/lib/my-tm"; CACHE_MODE=0750
@@ -444,27 +444,27 @@ LOG_DIR="$HOME/Library/Logs/my-tm"
 FIRMLINK="/tm"                  # /etc/synthetic.conf entry made by --install
 MOUNT_ROOT="/var/lib/my-tm/mount"
 SITE_CONF_DIR="/usr/local/etc"  # where --install puts my-tm.conf
-NOTIFY_MOUNT_WARN=1             # also notify when a --mount TTL looks unsafe
+NOTIFY_MOUNT_WARN=1             # also notify when a mount TTL looks unsafe
 CACHE_TTL=3600                  # s; older -> rescan mounted locations
 USAGE_SAMPLE_INTERVAL=21600     # s; a slow heartbeat for store-size drift that
                                 # no snapshot change explains. Samples are taken
                                 # on backup EVENTS, not on this clock
 IMAGE_SCAN_TTL=300              # s to cache the scan for this Mac's own
                                 # sparsebundles on attached disks
-INDEX_BASELINES="newest oldest" # snapshots --index walks when none are named
+INDEX_BASELINES="newest oldest" # snapshots index walks when none are named
 INDEX_INC_MAX=16                # consolidate the increments once there are
                                 # this many
-INDEX_BACKUP_POLL="5m"          # how often --index --all looks at a running
+INDEX_BACKUP_POLL="5m"          # how often index --all looks at a running
                                 # Time Machine backup it is waiting for, and
                                 # the cadence of the lines saying it still is
-INDEX_BACKUP_MAX_WAIT="none"    # a duration, or none: how long --index --all
+INDEX_BACKUP_MAX_WAIT="none"    # a duration, or none: how long index --all
                                 # waits for a backup before giving up. A backup
                                 # that runs for hours is the normal case, not a
                                 # stuck process, so the default waits it out and
                                 # Ctrl-C is the bound. Anything that is not a
                                 # duration is read as none
 SHADOW_SSH_INDEX_FILES=1        # keep a shadow copy of an ssh location's index
-                                # here as well, so --find answers while that
+                                # here as well, so find answers while that
                                 # host is offline. The index itself lives on the
                                 # host that holds the disk, and is built there
 SSH_CONNECT_TIMEOUT=3           # s to wait for an ssh host before calling it
@@ -475,9 +475,9 @@ SSH_RUN_TIMEOUT="10m"           # ...and how long one remote command may RUN
                                 # above bounds the CONNECTION only: a my-tm
                                 # that looped on the far side kept it perfectly
                                 # healthy while a status here waited with it.
-                                # Generous on purpose -- a remote --ls that has
+                                # Generous on purpose -- a remote ls that has
                                 # to attach a 4 T sparsebundle measured 2m46s.
-                                # 0 = no bound (what an --index or a --cat
+                                # 0 = no bound (what an index or a cat
                                 # over ssh runs with: those are hours of work,
                                 # not an unanswered question)
 REMOTE_INSTALL_DIR_DEFAULT="/usr/local/sbin"   # where --install <HOST> puts
@@ -496,9 +496,9 @@ REMOTE_MY_TM_PATHS="/usr/local/sbin/my-tm /sbin/my-tm"   # where my-tm may
 AUTO_INDEX_TM_BACKUP_DISKS=0    # 1: Time Machine backups on a disk connected to
                                 # this Mac (internal or external, a sparsebundle
                                 # stored on one included) are indexed without
-                                # --index. Never local snapshots, never ssh
+                                # index. Never local snapshots, never ssh
                                 # locations -- their host's own config decides.
-                                # --index / --no-index per location win over it
+                                # index / no-index per location win over it
 INDEX_INTERVAL_DEFAULT="1d"     # how often an opted-in location is re-indexed
                                 # when Time Machine has no schedule of its own.
                                 # With AutoBackup on, a finished run is the
@@ -535,7 +535,7 @@ ATTACH_LOCK_MAX_WAIT="30m"      # waiting longer than this for another run's
 ID_LEN=6
 # --- retention ---
 THIN_POLICY_TO_KEEP_DEFAULT="24h:hourly 7d:daily 4w:weekly 2y:monthly"
-                                # what --thin keeps; for one location set
+                                # what thin keeps; for one location set
                                 # THIN_POLICY_TO_KEEP in set_location_parameters
 # --- health ---
 HEALTH_INTERVAL="1d"            # "" / 0 / false -> no daemon installed
@@ -550,7 +550,7 @@ HEALTH_MAX_INTERRUPTED=2; HEALTH_DRIFT_FACTOR=5
 INTERRUPTED_AFTER="1h"          # a backup into an image that Time Machine still
                                 # calls Running, with nothing written for this
                                 # long, is shown "interrupted ?": <N>m|h|d
-HEADLESS_NOTIFY_HEALTH_WARNINGS=1   # a --health nobody is watching notifies on
+HEADLESS_NOTIFY_HEALTH_WARNINGS=1   # a health nobody is watching notifies on
                                     # warnings too, not only on failures. 0:
                                     # failures only. A run in a terminal never
                                     # notifies -- you are already reading it
@@ -764,6 +764,21 @@ config_refuse_old_names() {
 		esac
 	done
 	return 0
+}
+
+## DEFAULT_CMD held a --flag until the commands became verbs, and every
+## machine's config still does until its rollout step has run. Read the verb
+## out of it rather than failing a bare `my-tm`, and say so once per run --
+## the file is root's, so nobody can fix it from here.
+config_default_cmd_verb() {
+	case "${DEFAULT_CMD:-}" in
+		--*) ;;
+		*) return 0 ;;
+	esac
+	_dcv=${DEFAULT_CMD#--}
+	is_command "${_dcv%% *}" || return 0
+	warn "DEFAULT_CMD=\"$DEFAULT_CMD\" is the old spelling (config:$CONFIG_SOURCED) -- read as \`$_dcv\`; commands are verbs now"
+	DEFAULT_CMD="$_dcv"
 }
 
 cmd_create_config() {
@@ -1145,7 +1160,7 @@ locations_user_file_note() {
 	_lun=$(grep -cv '^[[:space:]]*\(#.*\)\{0,1\}$' "$_luf" 2>/dev/null) || _lun=0
 	[ "$_lun" -gt 0 ] || return 0
 	note "$_lun location(s) in $_luf are no longer read -- locations are shared now, add them again as root:"
-	awk -F'\t' 'NF && $1 !~ /^[[:space:]]*#/ { printf "  %s --add %s %s\n", us, $2, $1 }' us="$US" "$_luf" |
+	awk -F'\t' 'NF && $1 !~ /^[[:space:]]*#/ { printf "  %s add %s %s\n", us, $2, $1 }' us="$US" "$_luf" |
 		while IFS= read -r _lul; do minor "${_lul# }"; done
 	return 0
 }
@@ -1162,7 +1177,7 @@ locations_registered() {
 destinations_scan() {
 	## A destination with NO "Mount Point:" line is ejected or otherwise not
 	## attached. tmutil still knows it, and it MUST still be listed: dropping it
-	## would hide exactly the case --status exists for -- a disk that has not
+	## would hide exactly the case status exists for -- a disk that has not
 	## been backed up to for days. Its conventional path stands in as the label
 	## while it is away; nothing reads that path until it is really mounted.
 	tmutil destinationinfo 2>/dev/null | awk '
@@ -1181,7 +1196,7 @@ destinations_scan() {
 ## all locations: registered + (optionally) autodetected + the `local` pseudo
 ## emits: handle <TAB> target <TAB> installdir
 ##
-## Built ONCE per run. A single --status used to rebuild it 35 times -- every
+## Built ONCE per run. A single status used to rebuild it 35 times -- every
 ## handle lookup starts here -- at ~20 ms each (tmutil, the image-scan cache's
 ## age check, a pass of awk per row): 0.7 s of a 1.8 s run. Kept in a FILE in the
 ## run directory, since nearly every caller reaches it through $(...), where a
@@ -1354,8 +1369,8 @@ loc_is_adhoc() {
 ## should not have to ask for. A path is also nobody's registered destination
 ## -- a handle has an owner who chose to carry the cost of opening it, a path
 ## someone typed has not.
-## Opening one is what --refresh, --index, --mount and --verify are for: they
-## name the store they open, and --refresh is what fills this cache.
+## Opening one is what refresh, index, mount and verify are for: they
+## name the store they open, and refresh is what fills this cache.
 ## A store that is ALREADY attached is read live like any other -- the rule is
 ## about opening one, not about the path -- and a path that is a plain
 ## directory costs nothing to read, so neither is refused here.
@@ -1401,7 +1416,7 @@ loc_indexes() {
 }
 
 ## Write ONE field of a location's row. A detected location has no row yet, so
-## this CREATES one -- which is also what makes --forget work for it afterwards.
+## this CREATES one -- which is also what makes forget work for it afterwards.
 ## The caller has already checked that the list is writable.
 ## Field 3 is where my-tm lives on an ssh host, field 4 the INDEX column.
 loc_set_field() {               # <handle> <3|4> <value>
@@ -1516,10 +1531,10 @@ loc_is_remote() { is_remote_target "$(loc_target "$1")"; }
 
 ## Is the host that stores an ssh location actually there? One connection
 ## attempt, no password prompt, short timeout. Answering "yes" without asking
-## is what made --health report "no snapshots found" for a host that was merely
+## is what made health report "no snapshots found" for a host that was merely
 ## switched off -- a wrong answer dressed up as a real one.
 ##
-## Asked ONCE per run per host: a --status asked twice for the same host, at
+## Asked ONCE per run per host: a status asked twice for the same host, at
 ## ~150 ms an ssh login. The answer is kept for the run -- a host that comes up
 ## mid-run is seen by the next one, which for a status is seconds away.
 remote_reachable() {
@@ -1573,7 +1588,7 @@ loc_volume() { loc_store_path "$1"; }
 ## it, in about 10 ms and without asking anything: diskutil info goes through
 ## diskarbitrationd, which usually answers in 0.1 s but blocked for 11 s while
 ## an index walk was reading the same disk -- and that call alone made a
-## --status take 12 s. diskutil stays as the fallback for anything the table
+## status take 12 s. diskutil stays as the fallback for anything the table
 ## does not name. Only a real device line counts: a mounted SNAPSHOT of the same
 ## disk reads "com.apple.TimeMachine....@/dev/disk5s2 on ...".
 vol_device() {
@@ -1927,8 +1942,8 @@ snapshots_scan() {
 snapshots_get() {
 	_h="$1"
 	## A store that is not there cannot be scanned, and its last known table is
-	## the only honest answer. Centrally, so every caller agrees: --status,
-	## --ls, -J and resolving an <ID> must not each decide this differently.
+	## the only honest answer. Centrally, so every caller agrees: status,
+	## ls, -J and resolving an <ID> must not each decide this differently.
 	if ! loc_reachable "$_h"; then
 		snapshots_cached_only "$_h"
 		return 0
@@ -2003,9 +2018,9 @@ snapshots_cache_put() {
 	return 0
 }
 
-## Rows straight from the cache, never scanning: what --status and --ls fall
+## Rows straight from the cache, never scanning: what status and ls fall
 ## back to when the disk is not attached. A location that has gone away must
-## still report its last known state -- that is the whole point of --status.
+## still report its last known state -- that is the whole point of status.
 snapshots_cached_only() {
 	for _d in $(cache_read_dirs); do
 		[ -f "$_d/snapshots.cache" ] || continue
@@ -2087,7 +2102,7 @@ resolve_id() {
 
 ## the friendly "it is gone" message the design asks for
 snapshot_gone() {
-	warn "$1: no such snapshot. Try: $US --ls"
+	warn "$1: no such snapshot. Try: $US ls"
 	exit 1
 }
 
@@ -2853,7 +2868,7 @@ mounts_file() { printf '%s/mounts.cache\n' "$(cache_write_dir)"; }
 ## went while the umount failed, leaves that snapshot mounted for ever. Nothing
 ## says it is there, so nothing ever releases it, and a mounted snapshot is
 ## exactly what blocks Time Machine's thinning. Seen on horse on 2026-09-16
-## after an --index run died: one snapshot pinned, mounts.cache empty.
+## after an index run died: one snapshot pinned, mounts.cache empty.
 ##
 ## MOUNT_ROOT is my-tm's own directory, so a snapshot mounted under it that no
 ## record claims is my-tm's to release.
@@ -2968,7 +2983,7 @@ snap_mount() {
 	if ! snap_names "$_loc" 2>/dev/null | grep -qx "$_ts"; then
 		## Time Machine adds and thins constantly, and local snapshots are
 		## purgeable at any age: a list read a minute ago can already be wrong
-		warn "$(ts_display "$_ts"): gone from '$_loc' since the list was read ($US --refresh $_loc)"
+		warn "$(ts_display "$_ts"): gone from '$_loc' since the list was read ($US refresh $_loc)"
 	else
 		warn "mount failed: $_apfs on $_vol_src${_sm_err:+: $(printf '%s' "$_sm_err" | tr '\n' ' ')}"
 	fi
@@ -3074,7 +3089,7 @@ transient_snapshot() {
 }
 
 #############################################################################
-## THE SWEEP  (maintenance job, and after every --mount)
+## THE SWEEP  (maintenance job, and after every mount)
 #############################################################################
 
 ## Which of the mountpoints on stdin have open files -- ONE lsof for all of
@@ -3136,7 +3151,7 @@ vol_free_pct() {
 	df -k "$1" 2>/dev/null | awk 'NR == 2 { if ($2 > 0) printf "%d\n", ($4 * 100) / $2; else print 100 }'
 }
 
-## Should the sweep leave this mount alone? Only while the --index run that
+## Should the sweep leave this mount alone? Only while the index run that
 ## made it is still ALIVE: kill -9 cannot be trapped, and a dead indexer
 ## would otherwise pin its snapshot against thinning for good.
 indexer_still_running() {
@@ -3264,8 +3279,8 @@ tm_refresh_loc() {
 		{
 			printf 'This location lives on another machine:  %s\n' "$_t"
 			printf 'Its snapshots cannot be browsed from here (that would need sshfs/macFUSE).\n\n'
-			printf '  %s --ls %s              list its snapshots from here (over ssh)\n' "$US" "$_h"
-			printf '  %s --cat|--cp|--open <ID> <PATH>   fetch one file from it (over ssh)\n' "$US"
+			printf '  %s ls %s              list its snapshots from here (over ssh)\n' "$US" "$_h"
+			printf '  %s cat|cp|open <ID> <PATH>   fetch one file from it (over ssh)\n' "$US"
 			printf '  ssh %s              log in, then browse %s/%s/ there\n\n' \
 				"$(remote_host "$_t")" "$FIRMLINK" "$_h"
 			if [ -n "$_idir" ]; then
@@ -3343,7 +3358,7 @@ tm_write_readme() {
 	## Name the firmlink, the path the user types -- not tm_root, which is
 	## $MOUNT_ROOT until the reboot that creates $FIRMLINK. --install runs
 	## BEFORE that reboot, so the text would otherwise be stale the moment it
-	## is reachable, and only --refresh could correct it. Written this way it
+	## is reachable, and only refresh could correct it. Written this way it
 	## is right once, and --install is its only writer.
 	_r="$FIRMLINK"
 	cat <<_EOF | atomic_write "$MOUNT_ROOT/README" 2>/dev/null
@@ -3356,8 +3371,8 @@ Time Machine snapshots, browsable as ordinary directories.
 A snapshot directory is EMPTY until that snapshot is mounted -- the listing
 tells you which backups exist, my-tm fills one in when you ask for it:
 
-  my-tm --mount <ID> 20m      mount it for twenty minutes
-  my-tm --ls <location>       what is in there
+  my-tm mount <ID> 20m      mount it for twenty minutes
+  my-tm ls <location>       what is in there
   my-tm <path>                every version of a file, and where
 
 A mounted snapshot cannot be deleted, so Time Machine's thinning stops against
@@ -3369,7 +3384,7 @@ _EOF
 #############################################################################
 ## THE VERSION STORE
 ##   Snapshots are immutable, so a (path, snapshot) stat is a permanent fact:
-##   never invalidated, only ever added to.  --lookup answers from here without
+##   never invalidated, only ever added to.  lookup answers from here without
 ##   mounting, and files in what it had to read live.
 ##     loc <TAB> ts <TAB> path <TAB> inode <TAB> size <TAB> mtime
 ##   inode "-" means: verified absent from that snapshot.
@@ -3390,7 +3405,7 @@ _EOF
 ## a single-path query decompresses ~140 KB instead of 35 MB.
 ##
 ## Each delta is taken against its neighbour IN TIME, never against the walk
-## before it: --index --all fills in older snapshots after newer ones are
+## before it: index --all fills in older snapshots after newer ones are
 ## indexed, and a lookup replays the deltas by name. A snapshot walked out of
 ## order therefore rewrites the delta of the one after it (or becomes the new
 ## baseline), in a hard-linked copy of the store that is swapped in whole.
@@ -3890,7 +3905,7 @@ index_writable() {
 }
 
 ## The locate build tools ship in /usr/libexec and are NOT on PATH. Calling
-## them by bare name exits 127, which would leave --index cheerfully
+## them by bare name exits 127, which would leave index cheerfully
 ## reporting success while building nothing at all.
 locate_tool() {
 	if command -v "$1" >/dev/null 2>&1; then
@@ -3930,7 +3945,7 @@ index_waiting_file() { printf '%s/%s.waiting\n' "$(index_dir)" "$1"; }
 ## daemon indexing the backup that just finished -- and both looking for the
 ## first name that does not exist lets both pick it: one increment then
 ## overwrites the other while .covered says both snapshots are indexed, so
-## --find quietly loses the paths of one of them. noclobber makes the create
+## find quietly loses the paths of one of them. noclobber makes the create
 ## atomic, so the loser takes the next number instead.
 index_claim_increment() {
 	_ici_n=0
@@ -3945,7 +3960,7 @@ index_claim_increment() {
 	return 1
 }
 
-## How long an --index run has been waiting for a Time Machine backup, or
+## How long an index run has been waiting for a Time Machine backup, or
 ## nothing when none is. The marker carries the waiter's pid, and ps answers
 ## for it rather than kill -0: the indexer runs as root, and kill -0 from
 ## anyone else answers "not permitted", which reads exactly like "not running".
@@ -3977,7 +3992,7 @@ index_covered_list() {
 	printf ' %s\n' "$(unique_cache_dump "$1" | awk 'NF {printf "%s ", $1}')"
 }
 
-## The snapshot an --index run is walking for LOCATION right now, as
+## The snapshot an index run is walking for LOCATION right now, as
 ## "<ts> <seconds-in>", or nothing. Read from the mount records: an indexer
 ## mount whose process is still alive -- the same test the sweep makes.
 index_in_progress() {
@@ -4075,7 +4090,7 @@ index_wait_for_backup() {
 	_iwb_poll=$(parse_interval "${INDEX_BACKUP_POLL:-5m}") || _iwb_poll=300
 	[ "$_iwb_poll" -ge 1 ] || _iwb_poll=1
 	warn "$1: a Time Machine backup is running -- waiting for it to finish before the next snapshot, so the walk does not block its thinning. Ctrl-C is safe."
-	## so --status can say "waiting" instead of "idle": nothing is mounted
+	## so status can say "waiting" instead of "idle": nothing is mounted
 	## during the wait, which is the state it otherwise reads that from
 	printf '%s %s\n' "$$" "$_iwb_w0" >"$(index_waiting_file "$1")" 2>/dev/null
 	while tm_backup_running; do
@@ -4131,7 +4146,7 @@ index_mark_covered() {
 }
 
 #############################################################################
-## --status
+## status
 #############################################################################
 
 ## An empty cell is a question -- why is there nothing, and what can I do about
@@ -4213,7 +4228,7 @@ cmd_status() {
 	fi
 	_ix_lines=""
 	_locs=$(locations_all)
-	[ -n "$_locs" ] || { note "no locations. Add one: $US --add <FOLDER> [<HANDLE>]"; return 0; }
+	[ -n "$_locs" ] || { note "no locations. Add one: $US add <FOLDER> [<HANDLE>]"; return 0; }
 
 	## Open every store BEFORE the table starts: mounting one prints a line, and
 	## a line printed between the header and a row splits the table in half.
@@ -4266,9 +4281,9 @@ _EOF
 				dbg "status: '$_h' unchanged since its table was read"
 			elif [ -n "$_rows" ]; then
 				_mark="?"
-				status_qmark "?" "the table as last read -- the sparsebundle is not attached. To see it live: $US --ls $_h$(status_open_cost "$_t")"
+				status_qmark "?" "the table as last read -- the sparsebundle is not attached. To see it live: $US ls $_h$(status_open_cost "$_t")"
 			else
-				status_footnote "nothing has been read from it yet, and a status never attaches a sparsebundle -- it would take minutes. Read it once with: $US --ls $_h$(status_open_cost "$_t")"
+				status_footnote "nothing has been read from it yet, and a status never attaches a sparsebundle -- it would take minutes. Read it once with: $US ls $_h$(status_open_cost "$_t")"
 				_mark="$FN_MARK"
 			fi
 		elif loc_ready "$_h"; then
@@ -4278,18 +4293,18 @@ _EOF
 				if is_remote_target "$_t" && [ -n "$_rerr" ]; then
 					status_footnote "reading it on $(remote_host "$_t") failed: $_rerr -- my-tm may have moved there, as root: $US --install $(remote_host "$_t") go"
 				elif is_remote_target "$_t"; then
-					status_footnote "$(remote_host "$_t") has not read it yet, and a status never makes it open the store -- it could take minutes there. Read it once with: $US --ls $_h"
+					status_footnote "$(remote_host "$_t") has not read it yet, and a status never makes it open the store -- it could take minutes there. Read it once with: $US ls $_h"
 				elif [ "$_t" = "local" ]; then
-					status_footnote "this Mac keeps no local snapshots right now -- Time Machine makes them only while backing THIS Mac up, and a Mac that is just a backup target has none. my-tm can take them itself: $US --local-snap takes one now, LOCAL_SNAP_INTERVAL=1h in the config keeps taking them"
+					status_footnote "this Mac keeps no local snapshots right now -- Time Machine makes them only while backing THIS Mac up, and a Mac that is just a backup target has none. my-tm can take them itself: $US local-snap takes one now, LOCAL_SNAP_INTERVAL=1h in the config keeps taking them"
 				else
-					status_footnote "the store is readable but holds no backups yet -- Time Machine has not written one here. $US --backup runs one"
+					status_footnote "the store is readable but holds no backups yet -- Time Machine has not written one here. $US backup runs one"
 				fi
 				_mark="$FN_MARK"
 			fi
 		else
 			## not attached (ejected, unplugged, network destination): show the
 			## last known table marked "?", never nothing -- a disk that has not
-			## been written to for weeks is the thing --status exists to surface
+			## been written to for weeks is the thing status exists to surface
 			_rows=$(snapshots_cached_only "$_h")
 			if [ -n "$_rows" ]; then
 				_mark="?"
@@ -4299,10 +4314,10 @@ _EOF
 					status_qmark "?" "the table as last read -- the destination is not attached; attach it (or mount it) and it is read live"
 				fi
 			elif is_remote_target "$_t"; then
-				status_footnote "$(remote_host "$_t") is not answering, and nothing was ever read from it -- try again when that Mac is up, or: $US --ls $_h"
+				status_footnote "$(remote_host "$_t") is not answering, and nothing was ever read from it -- try again when that Mac is up, or: $US ls $_h"
 				_mark="$FN_MARK"
 			else
-				status_footnote "the destination is not attached and nothing was ever read from it -- plug it in (or mount it), then: $US --ls $_h"
+				status_footnote "the destination is not attached and nothing was ever read from it -- plug it in (or mount it), then: $US ls $_h"
 				_mark="$FN_MARK"
 			fi
 		fi
@@ -4380,12 +4395,12 @@ _EOF
 			if [ -f "$JOBS_DIR/$MAINT_JOB.plist" ]; then
 				_ixs="$_ixs · new backups follow automatically"
 			else
-				_ixs="$_ixs · new backups: $US --index $_h"
+				_ixs="$_ixs · new backups: $US index $_h"
 			fi
 			if [ "$_snaps" != "-" ]; then
 				_rest=$(( _snaps - _ncov ))
 				[ -n "$_prog" ] && _rest=$(( _rest - 1 ))
-				[ "$_rest" -gt 0 ] && _ixs="$_ixs · $_rest more only with: $US --index $_h --all"
+				[ "$_rest" -gt 0 ] && _ixs="$_ixs · $_rest more only with: $US index $_h --all"
 			fi
 			_ix_lines="$_ix_lines
 $_h index: $_ixs"
@@ -4393,7 +4408,7 @@ $_h index: $_ixs"
 			_ixd="no"
 		fi
 		## what the index costs here, whatever INDEXED says: a location that was
-		## --no-index'ed keeps its index, and still takes the space
+		## no-index'ed keeps its index, and still takes the space
 		_ixb=$(index_loc_bytes "$_h")
 		_ixsz="-"; _ixper="-"
 		if [ "$_ixb" -gt 0 ]; then
@@ -4494,8 +4509,8 @@ _EOF
 	done
 	## named for the columns it explains: INDEX and PER SNAP are empty for these
 	## locations for this reason, which is the last unexplained "-" in the table
-	[ -n "$_ix_off" ] && note "not indexed (so INDEX and PER SNAP are -):${_ix_off} -- index one: $US --index <LOCATION>"
-	[ -n "$_ix_on" ] && note "indexed:${_ix_on} -- $US --no-index <LOCATION> stops, --rm-index <LOCATION> also deletes"
+	[ -n "$_ix_off" ] && note "not indexed (so INDEX and PER SNAP are -):${_ix_off} -- index one: $US index <LOCATION>"
+	[ -n "$_ix_on" ] && note "indexed:${_ix_on} -- $US no-index <LOCATION> stops, rm-index <LOCATION> also deletes"
 
 	## growth, only once the series says something
 	printf '%s\n' "$_locs" | awk -F'\t' '{print $1}' | while IFS= read -r _th; do
@@ -4517,7 +4532,7 @@ _EOF
 }
 
 #############################################################################
-## --ls
+## ls
 #############################################################################
 
 ## Print TAB-separated rows as columns sized to their WIDEST cell. Fixed printf
@@ -4579,7 +4594,7 @@ json_ls() {
 		_cached=false
 		loc_ready "$_h" 2>/dev/null || _cached=true
 		## --cached opens NOTHING, in JSON as on a terminal: this is the form a
-		## status on another Mac asks for (my-tm -J --cached --ls <path>), and
+		## status on another Mac asks for (my-tm -J --cached ls <path>), and
 		## reading it live there attached a sparsebundle for minutes -- the very
 		## wait --cached exists to prevent
 		if [ "${OPT_CACHED:-0}" = "1" ]; then
@@ -4655,11 +4670,11 @@ cmd_ls() {
 			## opposite of the truth -- the disk may simply be detached.
 			if [ -n "$_only" ]; then
 				if [ "$_cached_only" = "1" ]; then
-					note "$_h: nothing has been read from it yet -- $US --ls $_h opens it once"
+					note "$_h: nothing has been read from it yet -- $US ls $_h opens it once"
 				elif [ "$_bypath" = "1" ]; then
-					note "$_h: not attached, and nothing is remembered about it -- a store named by PATH is never opened by a read. To open it: $US --refresh $(loc_target "$_h")"
+					note "$_h: not attached, and nothing is remembered about it -- a store named by PATH is never opened by a read. To open it: $US refresh $(loc_target "$_h")"
 				elif [ "$_detached" = "1" ]; then
-					note "$_h is not attached, and nothing is remembered about it yet -- attach it, then: $US --refresh $_h"
+					note "$_h is not attached, and nothing is remembered about it yet -- attach it, then: $US refresh $_h"
 				else
 					note "$_h has no snapshots"
 				fi
@@ -4734,7 +4749,7 @@ _EOF
 }
 
 #############################################################################
-## --lookup
+## lookup
 ##   Covered snapshots come from the version store with no mount at all.  The
 ##   rest are mounted, stat'ed in ONE exec for all of them, released, and filed.
 #############################################################################
@@ -5004,7 +5019,7 @@ _EOF
 }
 
 #############################################################################
-## --find
+## find
 #############################################################################
 
 cmd_find() {
@@ -5044,13 +5059,13 @@ _EOF
 		## "no match" is only true of what was searched: a store with no index
 		## was not searched at all, and saying "no match" about it is a lie
 		if [ -n "$_noidx" ]; then
-			note "not indexed here, so not searched:${_noidx} -- index one: $US --index <LOCATION>"
+			note "not indexed here, so not searched:${_noidx} -- index one: $US index <LOCATION>"
 			return 0
 		fi
 		_l=$(printf '%s\n' "$_locs" | head -n 1)
 		_cov=$(index_covered_count "$_l")
 		_tot=$(snapshots_get "$_l" 2>/dev/null | count_lines)
-		note "no match · index covers $_cov/$_tot snapshots ($US --index $_l)"
+		note "no match · index covers $_cov/$_tot snapshots ($US index $_l)"
 		return 0
 	fi
 
@@ -5076,12 +5091,12 @@ _EOF
 		note "$(( _n - _max )) more (--all) · $US <path> for the version table"
 	## the hits are only from what WAS searched -- say what was not
 	[ -n "$_noidx" ] &&
-		note "not indexed here, so not searched:${_noidx} -- index one: $US --index <LOCATION>"
+		note "not indexed here, so not searched:${_noidx} -- index one: $US index <LOCATION>"
 	rm -f "$_hits"
 	return 0
 }
 
-## --find <ID> <GLOB>: a live walk of one snapshot, no index involved
+## find <ID> <GLOB>: a live walk of one snapshot, no index involved
 cmd_find_in_snapshot() {
 	_hit="$1"; _glob="$2"
 	_loc=$(printf '%s' "$_hit" | awk -F'\t' '{print $1}')
@@ -5097,7 +5112,7 @@ cmd_find_in_snapshot() {
 }
 
 #############################################################################
-## --show
+## show
 #############################################################################
 
 cmd_show() {
@@ -5129,19 +5144,19 @@ cmd_show() {
 		printf '%-10s %s\n' VOLUME "$_vol"
 		printf '%-10s %s\n' STATE "${_state:-ok}"
 		## only advertise the browsable path when it is really there: a tree
-		## that --refresh has never built is a path that does not exist
+		## that refresh has never built is a path that does not exist
 		_browse="$(tm_root)/$_loc/$_ts/$_vol"
 		if [ -e "$_browse" ]; then
 			printf '%-10s %s\n' BROWSE "$_browse"
 		elif [ -L "$_browse" ] || [ -d "$(dirname "$_browse")" ]; then
 			## the tree entry is there; it is simply not mounted yet
-			printf '%-10s %s  (%s --mount %s <TTL> to fill it)\n' \
+			printf '%-10s %s  (%s mount %s <TTL> to fill it)\n' \
 				BROWSE "$_browse" "$US" "$_id"
 		else
 			_why=""
 			( jobs_blind_on "$_loc" ) &&
 				_why="; the jobs cannot see into network volumes -- JOBS_RUN_WITH_FULL_DISK_ACCESS=1 keeps it built"
-			printf '%-10s %s  (%s --refresh %s to build the tree%s)\n' \
+			printf '%-10s %s  (%s refresh %s to build the tree%s)\n' \
 				BROWSE "$_browse" "$US" "$_loc" "$_why"
 		fi
 		return 0
@@ -5215,7 +5230,7 @@ notify() {
 }
 
 #############################################################################
-## --mount / --umount
+## mount / umount
 #############################################################################
 
 ## the destination's configured backup interval, in seconds
@@ -5258,8 +5273,8 @@ ttl_sanity_warn() {
 
 cmd_mount() {
 	_what="${1:-}"; _ttl_s="${2:-}"; _where="${3:-}"
-	[ -n "$_what" ] || err "--mount needs <ID>|<LOCATION>|--all and a <TTL> (7m / 4h / 2d). See --mount --help"
-	[ -n "$_ttl_s" ] || err "--mount needs a <TTL>: how long you need it (7m / 4h / 5h3m / 2d). It is asked for because a mounted snapshot cannot be deleted -- see --mount --help"
+	[ -n "$_what" ] || err "mount needs <ID>|<LOCATION>|--all and a <TTL> (7m / 4h / 2d). See mount --help"
+	[ -n "$_ttl_s" ] || err "mount needs a <TTL>: how long you need it (7m / 4h / 5h3m / 2d). It is asked for because a mounted snapshot cannot be deleted -- see mount --help"
 	_ttl=$(parse_ttl "$_ttl_s") ||
 		err "'$_ttl_s' is not a TTL. Use <N>m, <N>h or <N>d, combinable: 7m / 4h / 5h3m / 2d"
 	[ -n "$_ttl" ] ||
@@ -5335,7 +5350,7 @@ cmd_umount() {
 		if [ "$FORCE" != "1" ] && printf '%s\n' "$_busy" | grep -qxF "$_mp" 2>/dev/null; then
 			warn "$_mp is busy:"
 			lsof -n -P -- "$_mp" 2>/dev/null | head -n 5 >&2
-			warn "still needed? leave it. Otherwise: $US --umount -f $_what"
+			warn "still needed? leave it. Otherwise: $US umount -f $_what"
 			continue
 		fi
 		case "${_flags:-}" in
@@ -5363,7 +5378,7 @@ cmd_umount() {
 }
 
 #############################################################################
-## --open / --cat / --cp / --diff
+## open / cat / cp / diff
 #############################################################################
 
 ## resolve <ID> <PATH> to a live filesystem path inside a transient mount
@@ -5395,10 +5410,10 @@ cmd_cat() {
 	if loc_is_remote "$_loc"; then
 		_t=$(loc_target "$_loc")
 		_ts=$(printf '%s' "$_i" | awk -F'\t' '{print $2}')
-		## TWO arguments: the remote's --cat is <ID> <PATH>, and one string
+		## TWO arguments: the remote's cat is <ID> <PATH>, and one string
 		## with the two run together is neither. The path is the one inside the
 		## volume, so the remote resolves it against its own mountpoint.
-		remote_job "$_loc" --cat "$_ts" "$_rel" && return 0
+		remote_job "$_loc" cat "$_ts" "$_rel" && return 0
 		err "remote cat failed"
 	fi
 	[ -f "$_full" ] || err "$_rel: not in that snapshot"
@@ -5480,17 +5495,17 @@ cmd_diff() {
 }
 
 #############################################################################
-## --index
+## index
 #############################################################################
 
 cmd_index() {
 	## check the toolchain BEFORE walking anything: discovering it is missing
 	## after a twenty-minute walk would be a poor way to find out
 	locate_tool locate.mklocatedb >/dev/null ||
-		err "locate.mklocatedb not found (looked on PATH and in /usr/libexec). The name index --find uses cannot be built without it."
+		err "locate.mklocatedb not found (looked on PATH and in /usr/libexec). The name index find uses cannot be built without it."
 	_targets="$*"
 	_iw_all=""; [ "${OPT_ALL:-0}" = "1" ] && _iw_all=" --all"
-	index_writable "--index${_targets:+ $_targets}$_iw_all"
+	index_writable "index${_targets:+ $_targets}$_iw_all"
 	## drop what has been thinned away since the last run, before adding more
 	for _ph in $(locations_all | awk -F'\t' '$2 != "local" || 1 {print $1}'); do
 		loc_reachable "$_ph" && vs_prune "$_ph"
@@ -5504,7 +5519,7 @@ cmd_index() {
 			( loc_indexes "$_t" ) && _locs="$_locs $_t"
 		done
 		if [ -z "$_locs" ]; then
-			note "nothing is indexed -- $US --index <LOCATION> opts one in"
+			note "nothing is indexed -- $US index <LOCATION> opts one in"
 			return 0
 		fi
 	else
@@ -5525,10 +5540,10 @@ cmd_index() {
 		done
 		if [ -n "$_optin" ]; then
 			## built as " h1 h2", so it already reads as arguments
-			locations_writable "--index$_optin"
+			locations_writable "index$_optin"
 			for _t in $_optin; do
 				loc_set_index "$_t" 1 &&
-					msg "$_t: indexed from now on ($US --no-index $_t stops it)"
+					msg "$_t: indexed from now on ($US no-index $_t stops it)"
 			done
 		fi
 	fi
@@ -5582,23 +5597,23 @@ _EOF
 	return 0
 }
 
-## Stop indexing a location, keeping what it has. Separate from --rm-index
+## Stop indexing a location, keeping what it has. Separate from rm-index
 ## because the two answers to "stop" are different: an index that is no longer
-## updated still answers --find for the snapshots it covers.
+## updated still answers find for the snapshots it covers.
 cmd_no_index() {
-	[ "$#" -ge 1 ] || err "--no-index needs a <LOCATION>"
+	[ "$#" -ge 1 ] || err "no-index needs a <LOCATION>"
 	_nxs=""
 	for _nx in "$@"; do
 		_nh=$(loc_resolve "$_nx") || err "$(no_such_location "$_nx")"
 		_nxs="$_nxs $_nh"
 	done
-	locations_writable "--no-index$_nxs"
+	locations_writable "no-index$_nxs"
 	for _nx in $_nxs; do
 		loc_set_index "$_nx" 0 || err "$_nx: could not write the location list"
 		_nx_c=$(index_covered_count "$_nx")
 		if [ "$_nx_c" -gt 0 ]; then
-			msg "$_nx: no longer indexed -- the $_nx_c snapshot(s) it covers still answer $US --find"
-			why "$US --rm-index $_nx deletes them too"
+			msg "$_nx: no longer indexed -- the $_nx_c snapshot(s) it covers still answer $US find"
+			why "$US rm-index $_nx deletes them too"
 		else
 			msg "$_nx: no longer indexed"
 		fi
@@ -5608,14 +5623,14 @@ cmd_no_index() {
 
 ## Stop indexing a location AND delete what it has.
 cmd_rm_index() {
-	[ "$#" -ge 1 ] || err "--rm-index needs a <LOCATION>"
+	[ "$#" -ge 1 ] || err "rm-index needs a <LOCATION>"
 	_rxs=""
 	for _rx in "$@"; do
 		_rh=$(loc_resolve "$_rx") || err "$(no_such_location "$_rx")"
 		_rxs="$_rxs $_rh"
 	done
-	locations_writable "--rm-index$_rxs"
-	index_writable "--rm-index$_rxs"
+	locations_writable "rm-index$_rxs"
+	index_writable "rm-index$_rxs"
 	for _rx in $_rxs; do
 		_rx_c=$(index_covered_count "$_rx")
 		loc_set_index "$_rx" 0 || err "$_rx: could not write the location list"
@@ -5673,7 +5688,7 @@ index_one() {
 
 	## NOTHING below may run on a partial walk: the version store would record
 	## a delta that is missing paths, and index_mark_covered would close this
-	## snapshot for good -- --find would answer from half of it, for ever.
+	## snapshot for good -- find would answer from half of it, for ever.
 	## Leaving it unindexed costs one more walk; the next run resumes here.
 	_wrc=$(cat "$_walkrc" 2>/dev/null); rm -f "$_walkrc"
 	_gone=0
@@ -5682,7 +5697,7 @@ index_one() {
 	[ "$_gone" = "1" ] && _why="'$_h' is no longer reachable"
 	[ -z "$_why" ] && [ "${_wrc:-1}" != "0" ] && _why="find exited ${_wrc:-?}"
 	if [ -n "$_why" ]; then
-		warn "$_ts: the walk did not finish ($_why) -- the snapshot stays unindexed, so the next --index walks it again"
+		warn "$_ts: the walk did not finish ($_why) -- the snapshot stays unindexed, so the next index walks it again"
 		rm -f "$_stats" "$_paths"
 		snap_umount "$_mp" >/dev/null 2>&1
 		## the disk being gone is not this snapshot's problem: 3 stops the walk
@@ -5700,7 +5715,7 @@ index_one() {
 
 	## Only what this snapshot ADDS to the union goes into its increment: every
 	## path it holds is either a real row of its delta or already in the indexed
-	## snapshot before it, and --find asks the union. A full list per snapshot
+	## snapshot before it, and find asks the union. A full list per snapshot
 	## was ~57 MB each. The baseline has no delta, so its list is whole.
 	_dlt="$(vs_dir "$_h")/d.$_ts.tsv.gz"
 	if [ "$_vs_rc" = 0 ] && [ -f "$_dlt" ]; then
@@ -5775,7 +5790,7 @@ index_remote() {
 	_t=$(loc_target "$_h")
 	_rhost=$(remote_host "$_t")
 	msg "indexing '$_h' on $_rhost (the walk stays where the disk is)"
-	remote_job "$_h" --index "$(remote_path "$_t")" || return 1
+	remote_job "$_h" index "$(remote_path "$_t")" || return 1
 	if [ "${SHADOW_SSH_INDEX_FILES:-1}" = "1" ]; then
 		_dir=$(index_dir); need_dir "$_dir"
 		run scp_batch "$_rhost:$CACHE_DIR/index/*.db" "$_dir/" 2>/dev/null ||
@@ -5890,20 +5905,20 @@ remote_snap_names() {
 	## it is never in doubt which machine is talking.
 	## A status asks for what the far side already knows, and nothing more: its
 	## own rule is to never open a store for a status line, and asking a remote
-	## to --ls would make it open one there -- a status on horse once waited
-	## 2m46s for ada to attach a sparsebundle. --cached comes BEFORE --ls, so a
+	## to ls would make it open one there -- a status on horse once waited
+	## 2m46s for ada to attach a sparsebundle. --cached comes BEFORE ls, so a
 	## remote too old to know it refuses the call rather than opening anyway.
 	_rsn_c=""
 	[ "${STATUS_READ:-0}" = "1" ] && _rsn_c="--cached"
 	## A read that FAILED is not a store nobody has read yet, and saying so
-	## sent the reader to "--ls it once" while the truth was that my-tm was no
+	## sent the reader to "ls it once" while the truth was that my-tm was no
 	## longer at the recorded path there. The status is kept, and the first
 	## thing the far side complained about, for whoever asks next.
 	## in $RUN_DIR, not a variable: the caller reads the table in a command
 	## substitution, and a subshell's variables never reach it
 	rm -f "$(remote_read_err_file "$1")"
 	_rsn_rc="$_rsn_out.rc"; _rsn_err="$_rsn_out.err"
-	{ remote_run "$1" -J $_rsn_c --ls "$(remote_path "$_t")" 2>&1 >"$_rsn_out"
+	{ remote_run "$1" -J $_rsn_c ls "$(remote_path "$_t")" 2>&1 >"$_rsn_out"
 	  printf '%s\n' "$?" >"$_rsn_rc"
 	} | LC_ALL=C awk -v h="$_rsn_host" -v raw="$_rsn_err" '{
 			line = $0; sub(/^[[:space:]]*(>>>|>>|~~~|-->|!!!|>|~)[[:space:]]?/, "", line)
@@ -5926,7 +5941,7 @@ remote_snap_names() {
 }
 
 #############################################################################
-## --verify
+## verify
 #############################################################################
 
 cmd_verify() {
@@ -5976,7 +5991,7 @@ cmd_verify() {
 }
 
 #############################################################################
-## --local-snapshot
+## local-snapshot
 #############################################################################
 
 cmd_local_snap() {
@@ -6014,7 +6029,7 @@ _EOF
 }
 
 #############################################################################
-## --health
+## health
 #############################################################################
 
 HEALTH_RC=0
@@ -6047,17 +6062,17 @@ health_is_headless() {
 	return 0
 }
 
-## " (+3 more: my-tm --health)" when the run found more than the one problem
+## " (+3 more: my-tm health)" when the run found more than the one problem
 ## being named. A count alone told the reader there was more and not where it
 ## was: a notification cannot be scrolled, so it names the command that lists
 ## every one of them.
 health_more() {
 	_hm=$(( HEALTH_PROBLEMS - 1 ))
-	[ "$_hm" -gt 0 ] && printf ' (+%s more: %s --health)' "$_hm" "$US"
+	[ "$_hm" -gt 0 ] && printf ' (+%s more: %s health)' "$_hm" "$US"
 	return 0
 }
 
-## A silent failure is what --health exists to catch, so a run whose output
+## A silent failure is what health exists to catch, so a run whose output
 ## nobody will read says it where a person will see it. The first problem goes
 ## in VERBATIM: "1 problem" is not something anyone can act on.
 health_notify_headless() {
@@ -6070,7 +6085,7 @@ health_notify_headless() {
 	return 0
 }
 
-## Which locations a --health run covers. LOCAL used to be a synonym for ALL,
+## Which locations a health run covers. LOCAL used to be a synonym for ALL,
 ## so a daemon run here reached across the network on every single run.
 health_locations() {
 	case "${HEALTH_LOCATIONS:-}" in
@@ -6189,7 +6204,7 @@ _EOF
 	## and the other way round: they live ON the boot volume, so a pile that
 	## never gets trimmed is a startup disk filling up
 	[ "$_lsn" -gt "$(( ${LOCAL_SNAP_MAX:-48} * 2 ))" ] &&
-		health_say warn "$_lsn local APFS snapshots on / (LOCAL_SNAP_MAX $LOCAL_SNAP_MAX) -- they take space on the boot volume ($US --local-snap trims to the cap)"
+		health_say warn "$_lsn local APFS snapshots on / (LOCAL_SNAP_MAX $LOCAL_SNAP_MAX) -- they take space on the boot volume ($US local-snap trims to the cap)"
 
 	## paths that MUST be backed up
 	if [ -n "$HEALTH_WATCH_PATHS" ]; then
@@ -6209,7 +6224,7 @@ _EOF
 	## a mount that outlived its TTL and could not be released
 	_stale=$(mounts_read_all | awk -F'\t' -v now="$_now" '$4 + $5 < now' | count_lines)
 	[ "$_stale" -gt 0 ] &&
-		health_say warn "$_stale mount(s) past their TTL -- a mounted snapshot blocks thinning ($US --umount --all)"
+		health_say warn "$_stale mount(s) past their TTL -- a mounted snapshot blocks thinning ($US umount --all)"
 
 	## checksums, only for the paths the user named
 	if [ -n "$HEALTH_VERIFY" ]; then
@@ -6240,9 +6255,9 @@ _EOF
 	## that would have needed it
 	if ! has_full_disk_access; then
 		if [ "${JOBS_RUN_WITH_FULL_DISK_ACCESS:-0}" = "1" ]; then
-			health_say warn "no Full Disk Access: --rm, --verify and Time Machine's own listings will fail. Grant it in System Settings > Privacy & Security > Full Disk Access -- to your terminal, or for the jobs to $JOBS_LAUNCHER"
+			health_say warn "no Full Disk Access: rm, verify and Time Machine's own listings will fail. Grant it in System Settings > Privacy & Security > Full Disk Access -- to your terminal, or for the jobs to $JOBS_LAUNCHER"
 		else
-			health_say warn "no Full Disk Access: --rm, --verify and Time Machine's own listings will fail. Grant it in System Settings > Privacy & Security > Full Disk Access, to the program that runs my-tm (your terminal, or the job binary)"
+			health_say warn "no Full Disk Access: rm, verify and Time Machine's own listings will fail. Grant it in System Settings > Privacy & Security > Full Disk Access, to the program that runs my-tm (your terminal, or the job binary)"
 		fi
 	else
 		health_say ok "Full Disk Access is granted"
@@ -6257,7 +6272,7 @@ _EOF
 	if [ -n "$HEALTH_VERIFY" ] && [ "${JOBS_RUN_WITH_FULL_DISK_ACCESS:-0}" != "1" ] && ! has_full_disk_access; then
 		health_say hint "HEALTH_VERIFY needs Full Disk Access in the jobs -- JOBS_RUN_WITH_FULL_DISK_ACCESS=1"
 	fi
-	_lufh=$(locations_user_file) && health_say warn "$_lufh is no longer read -- locations are shared now ($US --status lists what to add again as root)"
+	_lufh=$(locations_user_file) && health_say warn "$_lufh is no longer read -- locations are shared now ($US status lists what to add again as root)"
 
 	## my-tm's own tree, which --install excludes
 	if ! tmutil isexcluded "$CACHE_DIR" 2>/dev/null | grep -q '\[Excluded\]'; then
@@ -6284,7 +6299,7 @@ _EOF
 }
 
 #############################################################################
-## --rm   (snapshots; forgetting a location is --forget)
+## rm   (snapshots; forgetting a location is forget)
 #############################################################################
 
 ## Deleting a snapshot happens where the store is. `tmutil delete` run HERE
@@ -6304,7 +6319,7 @@ cmd_rm() {
 			*)  _ids="$_ids $_a" ;;
 		esac
 	done
-	[ -n "$_ids" ] || err "--rm needs one or more <ID> and the literal word go"
+	[ -n "$_ids" ] || err "rm needs one or more <ID> and the literal word go"
 
 	_plan=$(tmp_file rm) || return 1
 	for _w in $_ids; do
@@ -6313,7 +6328,7 @@ cmd_rm() {
 		_loc=$(printf '%s' "$_hit" | awk -F'\t' '{print $1}')
 		_ts=$(printf '%s' "$_hit" | awk -F'\t' '{print $2}')
 		_id=$(printf '%s' "$_hit" | awk -F'\t' '{print $3}')
-		refuse_remote_delete "$_loc" --rm
+		refuse_remote_delete "$_loc" rm
 		## The cache is an index, never the authority for a destructive call, so
 		## the store itself is asked. But "I cannot see the store" is NOT "the
 		## snapshot is gone": saying so about a detached disk would report a
@@ -6403,7 +6418,7 @@ snapshots_cache_drop() {
 }
 
 #############################################################################
-## --thin   (selection only; the deleting is --rm's job)
+## thin   (selection only; the deleting is rm's job)
 #############################################################################
 
 ## policy -> keep/del decision per snapshot.
@@ -6493,7 +6508,7 @@ cmd_thin() {
 		## named explicitly -> refuse and say where to run it; swept over as
 		## part of "every location" -> pass it by, it is not this Mac's to thin
 		if loc_is_remote "$_h"; then
-			[ -n "$_loc" ] && refuse_remote_delete "$_h" --thin
+			[ -n "$_loc" ] && refuse_remote_delete "$_h" thin
 			dbg "$_h is on another host -- it thins its own store"
 			continue
 		fi
@@ -6540,7 +6555,7 @@ _EOF
 }
 
 #############################################################################
-## --backup   (what my-tm.sh used to do)
+## backup   (what my-tm.sh used to do)
 #############################################################################
 
 backup_cleanup() {
@@ -6668,7 +6683,7 @@ backup_leftovers_hint() {
 	[ -n "$_bl_v" ] && [ -d "$_bl_d" ] || return 0
 	_bl_n=$(find "$_bl_d" -maxdepth 1 \( -name '*.inprogress' -o -name '*.interrupted' \) 2>/dev/null | count_lines)
 	[ "$_bl_n" -gt 0 ] || return 0
-	note "$_bl_n interrupted leftover(s) on $_bl_v -- Time Machine refuses the store until they are gone ($US --health lists them)"
+	note "$_bl_n interrupted leftover(s) on $_bl_v -- Time Machine refuses the store until they are gone ($US health lists them)"
 	return 0
 }
 
@@ -6717,6 +6732,26 @@ do_post_backup() {
 	return 1
 }
 
+## Hand a backup to my-tm's OWN launchd job and return at once.
+##
+## The work must not run as a child of whoever asked for it. A backup started
+## that way had its `--block` never return and nothing after it ran -- the note
+## above the launchctl pair in my-network-change_macos.sh records exactly that,
+## and the unload/load there was imitating what `kickstart` does properly.
+##
+## NOT `kickstart -k`: -k kills a running instance first, which for a backup
+## means killing the backup you were asking for.
+cmd_trigger() {
+	_tr_job="${BACKUP_JOB:-}"
+	[ -n "$_tr_job" ] || err "no backup job is configured (BACKUP_JOB)"
+	[ -f "$JOBS_DIR/$_tr_job.plist" ] ||
+		err "$_tr_job is not installed, so there is nothing to ask -- $US --install writes it"
+	run launchctl kickstart "system/$_tr_job" ||
+		err "could not ask $_tr_job to run a backup (launchctl kickstart)"
+	msg "asked $_tr_job to run a backup now"
+	why "it runs as its own launchd job, so this returns at once and the backup outlives this process"
+}
+
 cmd_backup() {
 	_action="${1:-}"
 	shift 2>/dev/null || true
@@ -6737,9 +6772,9 @@ cmd_backup() {
 	case "$_action" in
 		start|stop) : ;;
 		"") return 0 ;;
-		*) err "--backup takes start or stop" ;;
+		*) err "backup takes start or stop" ;;
 	esac
-	require_root "--backup"
+	require_root "backup"
 
 	if [ -e "$LOCKFILE" ]; then
 		err "$LOCKFILE exists -- another run is in progress." 2
@@ -6812,7 +6847,7 @@ cmd_backup() {
 }
 
 #############################################################################
-## --add / --forget / --refresh
+## add / forget / refresh
 #############################################################################
 
 ## What a sparsebundle can say about itself WITHOUT being attached -- which is
@@ -6868,7 +6903,7 @@ add_pick() {
 			if [ "$_pk_asked" = "0" ]; then
 				note "$_pk_n Time Machine backups here, and nothing to answer with; add one by name:"
 				printf '%s\n' "$_pk_list" | while IFS= read -r _pk_lb; do
-					[ -n "$_pk_lb" ] && minor "$US --add $_pk_lb"
+					[ -n "$_pk_lb" ] && minor "$US add $_pk_lb"
 				done
 				return 1
 			fi
@@ -6894,7 +6929,7 @@ add_pick() {
 
 cmd_add() {
 	_folder="${1:-}"; _handle="${2:-}"
-	[ -n "$_folder" ] || err "--add needs a <FOLDER> (or host:/path), optionally a <HANDLE>"
+	[ -n "$_folder" ] || err "add needs a <FOLDER> (or host:/path), optionally a <HANDLE>"
 
 	## A directory that CONTAINS Time Machine bundles rather than being a store
 	## itself: offer what is in it instead of refusing.
@@ -6939,10 +6974,15 @@ add_one() {
 		err "'$_handle' cannot be a handle: letters, digits, '-', '.' and '@' only, and not starting with '-' or '.'. It names a directory under $FIRMLINK and several cache files."
 	if is_image_target "$_folder" && _ad_nv=$(network_volume_of "$_folder"); then
 		_ad_h=$(network_mount_host "$_ad_nv")
-		err "$_folder is on a network share (${_ad_h:-another host}) -- read it where it is stored: $US --add ${_ad_h:-<host>}:<path on ${_ad_h:-that host}>/$(basename "$_folder")"
+		err "$_folder is on a network share (${_ad_h:-another host}) -- read it where it is stored: $US add ${_ad_h:-<host>}:<path on ${_ad_h:-that host}>/$(basename "$_folder")"
 	fi
 	is_id_word "$_handle" &&
 		err "'$_handle' reads like a snapshot ID (6-8 characters, all from the ID alphabet), so my-tm could never tell them apart. Try '$_handle-tm'."
+	## Same reason, the other collision: a bare word that is a command is read
+	## as the command before anything knows the locations, so a store called
+	## `backup` could never be reached by its handle.
+	is_command "$_handle" &&
+		err "'$_handle' is a command, so my-tm could never tell them apart -- \`$US $_handle\` would run the command. Try '$_handle-tm'."
 	## awk's `exit` still runs END, so END's status would win -- use a flag
 	locations_registered | awk -F'\t' -v h="$_handle" '$1 == h {f = 1} END {exit(f ? 0 : 1)}' &&
 		err "handle '$_handle' is already registered"
@@ -6983,7 +7023,7 @@ add_one() {
 	fi
 
 	_f=$(locations_file)
-	locations_writable "--add $_folder${2:+ $2}"
+	locations_writable "add $_folder${2:+ $2}"
 	{
 		[ -f "$_f" ] && cat "$_f"
 		printf '%s\t%s\t\n' "$_handle" "$_folder"
@@ -6995,7 +7035,7 @@ add_one() {
 		## Scanned THROUGH the cache, not counted with snap_names: the store is
 		## open right now -- an image was just attached for its uuid, which costs
 		## minutes -- and counting alone would throw that away, leaving the next
-		## --status a blank row for a location that was just added.
+		## status a blank row for a location that was just added.
 		_rows=$(snapshots_get "$_handle")
 		_n=$(printf '%s\n' "$_rows" | count_lines)
 		minor "$_n snapshots"
@@ -7007,16 +7047,16 @@ add_one() {
 
 cmd_forget() {
 	_handle="${1:-}"
-	[ -n "$_handle" ] || err "--forget needs a <HANDLE>"
+	[ -n "$_handle" ] || err "forget needs a <HANDLE>"
 	_f=$(locations_file)
 	[ -f "$_f" ] || err "no locations file at $_f"
 	awk -F'\t' -v h="$_handle" '$1 == h {found = 1} END {exit(found ? 0 : 1)}' "$_f" ||
 		err "$_handle: not a registered location"
-	locations_writable "--forget $_handle"
+	locations_writable "forget $_handle"
 	awk -F'\t' -v h="$_handle" '$1 != h' "$_f" | atomic_write "$_f" || err "cannot write $_f"
 	locations_run_cache_drop
 	msg "forgot location '$_handle' -- no backup was touched"
-	why "deleting snapshots is a different verb: $US --rm <ID> go"
+	why "deleting snapshots is a different verb: $US rm <ID> go"
 	return 0
 }
 
@@ -7030,7 +7070,7 @@ cmd_refresh() {
 	for _rf_h in ${_only:-$(locations_all | awk -F'\t' '{print $1}')}; do
 		loc_reachable "$_rf_h" && snapshots_cache_drop "$_rf_h"
 	done
-	## drop remembered per-file facts too: --refresh is what someone reaches
+	## drop remembered per-file facts too: refresh is what someone reaches
 	## for when they suspect my-tm is telling them something stale or wrong
 	for _d in $(cache_read_dirs); do
 		rm -f "$_d/index/versions.tsv" 2>/dev/null
@@ -7396,7 +7436,7 @@ snitch_write() {
 
 ## The LaunchDaemon plist for one job, on stdout. Both output streams are
 ## captured -- <label>.log for stdout, <label>.err for stderr: a job without
-## StandardOutPath discards everything it prints, and --health reports on stdout.
+## StandardOutPath discards everything it prints, and health reports on stdout.
 job_plist() {
 	_jp_label="$1"; _jp_sched="$2"; shift 2
 	_jp_args=""
@@ -7645,12 +7685,12 @@ cmd_install() {
 	write_job "$MAINT_JOB" "${MAINT_INTERVAL}s" --maintenance
 	if [ -n "$HEALTH_INTERVAL" ] && [ "$HEALTH_INTERVAL" != "0" ] && [ "$HEALTH_INTERVAL" != "false" ]; then
 		_hi=$(parse_interval "$HEALTH_INTERVAL") || _hi=86400
-		write_job "$HEALTH_JOB" "${_hi}s" --health
+		write_job "$HEALTH_JOB" "${_hi}s" health
 	else
 		minor "HEALTH_INTERVAL is empty -- no health daemon installed"
 	fi
-	[ -n "$BACKUP_SCHEDULE" ] && write_job "$BACKUP_JOB" "$BACKUP_SCHEDULE" --backup start
-	note "the $FIRMLINK tree is built by $MAINT_JOB on its first run -- to build it now: $US --refresh"
+	[ -n "$BACKUP_SCHEDULE" ] && write_job "$BACKUP_JOB" "$BACKUP_SCHEDULE" backup start
+	note "the $FIRMLINK tree is built by $MAINT_JOB on its first run -- to build it now: $US refresh"
 
 	## 5. the config -- copied only where a plain run would otherwise find none
 	install_config "$(printf '%s' "$CONFIG_SOURCED" | awk '{print $NF}')"
@@ -7946,36 +7986,40 @@ completion_zsh() {
 	cat <<'_EOF'
 #compdef my-tm
 _my-tm() {
-  local -a cmds
+  local -a cmds opts
   cmds=(
-    '--status:status of every backup location'
-    '--ls:snapshot table'
-    '--lookup:every version of a path'
-    '--find:search the history by name'
-    '--show:one snapshot'
-    '--mount:expose a snapshot (needs a TTL)'
-    '--umount:release a mount'
-    '--open:open a version'
-    '--cat:write a version to stdout'
-    '--cp:copy a version out'
-    '--diff:what changed since then'
-    '--index:build the name index'
-    '--no-index:stop indexing a location, keep its index'
-    '--rm-index:stop indexing a location and delete its index'
-    '--verify:re-check stored checksums'
-    '--local-snap:take an APFS local snapshot'
-    '--health:run the health checks'
-    '--rm:delete snapshots'
-    '--thin:apply a retention policy'
-    '--backup:start or stop a backup'
-    '--eject:with --backup: eject the disk after it'
-    '--no-eject:with --backup: leave the disk mounted'
+    'status:status of every backup location'
+    'ls:snapshot table'
+    'lookup:every version of a path'
+    'find:search the history by name'
+    'show:one snapshot'
+    'mount:expose a snapshot (needs a TTL)'
+    'umount:release a mount'
+    'open:open a version'
+    'cat:write a version to stdout'
+    'cp:copy a version out'
+    'diff:what changed since then'
+    'index:build the name index'
+    'no-index:stop indexing a location, keep its index'
+    'rm-index:stop indexing a location and delete its index'
+    'verify:re-check stored checksums'
+    'local-snap:take an APFS local snapshot'
+    'health:run the health checks'
+    'rm:delete snapshots'
+    'thin:apply a retention policy'
+    'backup:run a backup now'
+    'stop:stop the backup that is running'
+    'trigger:ask the backup job to run now'
+    'add:register a location'
+    'forget:forget a location'
+    'refresh:rebuild caches and the tree'
+  )
+  opts=(
+    '--eject:with backup: eject the disk after it'
+    '--no-eject:with backup: leave the disk mounted'
     '--install:set up dirs, firmlink, daemons'
     '--uninstall:undo --install'
     '--setup:configure Time Machine itself'
-    '--add:register a location'
-    '--forget:forget a location'
-    '--refresh:rebuild caches and the tree'
     '--create-config:print the default config'
     '--config:use a specific config file'
     '--completion:print the completion script'
@@ -7993,8 +8037,9 @@ _my-tm() {
     '--help:this'
   )
   if [[ $PREFIX == -* ]]; then
-    _describe 'command' cmds
+    _describe 'option' opts
   else
+    (( CURRENT == 2 )) && _describe 'command' cmds
     _alternative "handles:location:($(my-tm --completion --handles 2>/dev/null))" 'files:path:_files'
   fi
 }
@@ -8006,10 +8051,10 @@ completion_bash() {
 	cat <<'_EOF'
 _my_tm() {
   local cur="${COMP_WORDS[COMP_CWORD]}"
-  local cmds="--status --ls --lookup --find --show --mount --umount --open --cat
-    --cp --diff --index --no-index --rm-index --verify --local-snap
-    --health --rm --thin --backup --eject --no-eject
-    --install --uninstall --setup --add --forget --refresh
+  local cmds="status ls lookup find show mount umount open cat
+    cp diff index no-index rm-index verify local-snap
+    health rm thin backup --eject --no-eject
+    --install --uninstall --setup add forget refresh
     --create-config --config --completion --source --all --limit --json
     --cached --force --verbose --debug --deepdebug
     --run-tests --version --help"
@@ -8061,64 +8106,65 @@ usage() {
 usage: $US [OPTIONS] [<LOCATION>|<ID>] [<PATH>|<GLOB>]
 
 A <LOCATION> is one Time Machine backup store, named either by its path or by
-the short handle you gave it with --add; a store named by PATH is READ, never
-attached -- attaching takes minutes, and --refresh, --index, --mount and
---verify are the commands that open one. An <ID> is a 6-char name for one
-snapshot inside one location. Everything with -- is interpreted as a command.
-A bare \`$US\` runs \$DEFAULT_CMD (default --status).
+the short handle you gave it with \`add\`; a store named by PATH is READ, never
+attached -- attaching takes minutes, and \`refresh\`, \`index\`, \`mount\` and
+\`verify\` are the commands that open one. An <ID> is a 6-char name for one
+snapshot inside one location. An action is a VERB; everything with -- is an
+option.
+A bare \`$US\` runs \$DEFAULT_CMD (default status).
 
   $US                          status of all backup locations
-  $US <LOCATION>               list its snapshots                   (= --ls)
-  $US <ID>                     show one snapshot                  (= --show)
-  $US <PATH> [<LOCATION>]      every version of it [in <LOCATION>] (= --lookup)
-  $US '<GLOB>'                 search the history by name         (= --find)
+  $US <LOCATION>               list its snapshots                     (= ls)
+  $US <ID>                     show one snapshot                    (= show)
+  $US <PATH> [<LOCATION>]      every version of it [in <LOCATION>]  (= lookup)
+  $US '<GLOB>'                 search the history by name           (= find)
   $US <ID> <PATH>              that file, in that snapshot
   The two bare words may come in either order.
 
 INSPECT
-  --status  [<LOCATION>]         one line per location: snapshots, span, space,
+  status  [<LOCATION>]           one line per location: snapshots, span, space,
                                  index state; all locations if omitted
-  --ls      [<LOCATION>]         snapshot table: when, how much each backup
+  ls      [<LOCATION>]           snapshot table: when, how much each backup
                                  added, restore size, exclusive size*;
                                  every location if omitted
-  --lookup  <PATH> [<LOCATION>]  the distinct versions of PATH and where they
+  lookup  <PATH> [<LOCATION>]    the distinct versions of PATH and where they
                                  are; searches the locations backing up PATH's
                                  volume if <LOCATION> is omitted, --all for every
                                  known location
-  --find    [<ID>] '<GLOB>' [<LOCATION>]
+  find    [<ID>] '<GLOB>' [<LOCATION>]
                                  without <ID>: search the name index over the
                                  whole history -> paths + version counts
                                  with <ID>:    walk that one snapshot live, no
                                  index needed (slow)
                                  <LOCATION> limits it; all locations if omitted
-  --show    <ID> [<PATH>]        one snapshot; with <PATH>, just that file in it
+  show    <ID> [<PATH>]          one snapshot; with <PATH>, just that file in it
 
 USE
-  --mount   <ID>|<LOCATION>|--all <TTL> [<PATH>]
+  mount   <ID>|<LOCATION>|--all <TTL> [<PATH>]
                                  expose it and print the mountpoint. <TTL> is
                                  MANDATORY -- how long you need it: 7m / 4h /
                                  5h3m / 2d. <PATH> is where to put it: relative
                                  goes under $FIRMLINK, absolute is used as given;
                                  under $FIRMLINK if omitted. A location alone
                                  means its newest snapshot; --all means each of
-                                 them. See \`$US --mount --help\`
-  --umount [-f] <ID>|<LOCATION>|--all
+                                 them. See \`$US mount --help\`
+  umount [-f] <ID>|<LOCATION>|--all
                                  release it early (they expire on their own).
                                  If something still has files open, prints what
                                  is holding it and refuses; -f unmounts anyway
-  --open    <ID> <PATH>          open that version (prints the command first).
+  open    <ID> <PATH>            open that version (prints the command first).
                                  From an ssh location it is fetched to a temp
                                  directory of its own and KEPT -- path printed
-  --cat     <ID> <PATH>          write that version to stdout
-  --cp [-f] <ID> <PATH> [<DEST>] copy it out; <DEST> defaults to \$PWD under the
+  cat     <ID> <PATH>            write that version to stdout
+  cp [-f] <ID> <PATH> [<DEST>]   copy it out; <DEST> defaults to \$PWD under the
                                  original name. Refuses to overwrite without -f
-  --diff    <ID> [<PATH>]        what changed between then and now; the whole
+  diff    <ID> [<PATH>]          what changed between then and now; the whole
                                  snapshot if <PATH> is omitted (slow, warns first)
   ...or just browse:             ls $FIRMLINK/<LOCATION>/<SNAPSHOT>/
 
 MAINTAIN
-  --index   [<LOCATION>|<ID>...] [--all]
-                                 build the name index --find uses, and record
+  index   [<LOCATION>|<ID>...] [--all]
+                                 build the name index \`find\` uses, and record
                                  each snapshot's exclusive size* on the same
                                  pass. NOTHING is indexed until you say so:
                                  naming a <LOCATION> opts it in for good (needs
@@ -8134,30 +8180,31 @@ MAINTAIN
                                  it exists once, shared: only root builds it
                                  (anyone else is told the command). Caches
                                  are cheap: each user keeps their own
-  --no-index <LOCATION>...       stop indexing it; the index it has is kept and
-                                 still answers --find
-  --rm-index <LOCATION>...       stop indexing it and delete its index
-  --verify  <ID> [<PATH>...]     re-check the checksums stored at backup time;
+  no-index <LOCATION>...         stop indexing it; the index it has is kept and
+                                 still answers \`find\`
+  rm-index <LOCATION>...         stop indexing it and delete its index
+  verify  <ID> [<PATH>...]       re-check the checksums stored at backup time;
                                  the whole snapshot if no <PATH> given
-  --local-snap[shot]             take an APFS local snapshot now.
+  local-snap[shot]               take an APFS local snapshot now.
                                  [daemon: taken every LOCAL_SNAP_INTERVAL]
-  --health  [<LOCATION>]         run the health checks, exit non-zero on the
+  health  [<LOCATION>]           run the health checks, exit non-zero on the
                                  worst; all configured locations if omitted.
                                  [daemon: run every HEALTH_INTERVAL]
 
 MAINTAIN -- these need root + Full Disk Access
-  --rm      <ID>... go           delete snapshot(s). NOT undoable, no trash
-  --thin    [<LOCATION>] ["<POLICY>"] go
+  rm      <ID>... go             delete snapshot(s). NOT undoable, no trash
+  thin    [<LOCATION>] ["<POLICY>"] go
                                  delete the snapshots a retention policy does
                                  not keep; every location and the configured
                                  policy if omitted. Dry-run unless you type \`go\`
-  --backup  start|stop [--eject|--no-eject]
-                                 run or stop a backup, then do what POST_BACKUP
-                                 says with the disk: none | unmount | eject.
-                                 --no-eject leaves it mounted from now on,
-                                 --eject undoes that. Both persist, the
-                                 unattended run included.
+  backup  [--eject|--no-eject]   run a backup now and wait for it, then do
+                                 what POST_BACKUP says with the disk:
+                                 none | unmount | eject.
                                  [daemon: run on BACKUP_SCHEDULE]
+  stop                           stop the backup that is running
+  trigger                        ask the backup job to run one, and return at
+                                 once -- it outlives this process, so this is
+                                 what a script or another machine asks for
 
 INSTALL & SET UP
   --install [<SSH-HOST>] [go] | --uninstall [<SSH-HOST>] [go]
@@ -8179,11 +8226,11 @@ INSTALL & SET UP
                                  destinations, exclusions, quota.
                                  See \`--setup --help\` for the flags to do it
                                  from a script instead
-  --add <FOLDER> [<HANDLE>]      register a location; <HANDLE> defaults to a
+  add <FOLDER> [<HANDLE>]        register a location; <HANDLE> defaults to a
                                  slug of the volume name
-  --forget <HANDLE>              forget a location; no backup is touched
-                                 (deleting snapshots is --rm <ID> go)
-  --refresh [<LOCATION>]         rebuild caches and the $FIRMLINK tree; all if omitted
+  forget <HANDLE>                forget a location; no backup is touched
+                                 (deleting snapshots is \`rm <ID> go\`)
+  refresh [<LOCATION>]           rebuild caches and the $FIRMLINK tree; all if omitted
   --create-config [<FILE>]       print the default config, or write it to <FILE>
   --config <FILE>                use this config instead of the search order
   --completion [zsh|bash]        print the completion script
@@ -8205,11 +8252,14 @@ OPTIONS
   -A|--all               no limits: all locations / all rows / all snapshots
   -L|--limit <N>         stop after N rows
   -J|--json              machine-readable output
-  --cached               --ls answers from what is already known, and opens
+  --cached               ls answers from what is already known, and opens
                          nothing: no mount, no attach, no scan. What a status on
                          another Mac asks, so its "instant" costs nothing here
-  -f|--force             overwrite an existing destination (--cp),
-                         force a busy unmount (--umount)
+  --eject|--no-eject     with \`backup\`: eject the disk after it, or leave it
+                         mounted. Both persist until the other is given --
+                         the unattended run included
+  -f|--force             overwrite an existing destination (cp),
+                         force a busy unmount (umount)
   -V|--verbose           echo each tmutil / mount_apfs / find command before it runs
   -D|--debug [<PATH>]    diagnostics: which ladder rung fired, cache hits,
                          resolved snapshot paths   (implies -V)
@@ -8222,7 +8272,7 @@ _EOF
 
 usage_mount() {
 	cat <<_EOF
-usage: $US --mount [OPTIONS] <ID>|<LOCATION>|--all <TTL> [<PATH>] parameters.
+usage: $US mount [OPTIONS] <ID>|<LOCATION>|--all <TTL> [<PATH>] parameters.
 
 <TTL> is mandatory because a mounted snapshot CANNOT BE DELETED: while it is
 held, Time Machine's thinning silently fails against it, and on the startup
@@ -8278,44 +8328,52 @@ loc_nearest() {                 # <word>
 no_such_location() {            # <word>
 	_nsl=$(loc_nearest "$1")
 	if [ -n "$_nsl" ]; then
-		printf "'%s': no such location -- did you mean '%s'? (%s --status lists them)" "$1" "$_nsl" "$US"
+		printf "'%s': no such location -- did you mean '%s'? (%s status lists them)" "$1" "$_nsl" "$US"
 	else
-		printf "'%s': no such location (%s --status lists them)" "$1" "$US"
+		printf "'%s': no such location (%s status lists them)" "$1" "$US"
 	fi
 }
 
 ## A command typed without its dashes. Asked only of a word nothing else
 ## claimed -- a snapshot ID or a location keeps its meaning, so a store named
 ## "health" is still listed by `my-tm health`.
-## 0: a command that only reads, run on the word; 2: a command that changes
-## things or mounts, named but never run on a guess; 1: not a command at all.
-## The commands are read from --help's own list, so a new one is known here
-## the moment it is documented.
-bare_command() {                # <word> -> --command
-	case "$1" in
-		list|ls)     printf -- '--ls\n';     return 0 ;;
-		status)      printf -- '--status\n'; return 0 ;;
-		find|search) printf -- '--find\n';   return 0 ;;
-		lookup)      printf -- '--lookup\n'; return 0 ;;
-		show)        printf -- '--show\n';   return 0 ;;
-		health)      printf -- '--health\n'; return 0 ;;
+## Every command my-tm takes, as a VERB -- the standard's shape (actions are
+## verbs, modifiers are flags). ONE owner: the dispatch, the bare-word ladder
+## and the completion ask this instead of each keeping a list. Admin stays on
+## flags (--install, --setup, --create-config, --config, --completion,
+## --run-tests, --version, --help), and so do the modifiers.
+COMMANDS="status ls lookup find show mount umount open cat cp diff
+index no-index rm-index verify local-snap health rm thin backup trigger stop
+add forget refresh"
+
+## Is this word one of them? Exact match only: a near-miss is answered
+## elsewhere rather than guessed at here.
+is_command() {
+	case " $(printf '%s' "$COMMANDS" | tr '\n' ' ') " in
+		*" ${1:-} "*) return 0 ;;
 	esac
-	case " $(usage | sed -n '1,/^OPTIONS/p' | sed -nE 's/^ *--([a-z][a-z-]*).*/\1/p' | tr '\n' ' ') " in
-		*" $1 "*) printf -- '--%s\n' "$1"; return 2 ;;
+	return 1
+}
+
+## The words that mean a command without BEING one. The parser takes every
+## exact command itself, so only these reach here; a word that is neither is
+## left to the ladder below, as a name to look for.
+bare_command() {                # <word> -> <command>
+	case "$1" in
+		list)           printf 'ls\n';         return 0 ;;
+		search)         printf 'find\n';       return 0 ;;
+		local-snapshot) printf 'local-snap\n'; return 0 ;;
 	esac
 	return 1
 }
 
 ## Run a command a bare word named, saying what it was taken for.
-dispatch_bare_command() {       # <word> <--command> [<arg>]
+dispatch_bare_command() {       # <word> <command> [<arg>]
 	minor "'$1' taken as $2"
 	case "$2" in
-		--ls)     cmd_ls ${3:+"$3"} ;;
-		--status) cmd_status ${3:+"$3"} ;;
-		--health) cmd_health ${3:+"$3"} ;;
-		--find)   [ -n "${3:-}" ] || err "--find needs a <GLOB>"; cmd_find "$3" ;;
-		--lookup) [ -n "${3:-}" ] || err "--lookup needs a <PATH>"; cmd_lookup "$3" ;;
-		--show)   [ -n "${3:-}" ] || err "--show needs an <ID>"; cmd_show "$3" ;;
+		ls)         cmd_ls ${3:+"$3"} ;;
+		local-snap) cmd_local_snap ;;
+		find)       [ -n "${3:-}" ] || err "find needs a <GLOB>"; cmd_find "$3" ;;
 	esac
 }
 
@@ -8373,21 +8431,17 @@ classify_one() {
 
 ## the smart form: up to two bare words, in either order
 dispatch_bare() {
-	## A command without its dashes, in either position: `my-tm list horse`
-	## and `my-tm horse list` both mean --ls horse. Without this, `list` was a
-	## name to SEARCH for, and the search printed every path containing it.
+	## Another word for a command, in either position: `my-tm list horse` and
+	## `my-tm horse list` both mean `ls horse`. Without this, `list` was a name
+	## to SEARCH for, and the search printed every path containing it.
 	if [ "$#" -ge 1 ] && ! word_is_claimed "$1"; then
 		if _bc=$(bare_command "$1"); then
 			dispatch_bare_command "$1" "$_bc" "${2:-}"; return $?
-		elif [ "$?" = "2" ]; then
-			err "'$1' changes things or mounts, so it is not run on a guess -- say it with its dashes: $US $_bc ..."
 		fi
 	fi
 	if [ "$#" -ge 2 ] && ! word_is_claimed "$2"; then
 		if _bc=$(bare_command "$2"); then
 			dispatch_bare_command "$2" "$_bc" "$1"; return $?
-		elif [ "$?" = "2" ]; then
-			err "'$2' changes things or mounts, so it is not run on a guess -- say it with its dashes: $US $_bc ..."
 		fi
 	fi
 	_c1=$(classify_one "$1")
@@ -8452,7 +8506,7 @@ main() {
 		case "$_a" in
 			-h) usage; exit 0 ;;
 			--help)
-				if [ "$CMD" = "--mount" ]; then usage_mount; exit 0; fi
+				if [ "$CMD" = "mount" ]; then usage_mount; exit 0; fi
 				CMD="--help"
 				;;
 			-V|--verbose) VRB=1 ;;
@@ -8484,7 +8538,18 @@ main() {
 			--*)
 				if [ -z "$CMD" ]; then CMD="$_a"; else set -- "$@" "$_a"; fi
 				;;
-			*) set -- "$@" "$_a" ;;
+			*)
+				## a VERB, if it is one and nothing has claimed the slot yet.
+				## Exact match, and no ladder here: this runs before the config
+				## is loaded, so asking whether the word is a location is not
+				## possible yet -- and a location named `status` would be
+				## ambiguous however late we asked.
+				if [ -z "$CMD" ] && is_command "$_a"; then
+					CMD="$_a"
+				else
+					set -- "$@" "$_a"
+				fi
+				;;
 		esac
 	done
 
@@ -8503,7 +8568,7 @@ main() {
 	## reap a mount leaked by a kill -9. Reconcile and release expired ones on
 	## ordinary runs; a mount still inside its TTL is never touched.
 	case "${CMD:-}" in
-		--run-tests|--maintenance|--sweep|--umount) : ;;
+		--run-tests|--maintenance|--sweep|umount) : ;;
 		*)
 			if [ ! -f "$JOBS_DIR/$MAINT_JOB.plist" ] &&
 			   [ -n "$(mounts_read_all)" ]; then
@@ -8534,6 +8599,7 @@ main() {
 	esac
 
 	if [ -z "$CMD" ] && [ "$#" -eq 0 ]; then
+		config_default_cmd_verb
 		# shellcheck disable=SC2086  # DEFAULT_CMD may carry parameters on purpose
 		set -- $DEFAULT_CMD
 		CMD="$1"; shift
@@ -8542,35 +8608,37 @@ main() {
 	case "${CMD:-}" in
 		"")             dispatch_bare "$@" ;;
 		--help)         usage ;;
-		--status)       cmd_status "$@" ;;
-		--ls)           cmd_ls "$@" ;;
-		--lookup)       [ "$#" -ge 1 ] || err "--lookup needs a <PATH>"; cmd_lookup "$@" ;;
-		--find)         [ "$#" -ge 1 ] || err "--find needs a <GLOB>"
+		status)         cmd_status "$@" ;;
+		ls)             cmd_ls "$@" ;;
+		lookup)         [ "$#" -ge 1 ] || err "lookup needs a <PATH>"; cmd_lookup "$@" ;;
+		find)           [ "$#" -ge 1 ] || err "find needs a <GLOB>"
 		                if [ "$#" -ge 2 ]; then cmd_find "$2" "$1"; else cmd_find "$1"; fi ;;
-		--show)         [ "$#" -ge 1 ] || err "--show needs an <ID>"; cmd_show "$@" ;;
-		--mount)        cmd_mount "$@" ;;
-		--umount)       cmd_umount "$@" ;;
-		--open)         [ "$#" -ge 2 ] || err "--open needs <ID> <PATH>"; cmd_open "$@" ;;
-		--cat)          [ "$#" -ge 2 ] || err "--cat needs <ID> <PATH>"; cmd_cat "$@" ;;
-		--cp)           [ "$#" -ge 2 ] || err "--cp needs <ID> <PATH> [<DEST>]"; cmd_cp "$@" ;;
-		--diff)         [ "$#" -ge 1 ] || err "--diff needs an <ID>"; cmd_diff "$@" ;;
-		--index)        cmd_index "$@" ;;
-		--no-index)     cmd_no_index "$@" ;;
-		--rm-index)     cmd_rm_index "$@" ;;
-		--verify)       [ "$#" -ge 1 ] || err "--verify needs an <ID>"; cmd_verify "$@" ;;
-		--local-snap|--local-snapshot) cmd_local_snap ;;
-		--health)       cmd_health "$@" ;;
+		show)           [ "$#" -ge 1 ] || err "show needs an <ID>"; cmd_show "$@" ;;
+		mount)          cmd_mount "$@" ;;
+		umount)         cmd_umount "$@" ;;
+		open)           [ "$#" -ge 2 ] || err "open needs <ID> <PATH>"; cmd_open "$@" ;;
+		cat)            [ "$#" -ge 2 ] || err "cat needs <ID> <PATH>"; cmd_cat "$@" ;;
+		cp)             [ "$#" -ge 2 ] || err "cp needs <ID> <PATH> [<DEST>]"; cmd_cp "$@" ;;
+		diff)           [ "$#" -ge 1 ] || err "diff needs an <ID>"; cmd_diff "$@" ;;
+		index)          cmd_index "$@" ;;
+		no-index)       cmd_no_index "$@" ;;
+		rm-index)       cmd_rm_index "$@" ;;
+		verify)         [ "$#" -ge 1 ] || err "verify needs an <ID>"; cmd_verify "$@" ;;
+		local-snap|local-snapshot) cmd_local_snap ;;
+		health)         cmd_health "$@" ;;
 		--maintenance)  cmd_maintenance ;;
 		--sweep)        sweep ;;
-		--rm)           cmd_rm "$@" ;;
-		--thin)         cmd_thin "$@" ;;
-		--backup)       cmd_backup "$@" ;;
+		rm)             cmd_rm "$@" ;;
+		thin)           cmd_thin "$@" ;;
+		backup)         cmd_backup start "$@" ;;
+		stop)           cmd_backup stop "$@" ;;
+		trigger)        cmd_trigger "$@" ;;
 		--install)      cmd_install "$@" ;;
 		--uninstall)    cmd_uninstall "$@" ;;
 		--setup)        cmd_setup "$@" ;;
-		--add)          cmd_add "$@" ;;
-		--forget)       cmd_forget "$@" ;;
-		--refresh)      cmd_refresh "$@" ;;
+		add)            cmd_add "$@" ;;
+		forget)         cmd_forget "$@" ;;
+		refresh)        cmd_refresh "$@" ;;
 		--create-config) cmd_create_config "${1:-}" ;;
 		--completion)   cmd_completion "${1:-}" ;;
 		--stamp-version) cmd_stamp_version ;;
@@ -8584,7 +8652,13 @@ main() {
 			printf '  %s\n' "$(stat -f '%Sm' -t '%Y-%m-%d %H:%M' "$_vb" 2>/dev/null)"
 			;;
 		--run-tests)    run_tests "$@" ;;
-		*)              err "unknown command: $CMD  (see --help)" ;;
+		*)
+			## a dashed verb is answered by name, not refused as an option
+			case "$CMD" in
+				--*) is_command "${CMD#--}" &&
+					err "no such option: $CMD -- you mean \`$US ${CMD#--}\`" ;;
+			esac
+			err "unknown command: $CMD  (see --help)" ;;
 	esac
 	EXIT_RC=$?
 	return "$EXIT_RC"
@@ -8837,9 +8911,9 @@ t_test_ids() {
 t_test_handles() {
 	printf '\nHandles vs IDs\n'
 	if is_id_word "backup"; then
-		t_bad "'backup' is allowed as a handle" "it contains a 'u', which Crockford excludes"
+		t_bad "'backup' does not read as an ID" "it contains a 'u', which Crockford excludes"
 	else
-		t_ok "'backup' is allowed as a handle (it has a u)"
+		t_ok "'backup' does not read as an ID (it has a u)"
 	fi
 	t_true is_id_word "k7f2q9"
 	if is_id_word "k7f2q9x"; then t_ok "'k7f2q9x' reads as an ID (refused as a handle)"
@@ -8980,7 +9054,7 @@ t_test_location_parameters() {
 	_lp_fn=undefined; command -v set_location_parameters >/dev/null 2>&1 && _lp_fn=defined
 	t_eq "nothing leaks into my-tm itself" "${THIN_POLICY_TO_KEEP-unset} $_lp_fn" "unset undefined"
 
-	## HEALTH_MAX_AGE per location, as --health reads it
+	## HEALTH_MAX_AGE per location, as health reads it
 	# shellcheck disable=SC2016  # writing a config file
 	printf 'set_location_parameters() { case "$LOCATION" in store) HEALTH_MAX_AGE="0" ;; esac; }\n' >"$T_ROOT/age.conf"
 	CONFIG_SOURCED=" $T_ROOT/age.conf"
@@ -8998,7 +9072,7 @@ t_test_location_parameters() {
 
 	## an old name stops my-tm, and names what replaced it
 	printf 'POST_BACKUP_PER_LOCATION="store none"\n' >"$T_ROOT/old.conf"
-	_lp_out=$(MY_TM_CONFIG="$T_ROOT/old.conf" dash "$T_MYTM" --status 2>&1)
+	_lp_out=$(MY_TM_CONFIG="$T_ROOT/old.conf" dash "$T_MYTM" status 2>&1)
 	t_match "a config setting an old name is refused" "$_lp_out" "POST_BACKUP_PER_LOCATION is no longer read"
 	t_match "and the replacement is named" "$_lp_out" "use set_location_parameters instead"
 	rm -f "$T_ROOT/site.conf" "$T_ROOT/host.conf" "$T_ROOT/age.conf" "$T_ROOT/old.conf"
@@ -9026,6 +9100,21 @@ t_test_config() {
 	for _c_k in ATTACH_QUIET ATTACH_POLL; do
 		t_eq "$_c_k is in the default config" "$(count_match "$_c_k=" < "$_f")" "1"
 	done
+	t_eq "the default config spells DEFAULT_CMD as a verb" \
+		"$(count_match 'DEFAULT_CMD="status"' < "$_f")" "1"
+
+	## A config still on the old spelling must not break a bare `my-tm`: the
+	## verb is read out of it and the line is named. Adversarial: a value that
+	## is NOT a command keeps its dashes, so a real typo is still reported.
+	## the call cannot go in $( ), which would lose the assignment it makes
+	_c_save="$DEFAULT_CMD"; _c_err="$T_ROOT/defcmd.err"
+	DEFAULT_CMD="--status"; config_default_cmd_verb 2>"$_c_err"
+	t_eq "an old DEFAULT_CMD is read as its verb" "$DEFAULT_CMD" "status"
+	t_match "and the line is named" "$(cat "$_c_err")" "old spelling"
+	DEFAULT_CMD="--nonsense"; config_default_cmd_verb 2>"$_c_err"
+	t_eq "a value that is no command is left alone" "$DEFAULT_CMD" "--nonsense"
+	t_eq "(and nothing is said about it)" "$(count_lines < "$_c_err")" "0"
+	rm -f "$_c_err"; DEFAULT_CMD="$_c_save"
 }
 
 ## One shared location list. Adversarial: a per-user copy used to be written
@@ -9049,10 +9138,10 @@ t_test_one_shared_location_list() {
 	t_eq "so it is no location either" "$(locations_all | count_match 'mine')" "0"
 	## ... but it is named, with what to do about it
 	_sl_out=$(cmd_status 2>&1)
-	t_match "--status names the file that is no longer read" "$_sl_out" "no longer read"
+	t_match "status names the file that is no longer read" "$_sl_out" "no longer read"
 	t_match "and how to add it again as root" "$_sl_out" "add $T_ROOT/store mine"
 	rm -f "$CACHE_DIR_USER/locations.tsv"
-	t_eq "with no such file, --status says nothing about it" \
+	t_eq "with no such file, status says nothing about it" \
 		"$(cmd_status 2>&1 | count_match 'no longer read')" "0"
 
 	## writing it where it is not ours to write: refuse, and name the command
@@ -9060,7 +9149,7 @@ t_test_one_shared_location_list() {
 	mkdir -p "$_sl_ro"; : >"$_sl_ro/locations.tsv"; chmod 0444 "$_sl_ro/locations.tsv"
 	CACHE_DIR="$_sl_ro"
 	_sl_err=$( ( cmd_add "$T_ROOT/store" newloc ) 2>&1 >/dev/null )
-	t_match "--add refuses a list it cannot write" "$_sl_err" "needs root"
+	t_match "add refuses a list it cannot write" "$_sl_err" "needs root"
 	t_match "and names the command to run again" "$_sl_err" "add $T_ROOT/store newloc"
 	t_eq "and wrote nothing" "$(count_match 'newloc' < "$_sl_ro/locations.tsv")" "0"
 	chmod 0644 "$_sl_ro/locations.tsv"; rm -rf "$_sl_ro"
@@ -9069,7 +9158,7 @@ t_test_one_shared_location_list() {
 }
 
 ## A handle is a file name and a TAB-separated field, not free text.
-## Adversarial: --add took ANY handle, so "a/b" would have written outside
+## Adversarial: add took ANY handle, so "a/b" would have written outside
 ## $FIRMLINK, a tab would have split the row into different columns, and "-f"
 ## would have read as an option wherever the handle is passed on.
 t_test_handle_characters() {
@@ -9082,6 +9171,17 @@ t_test_handle_characters() {
 	done
 	t_eq "and none of them was written" "$(cat "$_hc_f" 2>/dev/null)" "$_hc_before"
 
+	## A handle that IS a command could never be reached: the parser takes the
+	## verb before anything has read the location list. Adversarial: a word
+	## that merely starts like one must still be accepted.
+	t_match "refused: 'backup', because it is a command" \
+		"$( ( cmd_add "$T_ROOT/store" backup ) 2>&1 >/dev/null )" "is a command"
+	t_eq "(and it was not written either)" "$(cat "$_hc_f" 2>/dev/null)" "$_hc_before"
+	cmd_add "$T_ROOT/store" backups >/dev/null 2>&1
+	t_eq "'backups' only starts like one, so it is a handle" \
+		"$(locations_registered | awk -F'\t' '$1 == "backups"' | count_lines)" "1"
+	printf '%s\n' "$_hc_before" | cache_write_locations
+
 	## the one the design needs
 	cmd_add "$T_ROOT/store" "horse@ada" >/dev/null 2>&1
 	t_eq "horse@ada is a handle" \
@@ -9093,7 +9193,7 @@ t_test_handle_characters() {
 }
 
 t_test_locations() {
-	printf '\nLocations (--add / --forget)\n'
+	printf '\nLocations (add / forget)\n'
 	_f="$T_ROOT/cache/locations.tsv"
 	_before=$(cat "$_f")
 	mkdir -p "$T_ROOT/store2"
@@ -9119,11 +9219,11 @@ t_test_locations() {
 	t_eq "nothing was written for the refused adds" \
 		"$(awk -F'\t' '$1 == "nope" || $1 == "k7f2q9"' "$_f" | count_lines)" "0"
 	( cmd_forget "extra" ) >/dev/null 2>&1
-	t_eq "--forget removes exactly its line" "$(cat "$_f")" "$_before"
+	t_eq "forget removes exactly its line" "$(cat "$_f")" "$_before"
 	if ( cmd_forget "nosuch" ) >/dev/null 2>&1; then
-		t_bad "--forget must refuse an unknown handle" ""
+		t_bad "forget must refuse an unknown handle" ""
 	else
-		t_ok "--forget refuses an unknown handle"
+		t_ok "forget refuses an unknown handle"
 	fi
 }
 
@@ -9255,13 +9355,13 @@ t_test_plists() {
 }
 
 t_test_rm_dryrun() {
-	printf '\n--rm (dry run only: no test ever deletes a snapshot)\n'
+	printf '\nrm (dry run only: no test ever deletes a snapshot)\n'
 	snapshots_cache_invalidate
 	_rows=$(snapshots_get store)
 	_id=$(printf '%s\n' "$_rows" | head -n 1 | awk -F'\t' '{print $4}')
 	_ts=$(printf '%s\n' "$_rows" | head -n 1 | awk -F'\t' '{print $2}')
 	if [ -z "$_id" ]; then
-		t_skip "--rm dry run" "no snapshots enumerated from the stub"
+		t_skip "rm dry run" "no snapshots enumerated from the stub"
 		return 0
 	fi
 	: >"$(t_calls)"
@@ -9282,13 +9382,19 @@ t_test_rm_dryrun() {
 		"$(count_match 'tmutil delete' < "$(t_calls)")" "0"
 }
 
+## COMMANDS, one per line and sorted -- what the two coverage checks below
+## compare --help and the completion against.
+t_commands_sorted() {
+	printf '%s' "$COMMANDS" | tr -s ' \n' '\n' | grep -v '^$' | LC_ALL=C sort -u
+}
+
 t_test_help() {
 	printf '\n--help and command coverage\n'
 	_u=$(usage)
 	## the usage line names the tool as it was INVOKED (my-tm, my-tm.sh, ...)
 	t_match "usage starts with the standard line" "$_u" "^usage: $US \[OPTIONS\]"
-	t_match "--mount --help explains the TTL" "$(usage_mount)" "CANNOT BE DELETED"
-	## every --command named in the usage block must be dispatchable
+	t_match "mount --help explains the TTL" "$(usage_mount)" "CANNOT BE DELETED"
+	## every admin flag named in the usage block must be dispatchable
 	_missing=""
 	for _c in $(printf '%s\n' "$_u" | sed -nE 's/^ *(--[a-z-]+).*/\1/p' | sort -u); do
 		case "$_c" in
@@ -9300,10 +9406,18 @@ t_test_help() {
 			_missing="$_missing $_c"
 	done
 	if [ -z "$_missing" ]; then
-		t_ok "every command in the usage block is dispatchable"
+		t_ok "every flag in the usage block is dispatchable"
 	else
-		t_bad "commands in --help with no dispatch arm" "$_missing"
+		t_bad "flags in --help with no dispatch arm" "$_missing"
 	fi
+	## ...and the VERBS, both ways: a command added to COMMANDS and never
+	## written up is one nobody can find, and a command written up and since
+	## removed is a promise the tool no longer keeps. `trigger` and `stop`
+	## were in the dispatch and in neither place.
+	t_eq "--help documents exactly the commands there are" \
+		"$(printf '%s\n' "$_u" | sed -n '/^INSPECT/,/^OPTIONS/p' |
+			sed -nE 's/^  ([a-z][a-z-]*)( {2,}|[<[|]| +[<[|]).*/\1/p' | LC_ALL=C sort -u)" \
+		"$(t_commands_sorted)"
 }
 
 t_test_paths() {
@@ -9354,7 +9468,7 @@ t_test_local_snapshots() {
 
 ## REGRESSION: a Time Machine destination that is ejected has no "Mount Point:"
 ## line in tmutil destinationinfo. It used to be dropped on the floor, so the
-## backup disk silently VANISHED from --status -- hiding the one failure the
+## backup disk silently VANISHED from status -- hiding the one failure the
 ## tool exists to report. It must be listed, marked "?", with its last known
 ## snapshot table intact.
 ## Detection is not a matter of taste, and it must not double-list a disk.
@@ -9406,12 +9520,12 @@ t_test_ejected_destination() {
 		"$(snapshots_cached_only ejectedstore | count_lines)" "1"
 
 	_st=$(cmd_status 2>&1)
-	t_match "--status still lists the detached disk" "$_st" "ejectedstore"
+	t_match "status still lists the detached disk" "$_st" "ejectedstore"
 	t_match "with its last known snapshot count" "$_st" "ejectedstore.* 1 "
 	t_match "and marked as not-current" "$_st" "?"
 
 	_ls=$(cmd_ls ejectedstore 2>&1)
-	t_match "--ls falls back to the remembered table" "$_ls" "2026-08-20_1558.05"
+	t_match "ls falls back to the remembered table" "$_ls" "2026-08-20_1558.05"
 	t_match "and says why it may be out of date" "$_ls" "not attached"
 
 	## this row HAS an ADDED figure, so a median is owed
@@ -9458,7 +9572,7 @@ t_test_volume_paths() {
 		"$(printf '%s' "$_exp" | count_match '/Data/Data')" "0"
 	t_match "and the expected path ends at the volume" "$_exp" "/Data\$"
 
-	## REGRESSION: --show advertised a browsable path even when the tree had
+	## REGRESSION: show advertised a browsable path even when the tree had
 	## never been built, sending the reader to a directory that is not there
 	_rows=$(snapshots_get store)
 	_id=$(printf '%s\n' "$_rows" | head -n 1 | awk -F'\t' '{print $4}')
@@ -9467,7 +9581,7 @@ t_test_volume_paths() {
 		t_match "an unbuilt tree says how to build it" "$_sh" "refresh"
 	fi
 
-	## REGRESSION: macOS mounts local snapshots itself, and --mount reuses
+	## REGRESSION: macOS mounts local snapshots itself, and mount reuses
 	## those. It used to print our tree path regardless, sending the reader to
 	## an empty directory while the files sat somewhere else entirely.
 	if true; then
@@ -9478,7 +9592,7 @@ t_test_volume_paths() {
 }
 
 ## REGRESSION: without --install an ordinary user cannot create /var/lib/my-tm,
-## so every mount failed and --lookup answered "0 versions" -- indistinguishable
+## so every mount failed and lookup answered "0 versions" -- indistinguishable
 ## from "your file was never backed up".
 t_test_mount_root_fallback() {
 	printf '\nMount root without --install\n'
@@ -9521,8 +9635,8 @@ t_test_version_store_generation() {
 
 ## REGRESSION: local snapshots are purgeable -- macOS deletes them at any age.
 ## A cached list produced mounts of snapshots that no longer existed.
-## Commands that change a store re-read THAT store. Adversarial: --rm, --thin,
-## --backup and --refresh must each keep the last known table of a disk that is
+## Commands that change a store re-read THAT store. Adversarial: rm, thin,
+## backup and refresh must each keep the last known table of a disk that is
 ## away (nothing can read it again until the disk is back), and still drop the
 ## stale table of the store they changed. Nothing is deleted: tmutil and
 ## diskutil are the stubs, and the test refuses to run without them.
@@ -9535,9 +9649,9 @@ t_test_commands_keep_other_tables() {
 	_ck_cf=$(snapshots_cache_file)
 	_ck_lf="$T_ROOT/cache/locations.tsv"
 	cp -p "$_ck_lf" "$T_ROOT/locations.ck"
-	## no ssh fixture: resolving an ID and --refresh read every location
+	## no ssh fixture: resolving an ID and refresh read every location
 	awk -F'\t' '$1 != "remote"' "$T_ROOT/locations.ck" >"$_ck_lf"
-	## --refresh also drops the version store; put it back afterwards
+	## refresh also drops the version store; put it back afterwards
 	for _ck_d in "$T_ROOT/cache" "$T_ROOT/ucache"; do
 		[ -f "$_ck_d/index/versions.tsv" ] && cp -p "$_ck_d/index/versions.tsv" "$_ck_d/index/versions.tsv.ck"
 	done
@@ -9549,26 +9663,26 @@ t_test_commands_keep_other_tables() {
 		cache_read_checked "$_ck_cf" 2>/dev/null | awk -F'\t' -v l="$1" '$1 == l { n++ } END { print n + 0 }'
 	}
 
-	## --rm <ID> go, as root: is_root answers yes inside the subshell only
+	## rm <ID> go, as root: is_root answers yes inside the subshell only
 	_ck_id=$(snapshots_get store 2>/dev/null | head -n 1 | awk -F'\t' '{print $4}')
 	if [ -n "$_ck_id" ]; then
 		_ck_away
 		# shellcheck disable=SC2329  # the redefinition is what makes it run as root
 		( is_root() { return 0; }; cmd_rm "$_ck_id" go ) >/dev/null 2>&1
-		t_eq "--rm go keeps the away disk's table" "$(_ck_count awaydisk)" "1"
+		t_eq "rm go keeps the away disk's table" "$(_ck_count awaydisk)" "1"
 		t_eq "and drops the table of the store it deleted from" "$(_ck_count store)" "0"
 	else
-		t_skip "--rm go keeps other tables" "no snapshots enumerated from the stub"
+		t_skip "rm go keeps other tables" "no snapshots enumerated from the stub"
 	fi
 
-	## --thin <LOCATION> <POLICY> go
+	## thin <LOCATION> <POLICY> go
 	snapshots_get store >/dev/null 2>&1
 	_ck_away
 	cmd_thin store "*:none" go >/dev/null 2>&1
-	t_eq "--thin go keeps the away disk's table" "$(_ck_count awaydisk)" "1"
+	t_eq "thin go keeps the away disk's table" "$(_ck_count awaydisk)" "1"
 	t_eq "and drops the table of the store it thinned" "$(_ck_count store)" "0"
 
-	## --backup start: the disk just backed up is re-read before POST_BACKUP
+	## backup start: the disk just backed up is re-read before POST_BACKUP
 	printf 'testvol\t/Volumes/TestVol\t\n' >>"$_ck_lf"
 	printf 'testvol\t2025-01-01-000000\t1735689600\tstale1\t-\t-\t-\t-\t-\tok\tData\n' | t_cache_add
 	_ck_away
@@ -9579,17 +9693,17 @@ t_test_commands_keep_other_tables() {
 	  LOCKFILE="$T_ROOT/backup.lock"; BACKUP_VOLUME="TestVol"; unset BACKUP_VOLUME_RESOLVED
 	  POST_BACKUP_DEFAULT="none"; NOTIFY_BEGIN=0; NOTIFY_END=0; NO_EJECT_FLAGFILE="$T_ROOT/no-eject.ck"
 	  cmd_backup start ) >/dev/null 2>&1
-	t_eq "--backup keeps the away disk's table" "$(_ck_count awaydisk)" "1"
+	t_eq "backup keeps the away disk's table" "$(_ck_count awaydisk)" "1"
 	t_eq "and drops the stale table of the disk it backed up" "$(_ck_count testvol)" "0"
 
-	## --refresh <LOCATION>, then --refresh, with the away disk registered
+	## refresh <LOCATION>, then refresh, with the away disk registered
 	printf 'awaydisk\t%s/gone-disk\t\n' "$T_ROOT" >>"$_ck_lf"
 	_ck_away
 	( tm_refresh() { :; }; cmd_refresh store ) >/dev/null 2>&1
-	t_eq "--refresh store keeps the away disk's table" "$(_ck_count awaydisk)" "1"
+	t_eq "refresh store keeps the away disk's table" "$(_ck_count awaydisk)" "1"
 	_ck_away
 	( tm_refresh() { :; }; cmd_refresh ) >/dev/null 2>&1
-	t_eq "--refresh keeps the away disk's table" "$(_ck_count awaydisk)" "1"
+	t_eq "refresh keeps the away disk's table" "$(_ck_count awaydisk)" "1"
 
 	mv -f "$T_ROOT/locations.ck" "$_ck_lf"
 	snapshots_cache_drop awaydisk
@@ -9717,7 +9831,7 @@ t_test_auto_mount_destinations() {
 }
 
 ## REGRESSION: tmutil verifychecksums prints nothing when a file is intact, so
-## --verify used to produce no output whatsoever -- a clean bill of health and
+## verify used to produce no output whatsoever -- a clean bill of health and
 ## a check that never ran looked exactly alike.
 t_test_verify_reports() {
 	printf '\nChecksum verification always reports\n'
@@ -9730,7 +9844,7 @@ t_test_verify_reports() {
 	t_match "and the offending line is shown" "$_out" "!"
 }
 
-## the reporting half of --verify, without needing a real snapshot to mount
+## the reporting half of verify, without needing a real snapshot to mount
 cmd_verify_report_probe() {
 	_probs=0; _checked=0
 	for _p in "$@"; do
@@ -9751,7 +9865,7 @@ cmd_verify_report_probe() {
 }
 
 ## REGRESSION: locate.mklocatedb and locate.concatdb live in /usr/libexec and
-## are NOT on PATH. my-tm called them by bare name, so every --index run exited
+## are NOT on PATH. my-tm called them by bare name, so every index run exited
 ## 127 per snapshot and built an empty index while reporting success.
 t_test_locate_toolchain() {
 	printf '\nlocate toolchain\n'
@@ -9777,7 +9891,7 @@ t_test_locate_toolchain() {
 	esac
 }
 
-## REGRESSION: an --index run marks its mount exempt from the sweep. A killed
+## REGRESSION: an index run marks its mount exempt from the sweep. A killed
 ## indexer (kill -9 cannot be trapped) left that exemption in place forever,
 ## pinning a snapshot against Time Machine's thinning for good.
 t_test_indexer_exemption_expires() {
@@ -9833,7 +9947,7 @@ t_test_lookup_collapse() {
 }
 
 ## REGRESSION: the snapshot list for a mounted store was trusted for a whole
-## CACHE_TTL. Time Machine adds and thins constantly, so --status reported
+## CACHE_TTL. Time Machine adds and thins constantly, so status reported
 ## "newest backup 1h ago" three minutes after a backup, and offered snapshot
 ## IDs that had already been thinned away. For a store that is already open,
 ## the cached set is checked against reality instead of trusted.
@@ -9852,14 +9966,14 @@ t_test_snapshot_set_is_validated() {
 	t_eq "and the real ones are still listed" \
 		"$(printf '%s\n' "$_rows" | count_lines)" "$_before"
 
-	## --status says how old its picture is, rather than implying it is current
+	## status says how old its picture is, rather than implying it is current
 	t_match "the footer dates the scan" "$(cmd_status 2>&1)" "scanned .* ago"
 }
 
 ## Opt-in indexing. Adversarial where it counts: AUTO_INDEX_TM_BACKUP_DISKS
-## must never override an explicit --no-index (or the opt-out silently undoes
-## itself on the next run); --rm-index must take ONLY its own location's files,
-## never a neighbour's; --no-index must delete nothing at all; and opting in a
+## must never override an explicit no-index (or the opt-out silently undoes
+## itself on the next run); rm-index must take ONLY its own location's files,
+## never a neighbour's; no-index must delete nothing at all; and opting in a
 ## location that DETECTION found must leave a row behind, or the choice is
 ## forgotten the moment the command ends.
 t_test_opt_in_indexing() {
@@ -9882,11 +9996,11 @@ t_test_opt_in_indexing() {
 
 	## an explicit choice beats the setting, in BOTH directions
 	loc_set_index store 0
-	t_eq "--no-index wins over the setting being on" \
+	t_eq "no-index wins over the setting being on" \
 		"$( ( loc_indexes store ) && echo yes || echo no)" "no"
 	AUTO_INDEX_TM_BACKUP_DISKS=0
 	loc_set_index store 1
-	t_eq "and --index wins over it being off" \
+	t_eq "and index wins over it being off" \
 		"$( ( loc_indexes store ) && echo yes || echo no)" "yes"
 	t_eq "the rewritten row keeps its target, and no row is lost" \
 		"$(loc_line store) [$(locations_registered | count_lines)]" \
@@ -9922,22 +10036,22 @@ t_test_opt_in_indexing() {
 	: >"$_oi_d/remote.db"; printf '2026-01-01-000000\n' >"$_oi_d/remote.covered"
 
 	cmd_no_index store >/dev/null 2>&1
-	t_eq "--no-index stops it and deletes nothing" \
+	t_eq "no-index stops it and deletes nothing" \
 		"$( ( loc_indexes store ) && echo yes || echo no) $([ -f "$_oi_d/store.db" ] && echo kept || echo gone)" \
 		"no kept"
 
 	loc_set_index store 1
 	cmd_rm_index store >/dev/null 2>&1
-	t_eq "--rm-index stops it and deletes ITS files, not the neighbour's" \
+	t_eq "rm-index stops it and deletes ITS files, not the neighbour's" \
 		"$( ( loc_indexes store ) && echo yes || echo no) store:$(find "$_oi_d" -maxdepth 1 -name 'store.*' 2>/dev/null | count_lines) remote:$(find "$_oi_d" -maxdepth 1 -name 'remote.*' 2>/dev/null | count_lines)" \
 		"no store:0 remote:2"
 
-	## with nothing opted in, neither the footer nor --index offers to keep going
+	## with nothing opted in, neither the footer nor index offers to keep going
 	_oi_st2=$(cmd_status 2>/dev/null)
 	t_eq "the footer then offers only the way in" \
 		"$(printf '%s\n' "$_oi_st2" | count_match 'not indexed (so') $(printf '%s\n' "$_oi_st2" | count_match 'no-index <LOCATION> stops')" \
 		"1 0"
-	t_eq "and --index with no argument indexes nothing, saying why" \
+	t_eq "and index with no argument indexes nothing, saying why" \
 		"$( ( cmd_index ) 2>&1 | count_match 'nothing is indexed')" "1"
 
 	rm -f "$_oi_d/remote.db" "$_oi_d/remote.covered"
@@ -10101,7 +10215,7 @@ t_test_index_waits_out_a_backup() {
 		"$(printf '%s\n' "$_iw_body" | count_match '[ "$OPT_ALL" = "1" ] && index_wait_for_backup')" "1"
 }
 
-## A --health nobody is watching, and how long an attach talks for.
+## A health nobody is watching, and how long an attach talks for.
 ## Adversarial: the notification must NAME the problem, since a count is
 ## nothing anyone can act on; a failure must get through even with warnings
 ## switched off; a run in a terminal must notify nothing, because the person
@@ -10125,7 +10239,7 @@ t_test_headless_health_notifies() {
 	  HEALTH_FIRST_FAIL="store: newest backup is 9d old"
 	  health_notify_headless )
 	t_eq "a failure is notified, named, with the rest counted -- and where to see them" \
-		"$(count_match "store: newest backup is 9d old (+2 more: $US --health)" <"$_hn_log") of $(count_lines <"$_hn_log")" \
+		"$(count_match "store: newest backup is 9d old (+2 more: $US health)" <"$_hn_log") of $(count_lines <"$_hn_log")" \
 		"1 of 1"
 
 	: >"$_hn_log"
@@ -10164,7 +10278,7 @@ t_test_headless_health_notifies() {
 	  health_notify_headless )
 	t_eq "and a clean run is not an event" "$(count_lines <"$_hn_log")" "0"
 
-	t_eq "--health ends by doing this" \
+	t_eq "health ends by doing this" \
 		"$(sed -n '/^cmd_health() {$/,/^}$/p' "$T_MYTM" | count_match 'health_notify_headless')" "1"
 
 	## how long an attach keeps talking
@@ -10187,7 +10301,7 @@ t_test_headless_health_notifies() {
 }
 
 ## ssh locations. Adversarial: a host that is simply switched off must not read
-## as "reachable" -- answering yes without asking is what made --health report
+## as "reachable" -- answering yes without asking is what made health report
 ## "no snapshots found" for a Mac that was off; a delete must never be run HERE
 ## for a store that is THERE, since `tmutil delete -d host:/path` addresses a
 ## local path; and a host with no my-tm must say which of the two ways out to
@@ -10212,18 +10326,18 @@ t_test_ssh_locations() {
 		"$(loc_reachable remote && echo reached || echo no)" "no"
 
 	## a delete belongs where the store is
-	_r7_rm=$( ( refuse_remote_delete remote --rm ) 2>&1 >/dev/null )
-	t_match "--rm on another host's store is refused" "$_r7_rm" "ssh host1 my-tm --rm"
+	_r7_rm=$( ( refuse_remote_delete remote rm ) 2>&1 >/dev/null )
+	t_match "rm on another host's store is refused" "$_r7_rm" "ssh host1 my-tm rm"
 	t_eq "and a local store is not refused at all" \
-		"$( ( refuse_remote_delete store --rm ) >/dev/null 2>&1; printf 'rc=%s' "$?")" "rc=1"
-	t_eq "--rm asks before it plans anything" \
+		"$( ( refuse_remote_delete store rm ) >/dev/null 2>&1; printf 'rc=%s' "$?")" "rc=1"
+	t_eq "rm asks before it plans anything" \
 		"$(sed -n '/^cmd_rm() {$/,/^}$/p' "$T_MYTM" | count_match 'refuse_remote_delete')" "1"
-	t_eq "and --thin does too" \
+	t_eq "and thin does too" \
 		"$(sed -n '/^cmd_thin() {$/,/^}$/p' "$T_MYTM" | count_match 'refuse_remote_delete')" "1"
 
 	## a host with no my-tm on it: one way out, and nothing is copied over
 	: >"$(t_calls)"
-	_r7_e=$( ( remote_run noinst --ls /x ) 2>&1 >/dev/null )
+	_r7_e=$( ( remote_run noinst ls /x ) 2>&1 >/dev/null )
 	t_match "a host without my-tm says how to install it" "$_r7_e" "not installed on host2 -- run: .* --install host2"
 	t_eq "and neither copies my-tm over nor runs anything there" \
 		"$(count_match 'scp' <"$(t_calls)") $(count_match 'ssh' <"$(t_calls)")" "0 0"
@@ -10251,7 +10365,7 @@ t_test_ssh_locations() {
 	printf '%s\n' "$_r7_save" | cache_write_locations
 }
 
-## Which locations --health covers, and the checks the README promises.
+## Which locations health covers, and the checks the README promises.
 ## Adversarial: LOCAL must NOT mean ALL -- it was a synonym, so every daemon
 ## run on this Mac reached across the network to another host's store; and the
 ## local-snapshot check has to fire in BOTH directions, since none at all and
@@ -10360,7 +10474,7 @@ t_test_remote_add_and_install() {
 	printf '%s\n' "$_ra_save" | cache_write_locations
 }
 
-## Mounts nothing recorded. Seen on horse on 2026-09-16: an --index run died,
+## Mounts nothing recorded. Seen on horse on 2026-09-16: an index run died,
 ## mounts.cache was empty, and one snapshot stayed mounted -- pinned against
 ## Time Machine's thinning with nothing left to say it was there. The sweep
 ## reconciled records against reality but never the other way round, so it
@@ -10628,12 +10742,12 @@ t_test_install_uses_existing_my_tm() {
 	printf '%s\n' "$_ue_save" | cache_write_locations
 }
 
-## --ls columns hold their line whatever the values. Adversarial, from a real
+## ls columns hold their line whatever the values. Adversarial, from a real
 ## listing on horse: 1011.5M, 433.9k and 202.8x! were wider than the fixed
 ## widths, and pushed every later column out of line on the one row that
 ## most needed reading.
 t_test_ls_columns_align() {
-	printf '\n--ls keeps its columns aligned\n'
+	printf '\nls keeps its columns aligned\n'
 	_la=$(printf 'ID\tADDED\tDRIFT\tVOL\naaaaaa\t931.2M\t0.5x\tData\nbbbbbb\t1011.5M\t202.8x!\tData\ncc\t1.1G\t1.0x\tData\n' |
 		table_align "lrrl")
 	t_eq "every row puts VOL at the same column" \
@@ -10660,7 +10774,7 @@ t_test_index_progress_visible() {
 	printf 'zz11zz\tstore\t%s/.mnt/store/%s\t%s\t86400\t1\tindexer\n' "$MOUNT_ROOT" "$_ipv_ts" "$(( $(now_epoch) - 300 ))" >"$_ipv_mc"
 	t_eq "the walk is found, with the snapshot it holds" \
 		"$(index_in_progress store | awk '{print $1}')" "$_ipv_ts"
-	t_eq "and --ls marks that snapshot now" \
+	t_eq "and ls marks that snapshot now" \
 		"$(cmd_ls store 2>/dev/null | grep -v '^ -->' | awk -v t="$(ts_display "$_ipv_ts")" 'index($0, t) {print ($0 ~ / now /) ? "now" : "not"}')" "now"
 	printf 'zz11zz\tstore\t%s/.mnt/store/%s\t1\t86400\t999999\tindexer\n' "$MOUNT_ROOT" "$_ipv_ts" >"$_ipv_mc"
 	t_eq "a dead indexer is not reported as walking" \
@@ -10673,7 +10787,7 @@ t_test_index_progress_visible() {
 ## directory must not be counted -- and the average must divide by what the
 ## index covers, not by how many snapshots the store has.
 t_test_status_index_size() {
-	printf '\n--status shows what each index costs\n'
+	printf '\nstatus shows what each index costs\n'
 	_sz_d="$(cache_write_dir)/index"; mkdir -p "$_sz_d"
 	_sz_save=$(cat "$T_ROOT/cache/locations.tsv")
 	loc_set_index store 1
@@ -10706,7 +10820,7 @@ t_test_status_index_size() {
 
 ## Per-run caching and the private run directory. Adversarial: a cached
 ## location list must not HIDE a location added or forgotten during the same
-## run -- --add then reading it back is exactly that; a host must be asked once,
+## run -- add then reading it back is exactly that; a host must be asked once,
 ## but its "no" must be remembered too, or an unreachable host costs a timeout
 ## per lookup; and nothing per-run may sit at a name another user can predict.
 t_test_run_cache() {
@@ -10776,7 +10890,7 @@ t_test_run_cache() {
 	printf '%s\n' "$_rc_save" | cache_write_locations
 }
 
-## REGRESSION: --open wrote the file it fetches to "$TMPDIR/<the file's name>",
+## REGRESSION: open wrote the file it fetches to "$TMPDIR/<the file's name>",
 ## a name anyone can predict -- and with TMPDIR unset (a root cron job, a
 ## LaunchDaemon) that is /tmp/<name>, where any local user can plant a symlink
 ## and have the root run write through it, wherever it points.
@@ -10785,7 +10899,7 @@ t_test_run_cache() {
 ## live in RUN_DIR -- an application opens it after my-tm has exited -- so the
 ## test holds both halves: unpredictable, and kept.
 t_test_open_keeps_what_it_hands_over() {
-	printf '\n--open keeps the file it hands to an application\n'
+	printf '\nopen keeps the file it hands to an application\n'
 	_op_k=$(tmp_kept_dir opencheck)
 	t_eq "a kept directory sits BESIDE the run's own, never inside it" \
 		"$(dirname "$_op_k")" "$RUN_TMPDIR"
@@ -10898,11 +11012,11 @@ t_test_loc_resolve() {
 	t_match "nor is a relative path" "$_lr_o" "relative=refused"
 	t_eq "a bare path to look up stays a path" \
 		"$(printf '%s' "$_lr_o" | sed -n 's/.*ladder=\([a-z]*\).*/\1/p')" "path"
-	t_match "--no-index refuses a store nothing registered" "$_lr_o" "noindex=refused"
+	t_match "no-index refuses a store nothing registered" "$_lr_o" "noindex=refused"
 	t_eq "and nothing was written to locations.tsv" \
 		"$(cat "$T_ROOT/cache/locations.tsv")" "$_lr_save"
 	## the table by path is the table by handle
-	t_eq "--ls by path shows the same table as --ls by handle" \
+	t_eq "ls by path shows the same table as ls by handle" \
 		"$(cmd_ls "$T_ROOT/store" 2>&1 | shasum)" "$(cmd_ls store 2>&1 | shasum)"
 
 	rm -rf "$_lr_s" "$T_ROOT/plaindir"
@@ -10910,7 +11024,7 @@ t_test_loc_resolve() {
 }
 
 ## A volume's device, from the mount table. Adversarial: diskutil info blocked
-## for 11 s on a busy disk and made --status take 12 s, so the answer must come
+## for 11 s on a busy disk and made status take 12 s, so the answer must come
 ## without it; but a mounted SNAPSHOT of the same disk must not be taken for the
 ## volume, and /Volumes/TM must not match /Volumes/TM2.
 t_test_vol_device() {
@@ -10937,10 +11051,10 @@ t_test_vol_device() {
 }
 
 ## The name index grew by a FULL path list per snapshot (~57 MB each) although
-## --find only asks the union. An increment now holds what its snapshot adds.
+## find only asks the union. An increment now holds what its snapshot adds.
 ## Adversarial: the snapshot walked second is OLDER and becomes the baseline --
 ## a path only it holds is in no delta as a real row, so a delta-only
-## increment would lose it from --find.
+## increment would lose it from find.
 t_test_index_increment_only_new() {
 	printf '\nA name-index increment holds only the paths its snapshot adds\n'
 	## the suite stubs locate.mklocatedb on PATH; this test needs the real one
@@ -11001,7 +11115,7 @@ t_test_index_increment_only_new() {
 ## A walk cut short must leave its snapshot UNINDEXED. Adversarial: the walk
 ## pipeline ends in sort, and sort succeeds just as well on the half a list a
 ## disk pulled mid-walk leaves -- so the tempting shape, mark it covered and
-## move on, closes the snapshot for good and --find answers from half of it,
+## move on, closes the snapshot for good and find answers from half of it,
 ## confidently, for ever. The two cases that matter both look like success
 ## from inside the pipeline: find itself failing, and the location going away.
 ## The third is what keeps the guard from being worse than the bug: a healthy
@@ -11116,7 +11230,7 @@ t_test_increment_names_are_claimed() {
 }
 
 ## "idle" while a walk waits for a backup is the tool stating something that
-## is not true -- nothing is mounted during the wait, which is where --status
+## is not true -- nothing is mounted during the wait, which is where status
 ## reads "walking now" from. Adversarial: the marker must not outlive its run,
 ## because a status stuck on "waiting" for ever is worse than one saying idle.
 t_test_status_says_waiting_not_idle() {
@@ -11134,7 +11248,7 @@ t_test_status_says_waiting_not_idle() {
 	t_eq "...and so is no marker at all" \
 		"$(index_waiting_age store >/dev/null 2>&1; echo $?)" "1"
 	# shellcheck disable=SC2016  # the source line is matched literally
-	t_eq "--status asks before it is allowed to say idle" \
+	t_eq "status asks before it is allowed to say idle" \
 		"$(sed -n '/^cmd_status() {$/,/^}$/p' "$T_MYTM" |
 			count_match 'elif _ixw=$(index_waiting_age')" "1"
 }
@@ -11268,7 +11382,7 @@ t_test_status_marks_guide_the_reader() {
 ## nothing has been written.
 ## Adversarial: the plist must WIN over a cache that still lists a thinned
 ## snapshot; a write after the read must bring the "?" back; an unchanged
-## bundle must cost --ls no attach while a changed one still gets one; and a
+## bundle must cost ls no attach while a changed one still gets one; and a
 ## Running that is still writing must not be called interrupted.
 t_img_plist() {                 # <bundle> <name> <completion date> ...
 	_tip_f="$1/com.apple.TimeMachine.SnapshotHistory.plist"; shift
@@ -11330,7 +11444,7 @@ t_test_image_read_without_attaching() {
 	t_match "(and the table is really there)" "$_ra_det" "besideimg .* 1 "
 	: >"$T_ROOT/calls.log"
 	( CACHE_TTL=0; snapshots_get besideimg >/dev/null 2>&1 )
-	t_eq "--ls: an expired cache of an unchanged bundle attaches nothing" \
+	t_eq "ls: an expired cache of an unchanged bundle attaches nothing" \
 		"$(grep -c 'hdiutil attach' "$(t_calls)")" "0"
 
 	touch "$_ra_img/bands/0"
@@ -11338,7 +11452,7 @@ t_test_image_read_without_attaching() {
 	t_match "a band written after the read: the ? is back" "$_ra_det" "[0-9]d[?]"
 	: >"$T_ROOT/calls.log"
 	( CACHE_TTL=0; snapshots_get besideimg >/dev/null 2>&1 )
-	t_ne "(and --ls reads it again)" "$(grep -c 'hdiutil attach' "$(t_calls)")" "0"
+	t_ne "(and ls reads it again)" "$(grep -c 'hdiutil attach' "$(t_calls)")" "0"
 	## a read records when it began, so the next status needs nothing
 	rm -f "$T_ROOT/cache/read.$(slug "$_ra_img")"
 	# shellcheck disable=SC2329  # the redefinition is what makes the read work
@@ -11371,7 +11485,7 @@ t_test_image_read_without_attaching() {
 }
 
 ## `my-tm /Use<TAB>` completed nothing: the first word was offered commands
-## and handles only, although a bare <PATH> there is --lookup. And the command
+## and handles only, although a bare <PATH> there is lookup. And the command
 ## list was typed by hand and had drifted from --help (--cached, --eject,
 ## --no-eject and --version missing). Adversarial: the lists are compared to
 ## what --help names, both ways, and the zsh function is RUN -- with the
@@ -11380,11 +11494,14 @@ t_test_completion_follows_help() {
 	printf '\nThe completion offers what --help names, and a path in any position\n'
 	_cf_help=$(help_options)
 	t_eq "(--help names a real list)" \
-		"$(printf '%s\n' "$_cf_help" | awk '$0 == "--cached" || $0 == "--lookup" {n++} END {print n+0}')" "2"
+		"$(printf '%s\n' "$_cf_help" | awk '$0 == "--cached" || $0 == "--eject" {n++} END {print n+0}')" "2"
 	t_eq "zsh offers exactly the options --help names" \
 		"$(completion_zsh | sed -nE "s/^ *'(--[a-z][a-z-]*):.*/\1/p" | LC_ALL=C sort -u)" "$_cf_help"
 	t_eq "bash too" \
 		"$(completion_bash | sed -n '/local cmds="/,/"$/p' | tr -s ' "' '\n' | grep -E '^--[a-z]' | LC_ALL=C sort -u)" "$_cf_help"
+	t_eq "and exactly the commands there are" \
+		"$(completion_zsh | sed -nE "s/^ *'([a-z][a-z-]*):.*/\1/p" | LC_ALL=C sort -u)" \
+		"$(t_commands_sorted)"
 	if command -v zsh >/dev/null 2>&1; then
 		completion_zsh >"$T_ROOT/_my-tm"
 		# shellcheck disable=SC2016  # expanded by the zsh it is handed to
@@ -11396,7 +11513,7 @@ t_test_completion_follows_help() {
 			"$(zsh -fc "$_cf_run" zsh /Use "$T_ROOT/_my-tm")" "files:path:_files"
 		t_match "(and to a handle, too)" \
 			"$(zsh -fc "$_cf_run" zsh st "$T_ROOT/_my-tm")" "handles:location:(store)"
-		t_eq "a word with a dash completes to commands only" \
+		t_eq "a word with a dash completes to options only" \
 			"$(zsh -fc "$_cf_run" zsh --ca "$T_ROOT/_my-tm")" "commands "
 		rm -f "$T_ROOT/_my-tm"
 	else
@@ -11526,7 +11643,7 @@ t_test_ssh_never_becomes_a_master() {
 	: >"$(t_calls)"
 	( RUN_CACHE=0; remote_reachable host1 ) >/dev/null 2>&1
 	( remote_find_my_tm host1 ) >/dev/null 2>&1
-	( remote_run remote --ls /x ) >/dev/null 2>&1
+	( remote_run remote ls /x ) >/dev/null 2>&1
 	_sm_made=$(grep '^ssh ' "$(t_calls)")
 	t_ne "(the calls were made)" "$(printf '%s\n' "$_sm_made" | count_lines)" "0"
 	t_eq "every ssh actually run carries ControlMaster=no" \
@@ -11539,7 +11656,7 @@ t_test_ssh_never_becomes_a_master() {
 		"$(printf '%s\n' "$_sm_made" | grep -vc 'ClearAllForwardings=yes')" "0"
 }
 
-## C. A status on horse asked ada to --ls a sparsebundle there, which opened it:
+## C. A status on horse asked ada to ls a sparsebundle there, which opened it:
 ## the "instant" status waited 2m46s. A status asks for the far side's CACHED
 ## table only; anything else that asks may still open it.
 t_test_status_asks_remotes_for_their_cache() {
@@ -11564,14 +11681,14 @@ t_test_status_asks_remotes_for_their_cache() {
 	rm -f "$(snapshots_cache_file)"
 	cmd_status >/dev/null 2>&1
 	t_match "a status asks the remote for its cached table" \
-		"$(grep ' --ls ' "$(t_calls)")" "[-][-]cached [-][-]ls"
+		"$(grep ' ls ' "$(t_calls)")" "[-][-]cached ls"
 
-	## the other way round: a plain --ls of the remote may open it -- asked for
+	## the other way round: a plain ls of the remote may open it -- asked for
 	: >"$(t_calls)"
 	rm -f "$(snapshots_cache_file)"
 	( STATUS_READ=0; cmd_ls remote ) >/dev/null 2>&1
-	t_eq "an explicit --ls of the remote does not restrict it" \
-		"$(grep ' --ls ' "$(t_calls)" | grep -c -- '--cached')" "0"
+	t_eq "an explicit ls of the remote does not restrict it" \
+		"$(grep ' ls ' "$(t_calls)" | grep -c -- '--cached')" "0"
 
 	cp "$T_ROOT/ssh.orig" "$_sc_stub"; chmod 0755 "$_sc_stub"; rm -f "$T_ROOT/ssh.orig"
 
@@ -11609,7 +11726,7 @@ t_test_status_asks_remotes_for_their_cache() {
 }
 
 ## The OTHER half of the same bug (#7, decided 2026-10-27): --cached stopped a
-## status on horse from attaching ada's 4 TB bundle, but a plain `--ls <path>`
+## status on horse from attaching ada's 4 TB bundle, but a plain `ls <path>`
 ## still attached it -- and nobody had asked it to. A store named by PATH is
 ## READ, never opened.
 ## Adversarial twice over. The cache is made STALE, so anything that does not
@@ -11678,7 +11795,7 @@ t_test_path_named_store_is_never_opened() {
 	t_eq "(never \"has no snapshots\": that would read as an empty store)" \
 		"$(printf '%s\n' "$_bp_none" | count_match 'has no snapshots')" "0"
 
-	## --health is a read too, so the same rule -- and it WARNS rather than
+	## health is a read too, so the same rule -- and it WARNS rather than
 	## failing: a store nothing may open says nothing about the backup
 	: >"$(t_calls)"
 	_bp_hout=$(cmd_health "$_bp_img" 2>&1)
@@ -11710,7 +11827,7 @@ t_test_path_named_store_is_never_opened() {
 	if [ -f "$T_ROOT/bp.cache.save" ]; then mv -f "$T_ROOT/bp.cache.save" "$_bp_cf"; else rm -f "$_bp_cf"; fi
 }
 
-## A. --find added THIS Mac's live-disk database to every location's search. On
+## A. find added THIS Mac's live-disk database to every location's search. On
 ## ada, a search in horse's store -- never indexed there -- listed ada's own
 ## /Applications as horse's history: an answer that was confidently wrong.
 t_test_find_searches_only_the_stores_index() {
@@ -11738,18 +11855,23 @@ t_test_find_searches_only_the_stores_index() {
 t_test_bare_command_words() {
 	printf '\nA command typed without its dashes is read as that command\n'
 	_bw_out=$(dispatch_bare list store 2>&1)
-	t_match "'list store' lists the store" "$_bw_out" "'list' taken as --ls"
-	t_match "(it is the --ls table)" "$_bw_out" "SNAPSHOT"
-	t_match "'store list' means the same" "$(dispatch_bare store list 2>&1)" "'list' taken as --ls"
-	_bw_rm=$( ( dispatch_bare rm store ) 2>&1 )
-	t_match "a command that changes things is not run on a guess" "$_bw_rm" "not run on a guess"
-	t_match "and it names the real command" "$_bw_rm" "[-][-]rm"
+	t_match "'list store' lists the store" "$_bw_out" "'list' taken as ls"
+	t_match "(it is the ls table)" "$_bw_out" "SNAPSHOT"
+	t_match "'store list' means the same" "$(dispatch_bare store list 2>&1)" "'list' taken as ls"
+	## The parser takes every exact verb itself, so dispatch_bare never sees
+	## one and there is no dashed form to escalate to. A destructive command
+	## is held by its own `go`, and a dashed verb is answered by name.
+	_bw_conf="$T_ROOT/bare.conf"
+	dash "$T_MYTM" --create-config "$_bw_conf" >/dev/null 2>&1
+	_bw_run() { HOME="$T_ROOT/home" MY_TM_CONFIG="$_bw_conf" dash "$T_MYTM" "$@" 2>&1; }
+	t_match "'rm' reaches rm, which needs go" "$(_bw_run rm)" "the literal word go"
+	t_match "and '--rm' is answered by name" "$(_bw_run --rm)" "you mean"
 
 	## a word that already means something keeps that meaning
 	_bw_save=$(cat "$T_ROOT/cache/locations.tsv")
 	printf 'health\t%s/store\t\n' "$T_ROOT" >>"$T_ROOT/cache/locations.tsv"
 	locations_run_cache_drop
-	t_eq "a location named 'health' is listed, not taken as --health" \
+	t_eq "a location named 'health' is listed, not taken as health" \
 		"$(dispatch_bare health 2>&1 | count_match 'taken as')" "0"
 	printf '%s\n' "$_bw_save" >"$T_ROOT/cache/locations.tsv"
 	locations_run_cache_drop
@@ -11802,7 +11924,7 @@ t_test_every_dash_is_explained() {
 		"$(printf '%s\n' "$_ed_tbl" | awk '/^store /' | t_count_re '[(][0-9]+[)]')" "0"
 }
 
-## --add opened the store to identify it -- for a sparsebundle that is minutes
+## add opened the store to identify it -- for a sparsebundle that is minutes
 ## of attaching -- counted its snapshots for one line of output, and kept
 ## nothing, so the location it had just added showed an empty row until
 ## something else read it.
@@ -11839,7 +11961,7 @@ t_test_status_footnotes() {
 	## the fixture's ssh location cannot be reached, and its store was never read
 	t_match "an empty row points at a note" "$_sf_out" "remote .*-(1)"
 	t_match "which says why there is nothing" "$_sf_out" "(1) remote: host1 is not answering"
-	t_match "and what can be done about it" "$_sf_out" "[-][-]ls remote"
+	t_match "and what can be done about it" "$_sf_out" "ls remote"
 	t_eq "a location with a table gets no note" \
 		"$(printf '%s\n' "$_sf_out" | count_match 'store: nothing has been read')" "0"
 
@@ -11870,7 +11992,7 @@ t_test_status_footnotes() {
 	_sf_out3=$(cmd_status 2>&1 | t_unsup)
 	t_match "an unopened sparsebundle says a status never attaches one" \
 		"$_sf_out3" "never attaches a sparsebundle"
-	t_match "and names the command that reads it once" "$_sf_out3" "[-][-]ls bundle"
+	t_match "and names the command that reads it once" "$_sf_out3" "ls bundle"
 
 	printf '%s\n' "$_sf_save" >"$T_ROOT/cache/locations.tsv"
 	locations_run_cache_drop
@@ -12045,7 +12167,7 @@ t_test_attach_is_not_orphaned() {
 ## Two runs asking for the same image at once started two attaches of it, which
 ## then competed and took longer than either alone. The second must wait for
 ## the first and use its result.
-## A status on another Mac asks it for `-J --cached --ls <path>`, and the JSON
+## A status on another Mac asks it for `-J --cached ls <path>`, and the JSON
 ## table read it LIVE: on ada that attached the sparsebundle -- minutes of wait
 ## for a line that must be instant, the very cost --cached exists to avoid.
 ## Adversarial: the cache is made STALE, so anything but --cached does attach --
@@ -12244,7 +12366,7 @@ t_test_remote_command_is_bounded() {
 	{ printf '#!/bin/sh\n'; printf 'exec sleep 30\n'; } >"$_rb_stub"
 	chmod 0755 "$_rb_stub"
 	_rb_t0=$(now_epoch)
-	_rb_err=$( ( remote_run remote --ls /x ) 2>&1 >/dev/null ) && _rb_rc=0 || _rb_rc=1
+	_rb_err=$( ( remote_run remote ls /x ) 2>&1 >/dev/null ) && _rb_rc=0 || _rb_rc=1
 	_rb_el=$(( $(now_epoch) - _rb_t0 ))
 	t_eq "it gives up instead of waiting with it" \
 		"$([ "$_rb_el" -le 8 ] && echo bounded || echo "waited ${_rb_el}s")" "bounded"
@@ -12255,7 +12377,7 @@ t_test_remote_command_is_bounded() {
 	## killing one for being slow is worse than waiting for it
 	{ printf '#!/bin/sh\n'; printf 'exec sleep 3\n'; } >"$_rb_stub"
 	chmod 0755 "$_rb_stub"
-	_rb_jerr=$( ( remote_job remote --index /x ) 2>&1 >/dev/null ) && _rb_jrc=0 || _rb_jrc=1
+	_rb_jerr=$( ( remote_job remote index /x ) 2>&1 >/dev/null ) && _rb_jrc=0 || _rb_jrc=1
 	t_eq "a job outlives the bound" "$_rb_jrc" "0"
 	t_eq "and nothing is said about giving up" \
 		"$(printf '%s\n' "$_rb_jerr" | count_match 'did not answer')" "0"
@@ -12266,7 +12388,7 @@ t_test_remote_command_is_bounded() {
 	{ printf '#!/bin/sh\n'; printf 'printf "answer\\n"\n'; } >"$_rb_stub"
 	chmod 0755 "$_rb_stub"
 	_rb_t0=$(now_epoch)
-	_rb_out=$(remote_run remote --ls /x 2>/dev/null)
+	_rb_out=$(remote_run remote ls /x 2>/dev/null)
 	_rb_el=$(( $(now_epoch) - _rb_t0 ))
 	t_eq "the answer comes back at once, not when the bound is over" \
 		"$([ "$_rb_el" -le 3 ] && echo prompt || echo "waited ${_rb_el}s")" "prompt"
@@ -12279,11 +12401,11 @@ t_test_remote_command_is_bounded() {
 ## REGRESSION: the design promised an "exclusive size" column from tmutil
 ## uniquesize. That tool refuses on an APFS Time Machine store
 ## ("pathInAPFSBackup"), and nothing else on macOS reports per-snapshot space,
-## so the column could never be filled -- while --index paid for a second full
+## so the column could never be filled -- while index paid for a second full
 ## walk of every snapshot to ask.
 t_test_no_exclusive_size_claims() {
 	printf '\nNo column claims a number macOS will not give\n'
-	t_eq "--ls has no UNIQUE column" \
+	t_eq "ls has no UNIQUE column" \
 		"$(cmd_ls store 2>&1 | count_match 'UNIQUE')" "0"
 	t_eq "--help offers no --unique" "$(usage | count_match '--unique')" "0"
 	t_match "and says why there is no such column" "$(usage)" "no per-snapshot exclusive size"
@@ -12291,7 +12413,7 @@ t_test_no_exclusive_size_claims() {
 	_rows=$(snapshots_get store)
 	_ts=$(printf '%s\n' "$_rows" | head -n 1 | awk -F'\t' '{print $2}')
 	index_one store "$_ts" >/dev/null 2>&1
-	t_eq "--index never calls uniquesize" \
+	t_eq "index never calls uniquesize" \
 		"$(count_match 'tmutil uniquesize' < "$(t_calls)")" "0"
 }
 
@@ -12315,7 +12437,7 @@ t_test_site_conf_dir_from_env() {
 }
 
 ## REGRESSION: a store that is not attached answered -J with an empty array and
-## made every <ID> in it unresolvable, so --rm/--show/--mount all said "no such
+## made every <ID> in it unresolvable, so rm/show/mount all said "no such
 ## snapshot" about backups my-tm had listed a moment earlier. The last known
 ## table is the honest answer, and one place decides it for every caller.
 t_test_detached_store_still_answers() {
@@ -12335,12 +12457,12 @@ t_test_detached_store_still_answers() {
 	cache_read_checked "$_cf" 2>/dev/null | grep -v '^gonestore' | cache_write_checked "$_cf"
 }
 
-## REGRESSION: --rm verifies against the store before deleting. When the store
+## REGRESSION: rm verifies against the store before deleting. When the store
 ## was not attached that check found nothing and reported "already deleted" --
 ## a deletion that never happened, about a backup that is very likely still
 ## there. Unverifiable is its own answer.
 t_test_rm_needs_the_store() {
-	printf '\n--rm will not guess about a store it cannot see\n'
+	printf '\nrm will not guess about a store it cannot see\n'
 	_cf=$(snapshots_cache_file)
 	printf 'gonestore\t/Volumes/NotHere\t\n' >>"$T_ROOT/cache/locations.tsv"
 	printf 'gonestore\t2026-08-20-155805\t1755698285\tzz9999\t-\t1\t2\t3\t-\tok\tData\n' | t_cache_add
@@ -12466,7 +12588,7 @@ t_test_full_disk_access() {
 	FDA_PROBE="$_no"
 	t_eq "an unreadable probe is detected" \
 		"$(has_full_disk_access && echo granted || echo denied)" "denied"
-	t_match "and --health says so with a pointer" "$(cmd_health 2>&1)" "Full Disk Access"
+	t_match "and health says so with a pointer" "$(cmd_health 2>&1)" "Full Disk Access"
 	t_match "naming where to grant it" "$(cmd_health 2>&1)" "System Settings"
 
 	## a probe that is not there at all must not raise a false alarm
@@ -12484,7 +12606,7 @@ t_test_full_disk_access() {
 ## A sparsebundle belongs to the machine that STORES it. Adversarial: detection
 ## picked up /Volumes/*/*.sparsebundle wherever it sat, so horse.sparsebundle on
 ## ada became a location here -- and every health run pulled it over SMB, 1060 s
-## measured. On a share it must not be detected, and --add must refuse it and
+## measured. On a share it must not be detected, and add must refuse it and
 ## name the ssh form instead.
 t_test_network_bundles() {
 	printf '\nA sparsebundle on a share belongs to its host\n'
@@ -12506,7 +12628,7 @@ t_test_network_bundles() {
 		"$(printf '%s\n' "$_nb_det" | count_match 'usbdisk/horse.sparsebundle')" "1"
 
 	_nb_err=$( ( cmd_add "$VOLUMES_DIR/timeMachine/horse.sparsebundle" fromada ) 2>&1 >/dev/null )
-	t_match "--add refuses it" "$_nb_err" "on a network share"
+	t_match "add refuses it" "$_nb_err" "on a network share"
 	t_match "names the host it is stored on" "$_nb_err" "(ada)"
 	t_match "and shows the ssh form" "$_nb_err" "add ada:"
 	t_eq "and registered nothing" \
@@ -12540,7 +12662,7 @@ t_test_bundle_ownership() {
 	t_eq "the host UUID is read back" \
 		"$(bundle_host_uuid "$_share/theirs.sparsebundle")" "BBBB9999-8888-7777-6666-555544443333"
 
-	## what --add shows before asking, without attaching anything
+	## what add shows before asking, without attaching anything
 	_show=$(bundle_show "$_share/mine.sparsebundle" 2>&1)
 	t_match "the summary says whose it is" "$_show" "THIS Mac"
 	t_match "and names the model" "$_show" "Mac16,5"
@@ -12550,9 +12672,9 @@ t_test_bundle_ownership() {
 	MAC_UUID="$_saved"
 }
 
-## --add pointed at a directory full of bundles asks about each in turn.
+## add pointed at a directory full of bundles asks about each in turn.
 t_test_add_picker() {
-	printf '\n--add on a directory of bundles\n'
+	printf '\nadd on a directory of bundles\n'
 	_saved="$MAC_UUID"
 	MAC_UUID="AAAA1111-2222-3333-4444-555566667777"
 	_share="$T_ROOT/share2"; mkdir -p "$_share"
@@ -12658,7 +12780,7 @@ t_test_image_orphan_adoption() {
 
 ## REGRESSION: pruning wrote its scratch files INSIDE the version-store
 ## directory. A location indexed before the version store existed has coverage
-## but no such directory, so the very first thing --index did was fail with a
+## but no such directory, so the very first thing index did was fail with a
 ## shell error and prune nothing.
 t_test_prune_without_version_store() {
 	printf '\nPruning a location that has no version store yet\n'
@@ -12728,7 +12850,7 @@ t_test_delta_removals_by_path() {
 }
 
 ## REGRESSION: every delta was taken against the WALK before it, while a lookup
-## replays them by NAME, i.e. in time. --index --all walks the older snapshots
+## replays them by NAME, i.e. in time. index --all walks the older snapshots
 ## after the newer ones are indexed, and from then on a snapshot inherited what
 ## a later walk had seen: a file reported in a backup that never held it.
 ## Adversarial: the walk order is newest, oldest, then the gaps -- exactly what
@@ -12850,7 +12972,7 @@ t_test_space_is_one_series() {
 }
 
 ## A remote read that FAILED was reported as "the host has not read it yet",
-## which sent the reader to "--ls it once" while the truth was that my-tm was
+## which sent the reader to "ls it once" while the truth was that my-tm was
 ## no longer at the path recorded for that host -- every remote call failing.
 ## Adversarial: a read that genuinely finds nothing must keep the old wording.
 t_test_remote_failure_is_not_unread() {
@@ -12897,22 +13019,22 @@ t_test_user_on_a_root_cache() {
 		-e '^ ~~~ ' -e '^ERROR ' -e '^$' -e '^  *[^ ]' || true; }
 
 	## as the owner: fill the shared cache, then leave the store one generation old
-	_ur_run --status >/dev/null; _ur_run --ls store >/dev/null
+	_ur_run status >/dev/null; _ur_run ls store >/dev/null
 	_ur_id=$(snapshots_get store | head -n 1 | cut -f4)
 	mkdir -p "$T_ROOT/cache/index"
 	printf 'store\t2026-08-20-155805\t/Users/u/stale\t1\t999\t1\n' >>"$T_ROOT/cache/index/versions.tsv"
 	printf '%s\n' "$(( VS_GENERATION - 1 ))" >"$T_ROOT/cache/index/versions.gen"
 	chmod -R a-w "$T_ROOT/cache"
 
-	for _ur_c in "--status" "--ls store" "--ls" "--cached --ls store" "--show $_ur_id" \
-	             "--find stale store" "--lookup /Users/u/stale store" "--health store" \
-	             "--refresh store" "--index store"; do
+	for _ur_c in "status" "ls store" "ls" "--cached ls store" "show $_ur_id" \
+	             "find stale store" "lookup /Users/u/stale store" "health store" \
+	             "refresh store" "index store"; do
 		# shellcheck disable=SC2086  # the command words are split on purpose
 		_ur_err=$(_ur_run $_ur_c)
 		t_eq "$_ur_c: nothing on stderr but my-tm's own lines" "$(_ur_leaks "$_ur_err")" ""
 	done
 	# shellcheck disable=SC2086
-	t_match "(--index still refuses, naming the root command)" "$(_ur_run --index store)" "rerun as root"
+	t_match "(index still refuses, naming the root command)" "$(_ur_run index store)" "rerun as root"
 	t_eq "the stale store is not believed" \
 		"$(vs_lookup store 2026-08-20-155805 /Users/u/stale 2>/dev/null)" ""
 	chmod -R u+w "$T_ROOT/cache"
@@ -12969,7 +13091,7 @@ t_test_index_is_shared_only() {
 	_is_out=$( ( cmd_index store ) 2>&1 )
 	chmod 0750 "$(index_dir)"
 	t_match "a run that may not write it refuses, naming the root command" "$_is_out" \
-		"is the shared name index: needs root -- rerun as root: .* --index store"
+		"is the shared name index: needs root -- rerun as root: .* index store"
 	t_eq "and walks nothing first" "$(count_match 'mount_apfs' <"$(t_calls)")" "0"
 	t_eq "(nor builds a private one)" \
 		"$(for _x in "$CACHE_DIR_USER"/index/store*.db; do [ -e "$_x" ] && echo "$_x"; done | count_lines)" "0"
@@ -13140,7 +13262,7 @@ t_test_install_config() {
 
 ## The daemons' logs follow LOG_DIR. cmd_install needs root, so its body is read.
 ## REGRESSION: the job plists captured stderr only, so everything a daemon
-## printed on stdout was discarded -- the whole --health report included.
+## printed on stdout was discarded -- the whole health report included.
 ## What counts as a network volume. Adversarial: a mount point that is a
 ## string-prefix of another must not claim it, and a name with a space in it
 ## must still be matched whole.
@@ -13178,11 +13300,11 @@ t_test_job_guidance() {
 
 	JOBS_RUN_WITH_FULL_DISK_ACCESS=0
 	_jg_st=$(cmd_status 2>/dev/null)
-	t_eq "--status names the location the jobs cannot see into" \
+	t_eq "status names the location the jobs cannot see into" \
 		"$(printf '%s\n' "$_jg_st" | count_match 'jgnet is on a network volume the jobs cannot see into')" "1"
 	t_eq "and nothing else" "$(printf '%s\n' "$_jg_st" | count_match 'on a network volume the jobs')" "1"
 	JOBS_RUN_WITH_FULL_DISK_ACCESS=1
-	t_eq "with the access granted, --status says nothing about it" \
+	t_eq "with the access granted, status says nothing about it" \
 		"$(cmd_status 2>/dev/null | count_match 'on a network volume the jobs')" "0"
 
 	## the setting is gone, and so is everything it gated: a config that still
@@ -13469,7 +13591,7 @@ t_test_network_volume_of() {
 		"$(path_on_network_volume "$T_ROOT/netmntX/a" && echo yes || echo no)" "no"
 
 	## nothing about a network volume stops a job from REACHING a location any
-	## more -- the expensive case, a sparsebundle on a share, is refused at --add
+	## more -- the expensive case, a sparsebundle on a share, is refused at add
 	printf 'netloc\t%s/horse.sparsebundle\t\n' "$_ng_mnt" >>"$T_ROOT/cache/locations.tsv"
 	## the retired setting is named on purpose: a config that still says 0 must
 	## not be able to stop a job, and saying nothing here would assert nothing
@@ -13491,14 +13613,14 @@ t_test_job_plist_streams() {
 	_jt_bin="${MY_TM_BIN:-}"; _jt_log="${LOG_DIR_ROOT:-}"
 	MY_TM_BIN="/usr/local/sbin/my-tm"; LOG_DIR_ROOT="$T_ROOT/logs"
 	_jt_f="$T_ROOT/job.plist"
-	job_plist test.my-tm.job 86400s --health >"$_jt_f"
+	job_plist test.my-tm.job 86400s health >"$_jt_f"
 	t_eq "the plist lints" "$(plutil -lint "$_jt_f" >/dev/null 2>&1 && echo ok)" "ok"
 	t_eq "stdout is captured, as <label>.log" \
 		"$(plutil -extract StandardOutPath raw -o - "$_jt_f" 2>/dev/null)" "$T_ROOT/logs/test.my-tm.job.log"
 	t_eq "stderr is captured, as <label>.err" \
 		"$(plutil -extract StandardErrorPath raw -o - "$_jt_f" 2>/dev/null)" "$T_ROOT/logs/test.my-tm.job.err"
 	t_eq "the job runs the installed binary with its arguments" \
-		"$(plutil -extract ProgramArguments.1 raw -o - "$_jt_f" 2>/dev/null)" "--health"
+		"$(plutil -extract ProgramArguments.1 raw -o - "$_jt_f" 2>/dev/null)" "health"
 	rm -f "$_jt_f"
 	MY_TM_BIN="$_jt_bin"; LOG_DIR_ROOT="$_jt_log"
 }
@@ -13591,7 +13713,7 @@ t_test_install_builds_no_tree() {
 	## names $FIRMLINK: were it built from tm_root, it would name $MOUNT_ROOT
 	## until the reboot that creates the firmlink, and need rewriting after.
 	_rb=$(sed -n '/^tm_refresh() {$/,/^}$/p' "$T_MYTM")
-	t_eq "--refresh does not rewrite the README" \
+	t_eq "refresh does not rewrite the README" \
 		"$(printf '%s\n' "$_rb" | grep -v '^[[:space:]]*#' | count_match 'tm_write_readme')" "0"
 	## Adversarial: a firmlink that does NOT exist yet -- the state --install
 	## writes in. A real /tm on the machine running the suite would let a
@@ -13610,7 +13732,7 @@ t_test_install_builds_no_tree() {
 		"$(printf '%s\n' "$_ib" | count_match 'tree:       built by $MAINT_JOB on its first run, not here')" "1"
 	# shellcheck disable=SC2016  # the literal source text is matched, not a variable
 	t_eq "and the user is told how to build it now" \
-		"$(printf '%s\n' "$_ib" | count_match 'to build it now: $US --refresh')" "1"
+		"$(printf '%s\n' "$_ib" | count_match 'to build it now: $US refresh')" "1"
 }
 
 t_test_lsof_never_answers() {
@@ -13791,12 +13913,12 @@ t_test_config_search_order() {
 }
 
 ## What happens to the disk when the backup was NOT ours. Adversarial: on horse
-## `my-tm --backup start` met "a backup was already running" and ejected the disk
+## `my-tm backup start` met "a backup was already running" and ejected the disk
 ## anyway, cutting Time Machine's run off. And the lookup for the volume's
 ## location must CONSUME locations_all: an early exit closed the pipe and the
 ## producer took a SIGPIPE ("write error: Broken pipe").
 ## Resolving the destination when it is NOT mounted. Adversarial: on horse the
-## disk was unmounted when --backup start ran, tmutil printed no "Mount Point",
+## disk was unmounted when backup start ran, tmutil printed no "Mount Point",
 ## backup_volume resolved to nothing, and POST_BACKUP then did nothing at all --
 ## silently, because that line was only shown under -V.
 ## Reporting what Time Machine actually did. Adversarial: on horse
@@ -13979,7 +14101,7 @@ t_test_backup_already_running() {
 	## No reader of locations_all may end its awk early: loc_line says why
 	## ("awk must CONSUME the whole pipe here"), and on horse an early exit
 	## made the producer take a SIGPIPE -- "printf: write error: Broken pipe"
-	## during --backup. Reproducing that needs the real timing, so this is a
+	## during backup. Reproducing that needs the real timing, so this is a
 	## check of the SOURCE, not of a run.
 	if [ -r "$T_MYTM" ]; then
 		t_eq "no reader of locations_all ends its awk early" \

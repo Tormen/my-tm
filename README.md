@@ -17,13 +17,13 @@ under `/tm/`.
 
 ```text
 my-tm                            # status of every backup location
-my-tm backup                      # list the snapshots of location "backup"
-my-tm ~/Documents/report.odt          # every version of this file, and where
-my-tm 'invoice*.pdf'            # search the history by name -> paths + versions
+my-tm bkp                        # list the snapshots of location "bkp"
+my-tm ~/Documents/report.odt     # every version of this file, and where
+my-tm 'invoice*.pdf'             # search the history by name -> paths + versions
 my-tm k7f2q9                     # what is snapshot k7f2q9  (6-char ID)
-my-tm k7f2q9 ~/Doc/report.odt         # that file in that snapshot: path + stat
-ls /tm/backup/2026-08-20_1558.05/ # browse any snapshot directly
-my-tm --backup start             # the classic: back up, then quiet the disk
+my-tm k7f2q9 ~/Doc/report.odt    # that file in that snapshot: path + stat
+ls /tm/bkp/2026-08-20_1558.05/   # browse any snapshot directly
+my-tm backup                     # the classic: back up, then quiet the disk
 ```
 
 **Every command starts with `--`; everything without `--` is data** — a
@@ -35,7 +35,7 @@ unambiguous: a file called `status` in `$PWD` can never be mistaken for a verb.
 | Term | Meaning |
 |---|---|
 | **location** | a Time Machine backup disk (`/Volumes/TimeMachine.Backup`), a network store (`<share>/<host>.sparsebundle`), an `ssh` target (`host1:/Volumes/…`), or the pseudo-location `local` (APFS local snapshots, §8) |
-| **handle** | your short name for a location — `backup`, `host1`. Set with `--add`. Anywhere `<LOCATION>` appears, a handle or a path both work |
+| **handle** | your short name for a location — `bkp`, `host1`. Set with `add`. Anywhere `<LOCATION>` appears, a handle or a path both work |
 | **snapshot** | one backup inside a location, `2026-08-20_1558.05` |
 | **ID** | 6-char handle for one snapshot, `k7f2q9`. Stable, machine-independent (§5). Short enough to double-click-select in a terminal |
 | **source volume** | a volume a location backs up (`Macintosh HD - Data`) |
@@ -44,89 +44,112 @@ unambiguous: a file called `status` in `$PWD` can never be mistaken for a verb.
 
 ## 3. Usage
 
+An action is a VERB (`status`, `index`, `backup`); a `--flag` only changes how
+it runs, or does admin around the tool. This is `my-tm --help` verbatim.
+
 ```text
 usage: my-tm [OPTIONS] [<LOCATION>|<ID>] [<PATH>|<GLOB>]
 
 A <LOCATION> is one Time Machine backup store, named either by its path or by
-the short handle you gave it in the CONFIG; a store named by PATH is READ,
-never attached -- attaching takes minutes, and --refresh, --index, --mount and
---verify are the commands that open one. An <ID> is a 6-char name for one
-snapshot inside one location. Everything with -- is interpreted as a command.
-A bare `my-tm` runs $DEFAULT_CMD (default --status).
+the short handle you gave it with `add`; a store named by PATH is READ, never
+attached -- attaching takes minutes, and `refresh`, `index`, `mount` and
+`verify` are the commands that open one. An <ID> is a 6-char name for one
+snapshot inside one location. An action is a VERB; everything with -- is an
+option.
+A bare `my-tm` runs $DEFAULT_CMD (default status).
 
   my-tm                          status of all backup locations
-  my-tm <LOCATION>               list its snapshots                   (= --ls)
-  my-tm <ID>                     show one snapshot                  (= --show)
-  my-tm <PATH> [<LOCATION>]      every version of it [in <LOCATION>] (= --lookup)
-  my-tm '<GLOB>'                 search the history by name         (= --find)
+  my-tm <LOCATION>               list its snapshots                     (= ls)
+  my-tm <ID>                     show one snapshot                    (= show)
+  my-tm <PATH> [<LOCATION>]      every version of it [in <LOCATION>]  (= lookup)
+  my-tm '<GLOB>'                 search the history by name           (= find)
   my-tm <ID> <PATH>              that file, in that snapshot
-  Each short form takes the same optional arguments as the command it maps to,
-  wherever that stays unambiguous.
+  The two bare words may come in either order.
 
 INSPECT
-  --status  [<LOCATION>]         one line per location: snapshots, span, space,
+  status  [<LOCATION>]           one line per location: snapshots, span, space,
                                  index state; all locations if omitted
-  --ls      [<LOCATION>]         snapshot table: when, how much each backup
-                                 added, restore size; every location if omitted
-  --lookup  <PATH> [<LOCATION>]  the distinct versions of PATH and where they
+  ls      [<LOCATION>]           snapshot table: when, how much each backup
+                                 added, restore size, exclusive size*;
+                                 every location if omitted
+  lookup  <PATH> [<LOCATION>]    the distinct versions of PATH and where they
                                  are; searches the locations backing up PATH's
                                  volume if <LOCATION> is omitted, --all for every
                                  known location
-  --find    [<ID>] '<GLOB>' [<LOCATION>]
+  find    [<ID>] '<GLOB>' [<LOCATION>]
                                  without <ID>: search the name index over the
                                  whole history -> paths + version counts
                                  with <ID>:    walk that one snapshot live, no
                                  index needed (slow)
                                  <LOCATION> limits it; all locations if omitted
-  --show    <ID> [<PATH>]        one snapshot; with <PATH>, just that file in it
+  show    <ID> [<PATH>]          one snapshot; with <PATH>, just that file in it
 
 USE
-  --mount   <ID>|<LOCATION>|--all <TTL> [<PATH>]
+  mount   <ID>|<LOCATION>|--all <TTL> [<PATH>]
                                  expose it and print the mountpoint. <TTL> is
                                  MANDATORY -- how long you need it: 7m / 4h /
-                                 5h3m / 2d. <PATH> is where to put it: relative goes
-                                 under /tm, absolute is used as given; under /tm
-                                 if omitted. See `my-tm --mount --help`
-  --umount [-f] <ID>|<LOCATION>|--all
+                                 5h3m / 2d. <PATH> is where to put it: relative
+                                 goes under /tm, absolute is used as given;
+                                 under /tm if omitted. A location alone
+                                 means its newest snapshot; --all means each of
+                                 them. See `my-tm mount --help`
+  umount [-f] <ID>|<LOCATION>|--all
                                  release it early (they expire on their own).
                                  If something still has files open, prints what
                                  is holding it and refuses; -f unmounts anyway
-  --open    <ID> <PATH>          open that version (prints the command first)
-  --cat     <ID> <PATH>          write that version to stdout
-  --cp [-f] <ID> <PATH> [<DEST>] copy it out; <DEST> defaults to $PWD under the
+  open    <ID> <PATH>            open that version (prints the command first).
+                                 From an ssh location it is fetched to a temp
+                                 directory of its own and KEPT -- path printed
+  cat     <ID> <PATH>            write that version to stdout
+  cp [-f] <ID> <PATH> [<DEST>]   copy it out; <DEST> defaults to $PWD under the
                                  original name. Refuses to overwrite without -f
-  --diff    <ID> [<PATH>]        what changed between then and now; the whole
+  diff    <ID> [<PATH>]          what changed between then and now; the whole
                                  snapshot if <PATH> is omitted (slow, warns first)
   ...or just browse:             ls /tm/<LOCATION>/<SNAPSHOT>/
 
 MAINTAIN
-  --index   [<LOCATION>|<ID>...] [--all]
-                                 build the name index --find uses. NOTHING is
-                                 indexed until you say so: naming a <LOCATION>
-                                 opts it in for good (needs root), and without
-                                 arguments it indexes what is already opted in.
+  index   [<LOCATION>|<ID>...] [--all]
+                                 build the name index `find` uses, and record
+                                 each snapshot's exclusive size* on the same
+                                 pass. NOTHING is indexed until you say so:
+                                 naming a <LOCATION> opts it in for good (needs
+                                 root -- the location list is shared), and
+                                 without arguments it indexes the locations
+                                 already opted in. AUTO_INDEX_TM_BACKUP_DISKS=1
+                                 opts in this Mac's backup disks instead.
                                  With --all: every snapshot -- an overnight
-                                 job, warns first
-  --no-index <LOCATION>...       stop indexing it; its index is kept
-  --rm-index <LOCATION>...       stop indexing it and delete its index
-  --verify  <ID> [<PATH>...]     re-check the checksums stored at backup time;
+                                 job, warns first, and waits while a Time
+                                 Machine backup runs rather than blocking its
+                                 thinning (Ctrl-C is safe). The index is
+                                 expensive, so
+                                 it exists once, shared: only root builds it
+                                 (anyone else is told the command). Caches
+                                 are cheap: each user keeps their own
+  no-index <LOCATION>...         stop indexing it; the index it has is kept and
+                                 still answers `find`
+  rm-index <LOCATION>...         stop indexing it and delete its index
+  verify  <ID> [<PATH>...]       re-check the checksums stored at backup time;
                                  the whole snapshot if no <PATH> given
-  --local-snap[shot]             take an APFS local snapshot now.
+  local-snap[shot]               take an APFS local snapshot now.
                                  [daemon: taken every LOCAL_SNAP_INTERVAL]
-  --health  [<LOCATION>]         run the health checks, exit non-zero on the
+  health  [<LOCATION>]           run the health checks, exit non-zero on the
                                  worst; all configured locations if omitted.
                                  [daemon: run every HEALTH_INTERVAL]
 
 MAINTAIN -- these need root + Full Disk Access
-  --rm      <ID>... go           delete snapshot(s). NOT undoable, no trash
-  --thin    [<LOCATION>] ["<POLICY>"] go
+  rm      <ID>... go             delete snapshot(s). NOT undoable, no trash
+  thin    [<LOCATION>] ["<POLICY>"] go
                                  delete the snapshots a retention policy does
                                  not keep; every location and the configured
                                  policy if omitted. Dry-run unless you type `go`
-  --backup  start|stop [--eject|--no-eject]
-                                 run or stop a backup, then do what POST_BACKUP
-                                 says with the disk: none | unmount | eject.
+  backup  [--eject|--no-eject]   run a backup now and wait for it, then do
+                                 what POST_BACKUP says with the disk:
+                                 none | unmount | eject.
                                  [daemon: run on BACKUP_SCHEDULE]
+  stop                           stop the backup that is running
+  trigger                        ask the backup job to run one, and return at
+                                 once -- it outlives this process, so this is
+                                 what a script or another machine asks for
 
 INSTALL & SET UP
   --install [<SSH-HOST>] [go] | --uninstall [<SSH-HOST>] [go]
@@ -134,35 +157,54 @@ INSTALL & SET UP
                                  Without `go` it only prints what it would do,
                                  every host listed. Needs root + Full Disk
                                  Access locally and on each configured ssh host;
-                                 <SSH-HOST> does just that one, all if omitted
+                                 <SSH-HOST> does just that one, all if omitted.
+                                 The jobs get Full Disk Access only with
+                                 JOBS_RUN_WITH_FULL_DISK_ACCESS=1 -- through a
+                                 launcher --install builds, granted once in
+                                 System Settings. A command says so where that
+                                 changed what it did. With LITTLE_SNITCH it
+                                 also allows, in Little Snitch, any program
+                                 via ssh to any host on each ssh location's
+                                 port (from ssh -G), owner system -- nobody
+                                 answers an alert for a job
   --setup                        interactive setup of Time Machine itself --
                                  destinations, exclusions, quota.
                                  See `--setup --help` for the flags to do it
                                  from a script instead
-  --add <FOLDER> [<HANDLE>]      register a location -- appends to
-                                 locations.tsv (root); <HANDLE> defaults to a
+  add <FOLDER> [<HANDLE>]        register a location; <HANDLE> defaults to a
                                  slug of the volume name
-  --forget <HANDLE>              forget a location; locations.tsv only, no
-                                 backup is touched (deleting snapshots is --rm)
-  --refresh [<LOCATION>]         rebuild caches and the /tm tree; all if omitted
+  forget <HANDLE>                forget a location; no backup is touched
+                                 (deleting snapshots is `rm <ID> go`)
+  refresh [<LOCATION>]           rebuild caches and the /tm tree; all if omitted
   --create-config [<FILE>]       print the default config, or write it to <FILE>
   --config <FILE>                use this config instead of the search order
   --completion [zsh|bash]        print the completion script
-  --run-tests [<FILTER>]         run the built-in tests (TAP: the plan '1..N' first,
-                                 then 'ok K - name' per test)
+  --run-tests [<FILTER>]         run the built-in tests: the plan '1..N' first,
+                                 then one 'ok K - name' line per test; only the
+                                 tests whose name contains <FILTER>, if given.
+                                 They run in parallel BLOCKS, one process each
+                                 (3m17s -> 34s); MY_TM_TESTS_JOBS sets how many,
+                                 1 runs them one after another.
+                                 Add --with-snapshots to take a real local snapshot
   --version | --help
 
   ADDED is what a backup WROTE, not what deleting it would free: macOS exposes
   no per-snapshot exclusive size for an APFS Time Machine store, so no column
-  here can honestly claim one (see "Exclusive size" below).
+  here can honestly claim one. See the README.
 
 OPTIONS
   -S|--source <FOLDER>   use this location only, skip autodetect
   -A|--all               no limits: all locations / all rows / all snapshots
   -L|--limit <N>         stop after N rows
   -J|--json              machine-readable output
-  -f|--force             overwrite an existing destination (--cp),
-                         force a busy unmount (--umount)
+  --cached               ls answers from what is already known, and opens
+                         nothing: no mount, no attach, no scan. What a status on
+                         another Mac asks, so its "instant" costs nothing here
+  --eject|--no-eject     with `backup`: eject the disk after it, or leave it
+                         mounted. Both persist until the other is given --
+                         the unattended run included
+  -f|--force             overwrite an existing destination (cp),
+                         force a busy unmount (umount)
   -V|--verbose           echo each tmutil / mount_apfs / find command before it runs
   -D|--debug [<PATH>]    diagnostics: which ladder rung fired, cache hits,
                          resolved snapshot paths   (implies -V)
@@ -178,21 +220,21 @@ is classified by this ladder — first match wins, `-V` prints which rung fired:
 
 | # | Test | Mode |
 |---|---|---|
-| 1 | matches `^[0-9a-z]{6,8}$` **and** hits the snapshot cache | `--show` |
-| 2 | is a handle in the config | `--ls` that location |
-| 3 | is a path **inside a known backup disk** | `--ls` that location |
-| 4 | contains a glob char (`* ? [`) | `--find` (§6); a `/` in the glob anchors it to that directory |
-| 5 | contains `/`, **or** is an existing name in `$PWD` | `--lookup` (§6) |
-| 6 | any other bare word | `--find` (§6) |
+| 1 | matches `^[0-9a-z]{6,8}$` **and** hits the snapshot cache | `show` |
+| 2 | is a handle in the config | `ls` that location |
+| 3 | is a path **inside a known backup disk** | `ls` that location |
+| 4 | contains a glob char (`* ? [`) | `find` (§6); a `/` in the glob anchors it to that directory |
+| 5 | contains `/`, **or** is an existing name in `$PWD` | `lookup` (§6) |
+| 6 | any other bare word | `find` (§6) |
 | 7 | nothing classifiable | error listing the near-misses |
 
 Rungs 4–6 answer "is this a path or a name?" the obvious way: `report.odt` in `$PWD`
 is a path; `report.odt` that does not exist is a name to search for; `*.odt` is
 always a name, `~/a/invoice*.pdf` a name anchored to that directory;
 `~/a/report.odt` is always a path. **`my-tm 'invoice*.pdf'` and
-`my-tm --find 'invoice*.pdf'` are identical** — the ladder just picks the
+`my-tm find 'invoice*.pdf'` are identical** — the ladder just picks the
 command you would have typed. Relative paths resolve against `$PWD` first; give
-`--find` an `<ID>` to search the relative form *inside* a snapshot instead.
+`find` an `<ID>` to search the relative form *inside* a snapshot instead.
 
 **A command typed without its dashes is that command** — asked only of a word
 the ladder's first two rungs did not claim, so a snapshot ID or a location
@@ -201,13 +243,13 @@ Commands that only read run on the word, and say what they took it for:
 
 ```text
 $ my-tm list horse              # same as: my-tm horse list
-    > 'list' taken as --ls
+    > 'list' taken as ls
 ```
 
 `ls`/`list`, `status`, `find`/`search`, `lookup`, `show` and `health` run this
 way. Every other command — the ones that change things or mount — is named and
 refused rather than run on a guess (`'rm' changes things or mounts, so it is
-not run on a guess -- say it with its dashes: my-tm --rm ...`). Without this
+not run on a guess -- say it with its dashes: my-tm rm ...`). Without this
 rule, `list` fell through to rung 6 and was searched for as a name, and the
 search printed every path containing it.
 
@@ -232,30 +274,30 @@ only a person can take red and prefixed `ATTENTION TODO:` so it stays greppable
 in a log.
 
 ```text
-$ my-tm                                            # = --status
+$ my-tm                                            # = status
 LOC     DESTINATION                  SNAPS  SPAN                    LAST  USED/FREE  INDEXED    INDEX           PER SNAP
 backup  /Volumes/TimeMachine.Backup     67  2025-09-28..2026-09-16   17m  3.59T/1.87T 11/67 now  1.60G / ~9.72G   148.5M
 host1   host1:/Volumes/TM.Ext            -  -                          -           -  no                      -         -
 local   / + /System/Volumes/Data        15  2026-09-15..2026-09-16   14m           -  no                      -         -
  --> cache 13.6K · index 1.60G · scanned 3m ago
- --> backup index: walking 2026-09-16_2249.27 now, 7m in · new backups follow automatically · 55 more only with: my-tm --index backup --all
- --> not indexed: host1 local -- index one: my-tm --index <LOCATION>
+ --> backup index: walking 2026-09-16_2249.27 now, 7m in · new backups follow automatically · 55 more only with: my-tm index backup --all
+ --> not indexed: host1 local -- index one: my-tm index <LOCATION>
 
-$ my-tm backup                                     # = --ls backup
+$ my-tm bkp                                        # = ls bkp
 ID      SNAPSHOT             AGE  FILES   ADDED   DRIFT  TOTAL  INDEXED  VOL
 k7f2q9  2026-08-22_1456.25   14m  17.9k    5.3G   1.4x   1.59T  now      Data
 m3x8b1  2026-08-20_1558.05    2d  12.1k    3.9G   1.0x   1.58T  yes      Data
 q4d7h2  2026-07-30_1558.05   23d  91.2k   84.7G  22.0x!  1.51T  no       Data
  --> 409 more (--all) · ADDED median 3.8G · indexed 11/412, walking 2026-08-22_1456.25 now
 
-$ my-tm ~/Documents/report.odt                     # = --lookup
+$ my-tm ~/Documents/report.odt                     # = lookup
 ID      SNAPSHOT             AGE   SIZE  STATE
 k7f2q9  2026-08-22_1456.25   14m  12.4K  =live
 m3x8b1  2026-08-20_1558.05    2d  11.9K  changed
 q4d7h2  2026-07-30_1558.05   23d      -  absent
  --> backup/Data · 3 distinct versions in 412 snapshots
 
-$ my-tm 'invoice*.pdf'                             # = --find
+$ my-tm 'invoice*.pdf'                             # = find
 PATH                                     VERSIONS  NEWEST      OLDEST
 /Users/you/Documents/2026/invoice-4.pdf         3  2026-08-20  2026-03-02
 /Users/you/Documents/2025/invoice-9.pdf         1  2025-11-04  2025-11-04
@@ -276,7 +318,7 @@ horse   /Volumes/TimeMachine.Horse   71  2025-09-28..2026-09-17   1d?  3.59T/1.8
 Every line under the table **starts with the mark it answers** — `?`, `??`
 or a superscript number — so the eye goes from the cell straight to its
 answer, and every one says **what removes the mark**: attach the disk, run
-`my-tm --ls <LOC>` once, `my-tm --local-snap`, `my-tm --backup`, and so on.
+`my-tm ls <LOC>` once, `my-tm local-snap`, `my-tm backup`, and so on.
 A mark with a way out gets one: an image that is already attached (by a
 command, or by the Mac backing up into it) is read live and carries no `?` —
 its cached table is checked against it like a disk's — and `local`'s
@@ -289,7 +331,7 @@ of the snapshots in an image *beside* the image, in
 thinned snapshot gone from it too — so SNAPS, SPAN and LAST come from there:
 today's values, no `?`. Where a bundle has no such list, the dates of its files
 decide: every read records when it began, and a bundle with nothing written
-since still holds exactly that table — no `?`, and `--ls` returns it without
+since still holds exactly that table — no `?`, and `ls` returns it without
 the attach (a bundle written to since is attached as before). my-tm attaches
 read-only, so its own reads never count as a write.
 
@@ -313,8 +355,8 @@ table — why there is nothing, and the command that fills it in:
 LOC    DESTINATION                                     SNAPS  SPAN  LAST      USED/FREE  INDEXED
 horse  /Volumes/backup/timeMachine/horse.sparsebundle      -  -       -¹    9.65T/4.90T  no
 local  / + /System/Volumes/Data                            -  -       -²  281.7G/165.3G  no
-¹ horse: nothing has been read from it yet, and a status never attaches a sparsebundle -- it would take minutes. Read it once with: my-tm --ls horse (about 4m34s, once)
-² local: this Mac keeps no local snapshots right now -- Time Machine makes them only while backing THIS Mac up. my-tm can take them itself: my-tm --local-snap takes one now, LOCAL_SNAP_INTERVAL=1h in the config keeps taking them
+¹ horse: nothing has been read from it yet, and a status never attaches a sparsebundle -- it would take minutes. Read it once with: my-tm ls horse (about 4m34s, once)
+² local: this Mac keeps no local snapshots right now -- Time Machine makes them only while backing THIS Mac up. my-tm can take them itself: my-tm local-snap takes one now, LOCAL_SNAP_INTERVAL=1h in the config keeps taking them
 ```
 
 A mark takes one column per digit, where `(1)` took three. Columns are sized
@@ -342,13 +384,13 @@ fails a test instead of the reader. Two mechanisms, and no cell needs both:
 
 A row where everything is known carries no number at all.
 
-**Opening a store keeps what that cost.** `--add` attaches a sparsebundle to
+**Opening a store keeps what that cost.** `add` attaches a sparsebundle to
 identify it — minutes, on a spinning disk — so it scans it through the cache
 while it is open, rather than counting the snapshots for one line of output and
 throwing the table away. A location is therefore never blank right after being
 added.
 
-**The index columns of `--status`.** `INDEXED` counts the snapshots the index
+**The index columns of `status`.** `INDEXED` counts the snapshots the index
 covers that still exist, `no` for a location not opted in, and adds `now` while
 a walk is running. `INDEX` is that location's index on disk (database,
 increments, coverage record, version store); while coverage is partial it adds
@@ -358,8 +400,8 @@ line per indexed location says what is being walked, or that it is waiting for a
 Time Machine backup to finish (nothing is mounted during that wait, so it would
 otherwise read as idle), or when it last ran, whether new backups follow
 automatically, and how many older snapshots only
-`--index <LOC> --all` will cover: the automatic runs take each new backup, never
-the history in between. `--ls` marks every snapshot `yes`, `no` or `now`. Anything longer than
+`index <LOC> --all` will cover: the automatic runs take each new backup, never
+the history in between. `ls` marks every snapshot `yes`, `no` or `now`. Anything longer than
 ~2 lines of prose belongs in `--help`, not in runtime output.
 
 ### The size columns, precisely
@@ -371,7 +413,7 @@ the history in between. `--ls` marks every snapshot `yes`, `no` or `now`. Anythi
 | **TOTAL** | `stats.propagated.logicalSize` | the **absolute** logical size of everything in that snapshot: what a full restore would occupy **on an empty disk**. It is *not* a delta against your current live disk |
 
 The fourth question — *how much would restoring this change my disk as it is
-now?* — is a comparison, not a stored statistic: that is `--diff <ID>`, which
+now?* — is a comparison, not a stored statistic: that is `diff <ID>`, which
 walks and therefore is never a table column. It is read-only and harmless, so it
 just runs — after printing one warning line with an ETA derived from the
 snapshot's file count and the last measured walk rate:
@@ -392,7 +434,7 @@ On an APFS Time Machine store macOS exposes no such number:
 
 So the honest columns are the ones the manifest really holds: **ADDED**, what a
 backup wrote, and **TOTAL**, what it would restore. Asking for exclusive size
-also cost `--index` a second full walk of every snapshot — to fail each time.
+also cost `index` a second full walk of every snapshot — to fail each time.
 
 ## 5. Snapshot IDs *(spec)*
 
@@ -410,9 +452,9 @@ also cost `--index` a second full walk of every snapshot — to fail each time.
   prefix clash *across* locations is resolved at parse time instead: the error
   lists the candidates as `<handle>@<ID>`.
 * Prefixes of ≥4 chars accepted while unambiguous. Also accepted: `latest`,
-  `-1` … `-N`, `<handle>@<date-prefix>` (`backup@2026-08-20`).
+  `-1` … `-N`, `<handle>@<date-prefix>` (`bkp@2026-08-20`).
 * A vanished ID gets a concise, instructive error:
-  `k7f2q9: snapshot gone (backup, 2026-08-22 14:56, deleted since 2026-08-23). my-tm --ls backup`
+  `k7f2q9: snapshot gone (backup, 2026-08-22 14:56, deleted since 2026-08-23). my-tm ls backup`
 
 IDs live on the CLI only. Under `/tm` the directories are timestamps (§8) —
 there, sorting matters more than typing.
@@ -434,7 +476,7 @@ or `-S` narrows, `--all` widens to every known location.
   snapshots, which would report 100 versions of a file that never changed.
 * Snapshots are immutable, so every answer is a **permanent fact**. my-tm
   keeps them in the version store (§7): a snapshot already covered — fully, by
-  an `--index` walk, or for this path, by any earlier lookup of it — is
+  an `index` walk, or for this path, by any earlier lookup of it — is
   answered from the store with
   **no mount at all**. Only uncovered snapshots are touched live: one
   short-lived read-only `mount_apfs` plus one `stat` each, batched into a
@@ -466,7 +508,7 @@ Results are **grouped by path**, one row per path with a version count, because
 the same name usually lives in several directories and the directory is what
 tells them apart. `--all` expands to one row per version inline.
 
-Given an `<ID>`, `--find` switches to a live tree walk of that one snapshot —
+Given an `<ID>`, `find` switches to a live tree walk of that one snapshot —
 slow, explicit, needs no index, and the right tool when you know the snapshot
 but not the name.
 
@@ -488,16 +530,16 @@ $CACHE_DIR/index/<loc>.versions/ -> the version store: a baseline plus one
                                   compressed delta per snapshot (path, size, mtime), §6
 ```
 
-* **Nothing is indexed until you say so.** `--index <LOCATION>` opts a
-  location in for good *and* indexes it now; `--no-index <LOCATION>` stops,
-  keeping what was built, and `--rm-index <LOCATION>` stops and deletes it.
+* **Nothing is indexed until you say so.** `index <LOCATION>` opts a
+  location in for good *and* indexes it now; `no-index <LOCATION>` stops,
+  keeping what was built, and `rm-index <LOCATION>` stops and deletes it.
   The choice is the `INDEX` column of the shared `locations.tsv`, so the
   daemons read the same answer — which is why writing it needs root.
   `AUTO_INDEX_TM_BACKUP_DISKS=1` opts in this Mac's own backup disks instead
   (a sparsebundle stored on one included); never `local`, whose snapshots are
   a decision rather than a default, and never an ssh location, which its own
   host's config decides for. A per-location choice always wins over the
-  setting, in both directions. `--status` reports the result in its `INDEXED`
+  setting, in both directions. `status` reports the result in its `INDEXED`
   column — `no`, or how many of that location's snapshots the index covers —
   and its footer names the command to change it.
 * **When it is updated.** An opted-in location is indexed when there is a
@@ -519,7 +561,7 @@ $CACHE_DIR/index/<loc>.versions/ -> the version store: a baseline plus one
   anyway.
 * **Tier 1, free**: every path that exists *now* is already in the system
   `locate` database, refreshed by macOS. Costs nothing, covers most searches.
-* **Tier 2, `--index`**: walks snapshots to catch paths that no longer exist
+* **Tier 2, `index`**: walks snapshots to catch paths that no longer exist
   anywhere live. `find <snapshot> | locate.mklocatedb` per snapshot, merged with
   `locate.concatdb` — both of which live in `/usr/libexec`, not on `PATH`.
 * **The same walk fills the version store**, which is what lets my-tm answer
@@ -532,24 +574,24 @@ $CACHE_DIR/index/<loc>.versions/ -> the version store: a baseline plus one
   * every later one is stored as a gzipped **delta** against the indexed
     snapshot just before it **in time**, `<loc>.versions/d.<ts>.tsv.gz`.
     Walks do not come in time order — `INDEX_BASELINES` walks the newest, then
-    the oldest, and `--index --all` fills in the gaps afterwards — so a snapshot
+    the oldest, and `index --all` fills in the gaps afterwards — so a snapshot
     walked before an indexed one also rewrites that one's delta (or becomes the
     new baseline). The rewrite is done in a hard-linked copy of the store and
     swapped in whole, so an interrupted run leaves the store as it was.
     A store written by an earlier my-tm (uncompressed deltas against the
-    previous *walk*) is converted once, by the first `--index` run that meets it.
+    previous *walk*) is converted once, by the first `index` run that meets it.
 
   Measured on a real 4.4 M-file snapshot: the full listing is 722 MB raw and
   **35 MB gzipped**, and a delta at the observed churn is a few hundred KB. So
   a whole history costs one baseline plus small deltas, not a baseline per
   snapshot. Because snapshots are immutable these rows are facts, never stale;
-  `--lookup` serves every covered snapshot from them with no mount (§6), and
+  `lookup` serves every covered snapshot from them with no mount (§6), and
   what it still has to read live it files alongside, so coverage grows with use.
 
   Each new backup is one more snapshot to index, so keeping up is one
   incremental walk — the same work the daemon already wakes up to do.
 * **Cost, honestly**: one snapshot walk is minutes, and there is no cheap delta
-  — `tmutil compare` walks both trees too. So `--index --all` over 412 snapshots
+  — `tmutil compare` walks both trees too. So `index --all` over 412 snapshots
   is an overnight job. It runs detached, prints progress, and is resumable;
   `.covered` means a re-run only does what is missing. Resumable includes the
   snapshot that was in flight: a walk that did not finish — the disk pulled
@@ -568,7 +610,7 @@ $CACHE_DIR/index/<loc>.versions/ -> the version store: a baseline plus one
   looking busy while indexing nothing. The disk no longer being attached is
   the other. An ordinary mount failure, and a snapshot thinned away since the
   list was read, still belong to their own snapshot and the walk carries on.
-* **`--index --all` and the sweep.** It starts with a warning naming the
+* **`index --all` and the sweep.** It starts with a warning naming the
   snapshot count and the ETA, because while it runs Time Machine's thinning is
   blocked on whatever it currently holds. That is acceptable for a run you do
   **once**, which is what this is. A backup writing to that same disk is not:
@@ -590,7 +632,7 @@ $CACHE_DIR/index/<loc>.versions/ -> the version store: a baseline plus one
   something the dying run does for itself.
 * **Sensible default**: `INDEX_BASELINES="newest oldest"` — two walks catch
   everything that exists now plus everything that existed at the start.
-  `--index <ID>...` adds specific snapshots; `--index --all` does the lot.
+  `index <ID>...` adds specific snapshots; `index --all` does the lot.
 * **Size — measured, not guessed.** A measured system `locate` database holds
   3.5 M filenames in 35 MB: **10.5 bytes per path**,
   7 % of the raw text. So one fully-walked 4.5 M-file snapshot is about
@@ -617,15 +659,15 @@ $CACHE_DIR/index/<loc>.versions/ -> the version store: a baseline plus one
   the paths it **adds** — the real rows of its version-store delta, since
   every other path it holds is already in the indexed snapshot before it.
   Only a snapshot that becomes the baseline writes its whole list. Queries pass the
-  whole set to `locate -d`. **`--index` consolidates at the end of its own run**, once the increments
+  whole set to `locate -d`. **`index` consolidates at the end of its own run**, once the increments
   exceed `INDEX_INC_MAX`: it dumps them
   all, `sort -u`s, rebuilds one database and drops the increments. Doing it
   there rather than in the maintenance daemon costs a few minutes on a job that
   already took hours, and buys predictability — a heavy `sort -u` never fires
-  at an arbitrary moment, and when `--index` returns the index is in its final
+  at an arbitrary moment, and when `index` returns the index is in its final
   state. Duplicates between increments are
   harmless to a query — they only cost space until the next consolidation,
-  which is the usual log-structured trade and the reason an `--index` run never
+  which is the usual log-structured trade and the reason an `index` run never
   has to read the existing index first.
 * **Two indexers at once is normal**, so the increment name is **claimed**, not
   looked up: the `--all` walk and the daemon indexing the backup that has just
@@ -639,10 +681,10 @@ $CACHE_DIR/index/<loc>.versions/ -> the version store: a baseline plus one
   It used to be added to every location's search: on ada, a search in horse's
   store — which ada had never indexed — listed ada's own `/Applications` as
   horse's history. A store with no index now says so instead of answering:
-  `not indexed here, so not searched: horse -- index one: my-tm --index <LOCATION>`,
+  `not indexed here, so not searched: horse -- index one: my-tm index <LOCATION>`,
   and the same line follows a result list when some locations were not searched.
-* **my-tm tells you when it is behind**: a `--find` that comes up empty says
-  `index covers 12/412 snapshots (my-tm --index backup)` instead of claiming the
+* **my-tm tells you when it is behind**: a `find` that comes up empty says
+  `index covers 12/412 snapshots (my-tm index backup)` instead of claiming the
   file never existed.
 
 ## 8. Browsing: `/tm` *(spec)*
@@ -657,18 +699,18 @@ mounting, under one typeable tree:
 
 ```text
 /tm/                                  firmlink -> $MOUNT_ROOT   (§9)
-/tm/backup/2026-08-20_1558.05/Data    -> the mount; empty until it is made
-/tm/backup/latest -> …                newest snapshot
-/tm/backup/by-id/<ts>_<ID>            reach one by the ID my-tm prints
+/tm/bkp/2026-08-20_1558.05/Data       -> the mount; empty until it is made
+/tm/bkp/latest -> …                   newest snapshot
+/tm/bkp/by-id/<ts>_<ID>               reach one by the ID my-tm prints
 /tm/local/2026-08-22_1556.39/Data     same, for an APFS local snapshot
 $MOUNT_ROOT/.mnt/<loc>/<ts>/          where the real mountpoints live
 ```
 
-**Every snapshot dir is a placeholder until mounted.** `--refresh` writes the
-tree, so `ls /tm/backup/` always lists what exists, and each snapshot directory
+**Every snapshot dir is a placeholder until mounted.** `refresh` writes the
+tree, so `ls /tm/bkp/` always lists what exists, and each snapshot directory
 holds one entry per volume; the volume fills in when you or my-tm mount it —
-`--mount` does it explicitly and TTL'd (below), and
-`--lookup`, `--find <ID>`, `--open`, `--cat`, `--cp` and `--diff` mount
+`mount` does it explicitly and TTL'd (below), and
+`lookup`, `find <ID>`, `open`, `cat`, `cp` and `diff` mount
 **transiently** on the way in: released before the command exits (trap-
 protected), recorded with a short fallback TTL so the sweep reaps what a
 `kill -9` leaks. Once mounted, `cd`, `ls`, `cp`, `rsync -axSHP`, `diff` and
@@ -695,8 +737,8 @@ the host and path, and the two things you can actually do with it:
 This location lives on another machine:  <host>:<path>
 Its snapshots cannot be browsed from here (that would need sshfs/macFUSE).
 
-  my-tm --ls <loc>              list its snapshots from here (over ssh)
-  my-tm --cat|--cp|--open <ID> <PATH>   fetch one file from it (over ssh)
+  my-tm ls <loc>              list its snapshots from here (over ssh)
+  my-tm cat|cp|open <ID> <PATH>   fetch one file from it (over ssh)
   ssh <host>                    log in, then browse /tm/<loc>/ there
 
 my-tm installed there: yes, /usr/local/bin, 2026-08-21_1430.07
@@ -719,12 +761,12 @@ earn their place twice over: those ~24 h of hourly snapshots are the only
 history you still have when the backup disk is detached, and they are the
 fastest thing on the machine to read.
 
-### `--mount` — the TTL'd form
+### `mount` — the TTL'd form
 
-`--mount <ID>|<LOCATION>|--all <TTL> [<PATH>]` mounts under `/tm` by default,
+`mount <ID>|<LOCATION>|--all <TTL> [<PATH>]` mounts under `/tm` by default,
 or under `<PATH>` when you give one (with `--all`, each snapshot becomes a
-subdirectory of `<PATH>`), and prints the mountpoint. `--mount <LOCATION>`
-means its newest snapshot; `--mount <LOCATION> --all <TTL>` mounts every
+subdirectory of `<PATH>`), and prints the mountpoint. `mount <LOCATION>`
+means its newest snapshot; `mount <LOCATION> --all <TTL>` mounts every
 snapshot of that location — measured at seconds, not minutes. It also covers
 what nothing else does: a store on a disk attached from another Mac, which
 Time Machine's own browser will not open.
@@ -751,8 +793,8 @@ case, a sparsebundle on a share, is refused where it is registered rather than
 worked around here — it belongs to the host that stores it and is read there
 over ssh (*Network stores*, §11). What a job still needs for a store on a
 share is Full Disk
-Access, without which it finds an empty directory; `--status`, `--health`,
-`--show` and `--refresh` say so where that is the case (§9).
+Access, without which it finds an empty directory; `status`, `health`,
+`show` and `refresh` say so where that is the case (§9).
 
 ### What the sweep is for
 
@@ -763,18 +805,18 @@ space by purging local snapshots, so a forgotten mount can end as a **full
 startup disk**. The TTL and the sweep exist to guarantee every mount my-tm
 made is released. `latest`/`by-id` symlinks, `REMOTE` files and unmounted
 placeholder dirs hold nothing and need neither — which is why the lifetime is
-asked for at `--mount` time rather than configured globally: it only ever
+asked for at `mount` time rather than configured globally: it only ever
 applies to a mount you deliberately made.
 
 ### The TTL belongs to the mount, not to the config
 
-**`--mount` requires you to say how long you need it.** There is no global
+**`mount` requires you to say how long you need it.** There is no global
 `MOUNT_TTL_MIN`; the lifetime is an argument:
 
 ```text
-my-tm --mount k7f2q9 20m          # twenty minutes, under /tm
-my-tm --mount local 4h            # four hours
-my-tm --mount backup 5h3m /mnt/x  # combined units, at a path you chose
+my-tm mount k7f2q9 20m          # twenty minutes, under /tm
+my-tm mount local 4h            # four hours
+my-tm mount backup 5h3m /mnt/x  # combined units, at a path you chose
 ```
 
 `<TTL>` is `<N>m`, `<N>h` or `<N>d`, combinable (`5h3m`). It goes into the mount record
@@ -799,7 +841,7 @@ backups' worth of thinning:
 
 It warns and proceeds — it is your disk — and also raises a notification when
 `NOTIFY_MOUNT_WARN=1`, because the mount may well outlive the terminal you
-started it in. `--mount --help` (or `--help --mount`) prints the same rule in
+started it in. `mount --help` (or `--help mount`) prints the same rule in
 four lines, with the reasonable value for *your* destinations filled in.
 
 The sweep then releases a mount when **any** of these is true:
@@ -829,12 +871,12 @@ ID  location  mountpoint  made-at  ttl-seconds  pid  flags
 only, §13); the sweep reads all of them, and nothing else anywhere tracks
 mounts. `flags` marks the two special lifetimes: `transient` (a mount a
 command makes and releases itself, carrying only the fallback TTL) and
-`indexer` (the one snapshot an `--index` run is walking, exempt from the
+`indexer` (the one snapshot an `index` run is walking, exempt from the
 sweep, §7).
 
 **Every mount, anywhere** — under `/tm` or at any path you passed. A mount at
 `/tmp/x` is invisible in the `/tm` tree but fully tracked, which is what lets
-`--umount --all`, `--status` and the sweep account for all of them.
+`umount --all`, `status` and the sweep account for all of them.
 
 The record is reconciled, not trusted: each sweep compares it against the real
 mount table, so a mount you released yourself with `umount(8)` is **silently
@@ -849,23 +891,23 @@ line that matches nothing real is dropped, not obeyed.
 | Path | Made by | Why you would use it |
 |---|---|---|
 | `/tm/README` | `--install` | what this tree is (a) and how to use it (b) — one screen, no scrolling |
-| `/tm/<loc>/<ts>/<vol>/` | `--refresh` (placeholder), filled by a mount | browse a snapshot; `--mount` (or any command that goes in) fills it |
-| `/tm/<loc>/latest` | `--refresh` (symlink) | the newest snapshot without looking up a date |
-| `/tm/<loc>/by-id/<ts>_<ID>` | `--refresh` (symlink) | reach a snapshot by the ID you read off the CLI. **Timestamp first**, so a plain `ls` sorts chronologically — nobody wants a directory sorted by hash |
-| `/tm/local/<ts>/<vol>/` | `--mount local` | the last ~24 h — the only history that works with the backup disk detached |
-| `/tm/<custom>/` | `--mount … <PATH>` | a mount you placed elsewhere **under `/tm`** on purpose. `--mount … /tmp/x` mounts at `/tmp/x` and is **not** visible under `/tm` |
-| `/tm/<loc>/REMOTE` | `--refresh` | an `ssh` location: a text file saying so, and how to reach it. Remote snapshots are **not** browsable locally |
+| `/tm/<loc>/<ts>/<vol>/` | `refresh` (placeholder), filled by a mount | browse a snapshot; `mount` (or any command that goes in) fills it |
+| `/tm/<loc>/latest` | `refresh` (symlink) | the newest snapshot without looking up a date |
+| `/tm/<loc>/by-id/<ts>_<ID>` | `refresh` (symlink) | reach a snapshot by the ID you read off the CLI. **Timestamp first**, so a plain `ls` sorts chronologically — nobody wants a directory sorted by hash |
+| `/tm/local/<ts>/<vol>/` | `mount local` | the last ~24 h — the only history that works with the backup disk detached |
+| `/tm/<custom>/` | `mount … <PATH>` | a mount you placed elsewhere **under `/tm`** on purpose. `mount … /tmp/x` mounts at `/tmp/x` and is **not** visible under `/tm` |
+| `/tm/<loc>/REMOTE` | `refresh` | an `ssh` location: a text file saying so, and how to reach it. Remote snapshots are **not** browsable locally |
 
 `/tm/<loc>/<ts>/` directories are shown as **empty placeholders** when nothing
 is mounted, so `ls` still tells you which snapshots exist. An empty
 `/tm/local` means **you have no local APFS snapshots yet**, and
-my-tm mounts what does exist for you on `--mount`, `--open`, `--cat`, `--cp`
-and `--diff`.
+my-tm mounts what does exist for you on `mount`, `open`, `cat`, `cp`
+and `diff`.
 
-**Making local snapshots.** `--local-snapshot` (`--local-snap`) runs
+**Making local snapshots.** `local-snapshot` (`local-snap`) runs
 `tmutil localsnapshot` — an immediate on-disk snapshot, useful right before an
 upgrade or a risky edit. **No root needed** (verified on macOS 26: an ordinary
-user created one). `--rm <ID> go` deletes one (§10).
+user created one). `rm <ID> go` deletes one (§10).
 
 They can also be taken on a schedule, by the maintenance job:
 `LOCAL_SNAP_INTERVAL` — `<N>m` or `<N>h`, any value from one minute up to a
@@ -891,7 +933,7 @@ distinguishes a snapshot my-tm made from one macOS made — they are all
   keeps roughly the last **24 hours**, deleting older ones. The cadence is *your
   setting*, not a law: `AutoBackupInterval` (hourly by default, and macOS 13+
   offers hourly / daily / weekly in System Settings). my-tm reads that value
-  rather than assuming, which is also what the `--mount` TTL check uses.
+  rather than assuming, which is also what the `mount` TTL check uses.
 * **Space pressure** — `deleted(8)` reclaims local snapshots as "purgeable
   space" when the boot volume fills, at any age, without warning.
 
@@ -902,15 +944,15 @@ So retention is bounded by macOS whatever my-tm does, and
 window. Both thin the oldest first, regardless of who created them, and my-tm
 says so before it does.
 
-**`--open`, `--cat`, `--cp` and `--diff` are conveniences, not a filesystem
+**`open`, `cat`, `cp` and `diff` are conveniences, not a filesystem
 layer.** Everything they do, `cp` and `rsync -axSHP` do too, on the `/tm` path.
 They exist because they resolve `<ID>` for you and mount the snapshot
 transiently on the way in; each prints the command it is about to run before
-running it. On an `ssh` location they run remotely: `--cat` streams the file
-back over `ssh`, `--cp` lands it at the local `<DEST>`, and `--open` fetches it
+running it. On an `ssh` location they run remotely: `cat` streams the file
+back over `ssh`, `cp` lands it at the local `<DEST>`, and `open` fetches it
 into a temp directory of its own first and opens it there, printing the path
 — that file is kept, since the application reads it after my-tm has gone.
-`--cp` **refuses to overwrite an existing destination** and needs `-f` to do
+`cp` **refuses to overwrite an existing destination** and needs `-f` to do
 it — deliberately stricter than `/bin/cp`, since the whole point of pulling a
 file out of a backup is that the live copy is the one you are worried about.
 There is deliberately **no `--restore`** — `tmutil restore` strips Time
@@ -933,7 +975,7 @@ change before making it.
    `MAINT_INTERVAL`; everything else under it is derived data my-tm rebuilds.
    Without this, `backupd` walks that tree while it changes underneath and logs
    "Failed to read sticky exclusion extended attribute". `--uninstall` removes
-   the exclusion again, and `--health` warns if it ever stops being in place.
+   the exclusion again, and `health` warns if it ever stops being in place.
 3. checks `/etc/synthetic.conf` for the firmlink and adds it if missing, with
    exactly one comment line above it:
 
@@ -965,7 +1007,7 @@ change before making it.
    a fresh install nothing is cached, so a sparsebundle on a share would have
    to be attached — minutes of waiting, for a tree that `$MAINT_JOB` builds on
    its first run and that only becomes reachable as `/tm` after the reboot.
-   `--install` says so in one line and names `my-tm --refresh` for building it
+   `--install` says so in one line and names `my-tm refresh` for building it
    at once.
 5. with `JOBS_RUN_WITH_FULL_DISK_ACCESS=1`, builds the launcher the jobs run
    through (below) and prints the one manual step, granting it Full Disk Access.
@@ -1024,9 +1066,9 @@ launcher is covered by Terminal's grant, not its own.
 **Hints.** A command mentions this value only where it changed what it did in
 that run, in one line naming the value to flip:
 
-* `--health`: a location the jobs cannot see into, and `HEALTH_VERIFY` without
+* `health`: a location the jobs cannot see into, and `HEALTH_VERIFY` without
   the access;
-* `--status`, `--show` (on its `BROWSE` line) and `--refresh`: a location on a
+* `status`, `show` (on its `BROWSE` line) and `refresh`: a location on a
   network volume whose `/tm` tree the jobs cannot keep current.
 
 Every other command runs with your own access, and says nothing about it.
@@ -1056,9 +1098,9 @@ there, and with `go` writes the missing ones through `LITTLE_SNITCH` (default
   without confirmation: **destinations** (add/remove/list, enable/disable
   automatic backups), **exclusions** (list/add/remove, `-p` sticky, plus a quick
   `isexcluded` check), **quota** (cap how much of a shared disk this Mac may use).
-* **`--forget <HANDLE>`** — forget a location: removes its `locations.tsv`
+* **`forget <HANDLE>`** — forget a location: removes its `locations.tsv`
   line, touches no backup, so no confirmation.
-* **`--rm <ID>… go`** — delete snapshots (`tmutil delete -d <mount> -t <ts>`;
+* **`rm <ID>… go`** — delete snapshots (`tmutil delete -d <mount> -t <ts>`;
   root + Full Disk Access) or local snapshots (`tmutil deletelocalsnapshots`,
   no root). Prints what will go and the space it frees, then needs the literal
   word `go`. **There is no trash for this**: deleting an APFS snapshot
@@ -1066,11 +1108,11 @@ there, and with `go` writes the missing ones through `LITTLE_SNITCH` (default
   ID→snapshot resolution is re-verified against the store itself — the cache
   is an index, never the authority for a destructive call; an ID whose
   snapshot is already gone reports `already deleted` and exits 0.
-* **`--thin [<LOCATION>] ["<POLICY>"] go`** — **yes, this works.** Time Machine
+* **`thin [<LOCATION>] ["<POLICY>"] go`** — **yes, this works.** Time Machine
   on APFS stores each backup as an *independent* APFS snapshot, not a chain of
   deltas: blocks stay referenced by whichever snapshots still need them, so
-  deleting an intermediate snapshot is safe and needs **no relinking**. `--thin`
-  therefore just selects what to keep and calls `--rm` for the rest. Dry-run by
+  deleting an intermediate snapshot is safe and needs **no relinking**. `thin`
+  therefore just selects what to keep and calls `rm` for the rest. Dry-run by
   default; `go` performs it.
 
   Policy syntax — a list of `<SPAN>:<GRANULARITY>` pairs, each span counted
@@ -1088,7 +1130,7 @@ there, and with `go` writes the missing ones through `LITTLE_SNITCH` (default
   Resolution order: the CLI argument beats the location's `THIN_POLICY_TO_KEEP`
   (set in `set_location_parameters`, §13), which beats
   `THIN_POLICY_TO_KEEP_DEFAULT`.
-* **`--verify <ID> [<PATH>…]`** — `tmutil verifychecksums`, which takes *paths*,
+* **`verify <ID> [<PATH>…]`** — `tmutil verifychecksums`, which takes *paths*,
   so it works at **snapshot, directory or single-file** granularity. Whole
   snapshots are slow; a directory or one file is quick. Reports `!` (checksum
   mismatch) and `?` (invalid recorded checksum); files backed up before OS X
@@ -1096,7 +1138,7 @@ there, and with `go` writes the missing ones through `LITTLE_SNITCH` (default
 
 ## 11. Health *(spec)*
 
-`my-tm --health` runs the checks below, prints one line per finding, and exits
+`my-tm health` runs the checks below, prints one line per finding, and exits
 non-zero on the worst — suitable for cron and for a LaunchDaemon.
 
 | Check | Fails when |
@@ -1117,11 +1159,11 @@ non-zero on the worst — suitable for cron and for a LaunchDaemon.
 Hints about the job access setting (§9) are printed beside the checks and never
 change the exit code.
 
-**A run nobody is watching notifies.** `--health` exists to catch failures that
+**A run nobody is watching notifies.** `health` exists to catch failures that
 happen *silently*, so a run whose stdout is not a terminal — a LaunchDaemon,
 whose output goes to a log file — raises a notification as well as writing the
 report. It names the first problem verbatim, counts the rest, and says where
-they are (`health: store: newest backup is 9d old (+2 more: my-tm --health)`) --
+they are (`health: store: newest backup is 9d old (+2 more: my-tm health)`) --
 a notification cannot be scrolled, so a count alone told you there was more
 and not where to find it. Failures always notify;
 `HEADLESS_NOTIFY_HEALTH_WARNINGS=1` (the default) does the same for warnings,
@@ -1155,7 +1197,7 @@ and paths.
 
 **Remote locations go over `ssh`, not SMB.** Walking a Time Machine store over
 SMB is unusably slow; instead my-tm re-executes *itself* on the far side
-(`ssh host1 my-tm -J --status <path>`) and merges the JSON, so every expensive
+(`ssh host1 my-tm -J status <path>`) and merges the JSON, so every expensive
 step happens local to that disk. The target is `<host>:<path>` and `<host>` is
 resolved exactly as `ssh` resolves it — `~/.ssh/config` first, then as a
 hostname; a non-default user or port therefore belongs in a `Host` block there,
@@ -1203,10 +1245,10 @@ from a temporary copy. On a host without it, a command says so:
 defaults and ends with a red `ATTENTION TODO` to review them; with one already
 there it leaves it alone and says so in one plain line.
 
-**The index lives where the disk is.** `--index` on an ssh location runs on that
+**The index lives where the disk is.** `index` on an ssh location runs on that
 host and stays there, because the walk has to be next to the disk.
 `SHADOW_SSH_INDEX_FILES=1` (the default) additionally copies the finished
-database here, so `--find` answers for that location while the host is offline;
+database here, so `find` answers for that location while the host is offline;
 the remote copy is the one that keeps getting extended, and the shadow is a
 read-only mirror.
 
@@ -1215,17 +1257,17 @@ private names and the far side has its own, so machine to machine my-tm sends
 the one thing both ends agree on: where the store is. `<LOCATION>` therefore
 accepts a path as well as a handle everywhere, and a path to a registered store
 resolves to its handle. The far side need not have registered that path at all:
-a READ command (`--ls`, `--status`, `--health`, `--mount`, `--umount`,
-`--refresh`) given an unregistered path that holds a store — a
+a READ command (`ls`, `status`, `health`, `mount`, `umount`,
+`refresh`) given an unregistered path that holds a store — a
 `backup_manifest.plist` at its root, or a disk image with its `Info.plist` —
 takes it for that run under a handle of its own (`path-horse`), and never writes
 it to `locations.tsv`. Commands that write the list or delete snapshots
-(`--index`, `--no-index`, `--rm-index`, `--thin`) still need a registered
+(`index`, `no-index`, `rm-index`, `thin`) still need a registered
 location, and a bare `my-tm <path>` with no command stays a file to look up.
 
 **A host that is off is not "reachable".** my-tm makes one `BatchMode`
 connection attempt with a `SSH_CONNECT_TIMEOUT` (3 s) before reading an ssh
-location. Assuming reachability was worse than the round trip: `--health` used
+location. Assuming reachability was worse than the round trip: `health` used
 to report *"no snapshots found"* for a Mac that was merely switched off, which
 reads as data loss.
 
@@ -1243,7 +1285,7 @@ the command call beside it did not):
   config (ada's: VNC on 5900, SOCKS on 6789) belong to your own logins. A
   my-tm connection neither takes those ports while it runs nor prints
   `bind [127.0.0.1]:5900: Address already in use` because your session has them.
-* the unattended ones — the probe, `--add`'s check, finding my-tm on the
+* the unattended ones — the probe, `add`'s check, finding my-tm on the
   host, every command call, copying the index back — also get `BatchMode`
   (never a password prompt nobody answers), `SSH_CONNECT_TIMEOUT`, and `-n`
   (they never read your terminal).
@@ -1252,8 +1294,8 @@ the command call beside it did not):
   `SSH_RUN_TIMEOUT` (10 min) the run. The two are different failures — a my-tm
   that looped on ada held a perfectly healthy connection while a status on
   horse waited with it. A watchdog, not a poll, so a host that answers pays
-  nothing. Work with no honest bound runs without one: an `--index` walk over
-  there is hours, and a `--cat` is as big as the file.
+  nothing. Work with no honest bound runs without one: an `index` walk over
+  there is hours, and a `cat` is as big as the file.
 
 Independently of my-tm, `ControlPersist 10m` beside `ControlMaster auto` in
 `~/.ssh/config` (yours and root's) stops ANY tool's ssh from becoming a
@@ -1261,11 +1303,11 @@ foreground master; my-tm just does not rely on it.
 
 **A status never makes another Mac open a store.** A status asks the far side
 for its table with `--cached`, which answers from what that Mac already knows
-and opens nothing — no mount, no attach, no scan. Asking it to `--ls` instead
+and opens nothing — no mount, no attach, no scan. Asking it to `ls` instead
 made ada attach a 4 T sparsebundle for a status line on horse: 2m46s for a
-command that is meant to be instant. An explicit `my-tm --ls horse@ada` still
+command that is meant to be instant. An explicit `my-tm ls horse@ada` still
 opens it, because there you asked for it. What ada has not read yet shows as a
-footnote naming that command. `--cached` goes before `--ls` on the wire, so a
+footnote naming that command. `--cached` goes before `ls` on the wire, so a
 far side too old to know it refuses the call rather than opening the store —
 both Macs need this build for the row to fill. The flag holds for `-J` as
 well: the JSON table — the form the far side is actually asked for — reads
@@ -1275,19 +1317,19 @@ store behind the flag's back.
 **A store named by PATH is read, never opened.** `--cached` is the caller
 saying "open nothing"; this is the half the caller should not have to say. A
 path is nobody's registered destination, and whoever names one is usually
-waiting on a single status line — so `--ls /Volumes/backup/horse.sparsebundle`
+waiting on a single status line — so `ls /Volumes/backup/horse.sparsebundle`
 answers from the last table that was read and says it is not attached, while
-`--ls horse@ada`, a handle someone registered, still opens the store. `-J` and
-`--health` follow the same rule, and `--health` warns rather than failing: a
+`ls horse@ada`, a handle someone registered, still opens the store. `-J` and
+`health` follow the same rule, and `health` warns rather than failing: a
 store nothing may open says nothing about the backup. To open one by path:
-`--refresh <path>`, which is also what fills that cache, or `--index`,
-`--mount`, `--verify`. A store that is ALREADY attached is read live, and a
+`refresh <path>`, which is also what fills that cache, or `index`,
+`mount`, `verify`. A store that is ALREADY attached is read live, and a
 path that is a plain directory costs nothing to read — the rule is about
 opening a store, not about the path.
 
 **What the remote is doing shows up here.** The far side does the slow work —
 attaching a sparsebundle there takes minutes — and its progress used to be
-discarded, so a `--status` that was waiting on ada looked like a hang. Those
+discarded, so a `status` that was waiting on ada looked like a hang. Those
 lines are now printed as they arrive, each named for the host saying it:
 
 ```text
@@ -1295,7 +1337,7 @@ lines are now printed as they arrive, each named for the host saying it:
     > ada: still attaching, 22s so far
 ```
 
-**Deleting happens where the store is.** `--rm` and `--thin` refuse an ssh
+**Deleting happens where the store is.** `rm` and `thin` refuse an ssh
 location and name the command to run on that host. Run here, `tmutil delete -d
 host:/path` addresses a *local* path — which either fails or, far worse, does
 not.
@@ -1309,16 +1351,16 @@ snapshots, same size columns.
 **A bundle on a share is read where it is STORED, over ssh** — never across the
 share. Reading it from here pulls every block over the network: 1060 s measured
 for `horse.sparsebundle` on ada, per health run. So detection skips bundles on
-network volumes, and `--add` refuses one, naming the host from the mount table:
+network volumes, and `add` refuses one, naming the host from the mount table:
 
 ```text
-!!! /Volumes/timeMachine/horse.sparsebundle is on a network share (ada) -- read it where it is stored: my-tm --add ada:<path on ada>/horse.sparsebundle
+!!! /Volumes/timeMachine/horse.sparsebundle is on a network share (ada) -- read it where it is stored: my-tm add ada:<path on ada>/horse.sparsebundle
 ```
 
 A bundle on a **locally attached** disk is an ordinary location:
 
 ```text
-my-tm --add /Volumes/<disk>/<host>.sparsebundle usbtm
+my-tm add /Volumes/<disk>/<host>.sparsebundle usbtm
 ```
 
 * **It says how big the store is, what it is sitting on, and how long that
@@ -1359,7 +1401,7 @@ my-tm --add /Volumes/<disk>/<host>.sparsebundle usbtm
   the bundle belongs to the Mac that backs up into it, and a writable attach
   could collide with it. Read-only also means no `fsck` and no risk to a backup.
 * **Attached only when the store must really be read.** A fresh cache answers
-  `--status` and `--ls` with no attach at all; a stale one pays for it once.
+  `status` and `ls` with no attach at all; a stale one pays for it once.
 * **One attach at a time per bundle.** Two runs asking at once used to start
   two `hdiutil` attaches of the same image, which then competed and took longer
   than either alone; the second now waits for the first and uses its result.
@@ -1378,7 +1420,7 @@ my-tm --add /Volumes/<disk>/<host>.sparsebundle usbtm
   in one Mac's `/tmp` on 2026-10-28, from five different steps, the oldest two
   days old, one a 4.4 MB `.err`. A `kill -9` still leaves the directory, since
   no trap can catch that; its name says which run, and each file inside says
-  which step. The exception is deliberate: `--open` fetches a remote file for
+  which step. The exception is deliberate: `open` fetches a remote file for
   an application to open **after** my-tm has exited, so that one outlives the
   run — it goes in a `mktemp -d` of its own, beside the run's directory rather
   than inside it, and its path is printed. Not under its own name in `TMPDIR`,
@@ -1397,14 +1439,14 @@ my-tm --add /Volumes/<disk>/<host>.sparsebundle usbtm
   by the sweep. Measured against a NAS store: the first command costs **66 s**
   of attach and mount, and every command after it **1 s**. Detaching the moment
   a command ends would make the next one pay the 66 s again. Only images my-tm
-  attached itself are ever detached, and `--umount --all` releases them now.
+  attached itself are ever detached, and `umount --all` releases them now.
 * **Identity comes from `Info.plist`'s `uuid`, readable without attaching**, so
   snapshot IDs are stable while the share is offline and survive the share being
   mounted somewhere else.
 * **A bundle that will not open read-only** is a warning when my-tm met it while
   sweeping every location, and an error when the command named that store.
 * Bundles belonging to **other** Macs on the same share are never picked up
-  automatically -- they are someone else's backups -- but `--add` takes one, and
+  automatically -- they are someone else's backups -- but `add` takes one, and
   the cache then answers for it like any other location.
 
 ### What my-tm does not cover
@@ -1429,7 +1471,7 @@ scope; see `,design-every-kind-of-store.md`.
 ### Store growth *(spec)*
 
 my-tm samples the store's real disk usage (`df`) and keeps the series, so
-`--status` can say how fast it is filling and how long the free space lasts:
+`status` can say how fast it is filling and how long the free space lasts:
 
 ```text
  --> backup grows 5.30G/day over 14.2d · 1.99T free · full in ~384d
@@ -1453,7 +1495,7 @@ that is a property of the current snapshot set, not of history.
 Read once, cached — and, as it turns out, **without mounting anything at all**:
 
 * `<store>/backup_manifest.plist` sits on the live store volume and is readable
-  directly. So `--status` and `--ls` — every size column in §4 — cost one
+  directly. So `status` and `ls` — every size column in §4 — cost one
   `plutil -p` and one `awk` per location and **no mount**. The file is a flat
   array alternating *date, record, date, record…*; a record carries `startDate`,
   `stats.changed.count` and `.physicalSize` (**ADDED**),
@@ -1487,7 +1529,7 @@ A `PATH` is *covered* by a location when the volume UUID of `PATH`
 /var/lib/my-tm/            SHARED — root:$TM_GROUP, mode 0750: root writes,
                             the group reads, others see nothing
     locations.tsv           HANDLE, TARGET, remote install dir — maintained by
-                            --add / --forget (root), never hand-merged config
+                            add / forget (root), never hand-merged config
     locations.cache         handle, UUID, mountpoint, kind, source volumes,
                             snapshot count, span, scanned-at
     snapshots.cache         one line per snapshot, ALL locations: ID, loc,
@@ -1516,14 +1558,14 @@ what that user may read. A non-root run that would have to write it builds
 nothing and names the command instead (the location list likewise):
 
 ```text
-!!! /var/lib/mine/my-tm/index is the shared name index: needs root -- rerun as root: my-tm --index horse
+!!! /var/lib/mine/my-tm/index is the shared name index: needs root -- rerun as root: my-tm index horse
 ```
 
 Deterministic IDs (§5) mean concurrent writers can never disagree. Writes are atomic (tmpfile + `mv`), and a written file takes its mode from its
 directory: group-readable (`0640`) where the directory lets the group read,
 private (`0600`) elsewhere, never world-readable — my-tm runs under `umask 027`.
-Caches are line-oriented TSV: greppable, human-readable, rebuilt by `--refresh`.
-`--status`'s footer reports their size, so they never grow unnoticed.
+Caches are line-oriented TSV: greppable, human-readable, rebuilt by `refresh`.
+`status`'s footer reports their size, so they never grow unnoticed.
 
 **Neutral defaults, site values in the config.** Every default built into
 my-tm is generic — `/var/lib/my-tm`, `~/Library/Logs/my-tm` (`$LOG_DIR`, which the daemons use too: each job's stdout goes to `<label>.log`, its stderr to `<label>.err`), job labels under
@@ -1574,13 +1616,13 @@ the plain `my-tm.conf`. It never overwrites a different file there (it offers
 `vimdiff` instead), and says so when a plain run would not look there either.
 
 ```sh
-# Locations live in $CACHE_DIR/locations.tsv, maintained by --add / --forget —
+# Locations live in $CACHE_DIR/locations.tsv, maintained by add / forget —
 # not in this file. ONE shared file, whoever runs my-tm: a location belongs to
 # the machine, and the daemons that refresh, check and index it all run as root.
-# --add and --forget refuse when that file is not theirs to write, naming the
+# add and forget refuse when that file is not theirs to write, naming the
 # command to run again as root. A per-user copy from before this rule is no
-# longer read; --status names it and prints an --add line per location in it.
-DEFAULT_CMD="--status"          # what a bare `my-tm` runs; params allowed
+# longer read; status names it and prints an add line per location in it.
+DEFAULT_CMD="status"          # what a bare `my-tm` runs; params allowed
 TM_GROUP=""                     # group with read access to the shared cache;
                                 # "" = the invoking user's primary group
 CACHE_DIR="/var/lib/my-tm"; CACHE_MODE=0750
@@ -1590,20 +1632,20 @@ FIRMLINK="/tm"                  # /etc/synthetic.conf entry made by --install
 MOUNT_ROOT="/var/lib/my-tm/mount"
 SITE_CONF_DIR="/usr/local/etc"  # where --install puts my-tm.conf; see the
                                 # search order above for every place my-tm looks
-NOTIFY_MOUNT_WARN=1             # also notify when a --mount TTL looks unsafe
+NOTIFY_MOUNT_WARN=1             # also notify when a mount TTL looks unsafe
 CACHE_TTL=3600                  # s; older -> rescan mounted locations
-INDEX_BASELINES="newest oldest" # snapshots --index walks when none are named
+INDEX_BASELINES="newest oldest" # snapshots index walks when none are named
 INDEX_INC_MAX=16                # consolidate the increments once there are
                                 # this many
 SHADOW_SSH_INDEX_FILES=1        # shadow an ssh location's index here too, so
-                                # --find answers while that host is offline
+                                # find answers while that host is offline
 SSH_CONNECT_TIMEOUT=3           # s before an ssh host counts as unreachable
 REMOTE_INSTALL_DIR_DEFAULT="/usr/local/sbin"   # where --install <HOST> puts
                                 # my-tm; must be writable by ROOT ONLY
 REMOTE_MY_TM_PATHS="/usr/local/sbin/my-tm /sbin/my-tm"   # a my-tm already on
                                 # the host, used in preference to copying one
 AUTO_INDEX_TM_BACKUP_DISKS=0    # 1: this Mac's backup disks are indexed without
-                                # --index. Never local snapshots, never ssh
+                                # index. Never local snapshots, never ssh
 INDEX_INTERVAL_DEFAULT="1d"     # only when Time Machine has no schedule of its
                                 # own; with AutoBackup on, a finished run is the
                                 # trigger and this is not consulted
@@ -1619,7 +1661,7 @@ HEALTH_WATCH_PATHS=""           # paths that MUST be covered by a backup; the
                                 # exclusion-drift check fails when one is
                                 # excluded or on an uncovered volume
 HEALTH_MAX_AGE_DEFAULT="48h"; HEALTH_MIN_FREE_PCT=10  # 0 = no age expected
-HEADLESS_NOTIFY_HEALTH_WARNINGS=1   # a --health nobody is watching notifies on
+HEADLESS_NOTIFY_HEALTH_WARNINGS=1   # a health nobody is watching notifies on
                                     # warnings too; 0 = failures only
 HEALTH_MAX_INTERRUPTED=2; HEALTH_DRIFT_FACTOR=5
 INTERRUPTED_AFTER="1h"          # a backup into an image that Time Machine still
@@ -1671,20 +1713,20 @@ the old names (`THIN_POLICY_TO_KEEP`, `THIN_POLICY_PER_LOCATION`, `POST_BACKUP`,
 `POST_BACKUP_PER_LOCATION`, `HEALTH_MAX_AGE_H`) stops my-tm with one line naming
 what replaced it.
 
-`my-tm --add /Volumes/X backup` (root — the file is in the shared dir) probes
+`my-tm add /Volumes/X backup` (root — the file is in the shared dir) probes
 the folder (§12), prints what it found — volumes, snapshot count, span — and
 appends the line to `locations.tsv`.
 Handle defaults to a slug of the volume name.
 
 A handle that could be mistaken for a snapshot ID — 6 to 8 chars, all from the
-ID alphabet (`0-9a-z` minus `ilou`, §5) — is **refused at `--add` time**, with
+ID alphabet (`0-9a-z` minus `ilou`, §5) — is **refused at `add` time**, with
 a suggestion. So is a handle that is not a usable file name: it becomes
 `$FIRMLINK/<handle>`, `usage.<handle>.tsv`, `.manifest.<handle>`,
 `<handle>.db`, `<handle>.covered` and one TAB-separated field, so only letters,
 digits, `-`, `.` and `@` are allowed, never leading with `-` or `.`
 (`horse@ada` is fine; `a/b`, `with space` and a tab are not). `backup` is fine (it contains a `u`), `k7f2q9x` would not be. Rejecting it
 once, at the only moment a human chose the name, is far better than making every
-later `--rm`/`--ls`/`--mount` disambiguate an ambiguity that never needed to
+later `rm`/`ls`/`mount` disambiguate an ambiguity that never needed to
 exist. (Rung 1 of the ladder would win anyway, so such a handle would be
 unusable in practice.)
 
@@ -1701,11 +1743,11 @@ as does any destination that is not there right now.
 
 ## 14. Backup control — replacing `my-tm.sh` *(spec)*
 
-`my-tm --backup start` keeps the old behaviour, cleaned up and config-driven:
+`my-tm backup` keeps the old behaviour, cleaned up and config-driven:
 single-instance lockfile with a signal trap, optional `diskutil mount` of
 `BACKUP_VOLUME`, `tmutil startbackup --block`, notification on the three
 outcomes (ok / already running / failed), then whatever `POST_BACKUP` says
-unless `--no-eject` planted the flag file. `--backup stop` = `tmutil stopbackup`
+unless `--no-eject` planted the flag file. `my-tm stop` = `tmutil stopbackup`
 plus the same post-backup logic. Both are root-only; everything else runs unprivileged
 wherever the OS allows.
 
@@ -1734,7 +1776,7 @@ startup; the pre-backup mount, the post-backup action and the rule below all
 use that one value. More than one destination and my-tm refuses and asks,
 rather than picking one.
 
-`--backup start --no-eject` leaves the disk mounted from now on, the unattended
+`backup --no-eject` leaves the disk mounted from now on, the unattended
 run included, until `--eject` undoes it. Both persist — they plant and remove
 `$NO_EJECT_FLAGFILE`, and say so.
 
@@ -1742,7 +1784,7 @@ run included, until `--eject` undoes it. Both persist — they plant and remove
 `MAINT_INTERVAL` seconds and would otherwise mount each destination and stat
 its manifest — waking the drive every couple of minutes and defeating the
 whole thing. So a location whose `POST_BACKUP` is `unmount` or `eject` is
-*quiet*: the daemons never open it, and `--health` answers from the cache,
+*quiet*: the daemons never open it, and `health` answers from the cache,
 marking the age it reports `[cached; disk asleep]`. Interactive commands still
 mount it — somebody asked.
 
@@ -1800,7 +1842,7 @@ cuts both ways:
 | `python3`, `os.stat` per file, incl. interpreter startup | **17 ms** |
 | bare startup: `/bin/sh -c :` · `/usr/bin/python3 -c pass` · Homebrew 3.14 | 4 ms · 15 ms · ~200 ms cold |
 
-The one place my-tm does real per-item work is `--lookup`: a few hundred `stat`s
+The one place my-tm does real per-item work is `lookup`: a few hundred `stat`s
 across snapshots. Naive shell is **40× slower** there and would be felt. Batched
 shell — BSD `stat -f` takes many paths in a single invocation — ties with
 Python. So the performance question resolves into a **design rule rather than a
@@ -1809,14 +1851,14 @@ language choice**:
 > **Batch every per-item syscall into one exec.** `stat -f '%i %z %m' <many
 > paths>`, one `find` per tree, one `plutil` per plist, **one `lsof` for every
 > mountpoint at once**. A loop that forks per item is a bug — and it is the bug
-> that actually happened here: `lsof` per mount turned `--umount --all` over a
+> that actually happened here: `lsof` per mount turned `umount --all` over a
 > few dozen mounts into minutes.
 
 The argument list is passed **NUL-separated through `xargs -0`**, never by word
 splitting: a path inside a backup can contain spaces, and an unquoted `$(cat
 list)` would quietly corrupt exactly those paths.
 
-`--lookup` is the one place with an unavoidable per-snapshot floor — one
+`lookup` is the one place with an unavoidable per-snapshot floor — one
 `mount_apfs` each, ~70 ms measured — and it stays batched at one `stat` exec
 per chunk of 16 snapshots (§6). `--run-tests` asserts the part that matters:
 a snapshot already covered by the version store is answered with **no
@@ -1893,20 +1935,20 @@ Each of these runs twice (idempotence), against a fixture root, and asserts the
 
 | Writer | Asserted |
 |---|---|
-| `--add` / `--forget` | the `locations.tsv` line appears/vanishes; the rest of the file is byte-identical; a duplicate handle is refused; a handle in the ID alphabet is refused; a bad folder is refused before any write |
+| `add` / `forget` | the `locations.tsv` line appears/vanishes; the rest of the file is byte-identical; a duplicate handle is refused; a handle in the ID alphabet is refused; a bad folder is refused before any write |
 | `--create-config` | never overwrites; stdout form and file form are identical |
 | space | the "??" in the table and the growth line below it name the same free space, with the newest sample written to the cache the other reader used to ignore |
 | a remote read that fails | the row says the read failed and why, names `--install <HOST> go`, and does not call it "not read yet"; a read that works and finds nothing keeps its own wording |
-| a user's run | the real script, against a shared cache it may not write and one version-store generation behind: `--status`, `--ls`, `--show`, `--find`, `--lookup`, `--health`, `--refresh`, `--index` print nothing on stderr but my-tm's own lines, and the stale store is not read |
+| a user's run | the real script, against a shared cache it may not write and one version-store generation behind: `status`, `ls`, `show`, `find`, `lookup`, `health`, `refresh`, `index` print nothing on stderr but my-tm's own lines, and the stale store is not read |
 | `--install` | dirs created `root:$TM_GROUP` `0750` *verified by mode*, not by intent; `/etc/synthetic.conf` gains exactly one comment + one tab-separated line; a second run adds nothing; a pre-existing foreign `tm` entry is left alone and reported; the completion file lands in the invoking user's home, owned by them, and an unchanged rerun does not rewrite it; a job binary inside a user-writable tree is refused |
 | `--uninstall` | removes exactly what `--install` added and nothing else; a diff of `/etc/synthetic.conf` before-install vs after-uninstall is empty; asks before the cache |
 | job plists | each `BACKUP_SCHEDULE` form produces the expected plist keys (`RunAtLoad` / `StartInterval` / `StartCalendarInterval` incl. weekday); the plist parses with `plutil -lint` |
 | cache writes | atomic (tmpfile + `mv`); a killed write leaves the old file intact; two concurrent writers converge; a corrupt cache is detected and rebuilt rather than half-read |
-| `--refresh` | the `/tm` placeholder dirs and `latest`/`by-id` symlinks match the fixture exactly; stale entries for deleted snapshots are removed; a user-made `/tm/<custom>` mount dir is not touched |
+| `refresh` | the `/tm` placeholder dirs and `latest`/`by-id` symlinks match the fixture exactly; stale entries for deleted snapshots are removed; a user-made `/tm/<custom>` mount dir is not touched |
 | mount bookkeeping | the record matches the real mount table; a TTL expires exactly once; the sweep respects `lsof`; a mount released behind my-tm's back (`umount(8)`) is silently dropped from the record; a mount whose target vanished is cleaned up; a `transient`-flagged leftover is reaped; TTL parsing of `7m`/`4h`/`5h3m`/`2d` and rejection of `4`, `0m` |
-| `--rm` / `--thin` | **dry-run output only** — the dry run *prints* the exact `tmutil delete` command line it would run and the fixture asserts that string; that nothing runs without the literal `go`; and that `go` without root refuses and still runs nothing. No test ever deletes a real snapshot |
-| `--local-snap` | skipped by default; enabled only by `--run-tests --with-snapshots`, and then it creates one, finds it in `--ls local`, and deletes it again |
-| `--backup` | the `tmutil` / `diskutil` calls are asserted through a stub `PATH`, never executed for real; the lockfile blocks a second instance; the trap removes it on every signal; the eject retry loop honours `EJECT_RETRIES` and the no-eject flag file |
+| `rm` / `thin` | **dry-run output only** — the dry run *prints* the exact `tmutil delete` command line it would run and the fixture asserts that string; that nothing runs without the literal `go`; and that `go` without root refuses and still runs nothing. No test ever deletes a real snapshot |
+| `local-snap` | skipped by default; enabled only by `--run-tests --with-snapshots`, and then it creates one, finds it in `ls local`, and deletes it again |
+| `backup` | the `tmutil` / `diskutil` calls are asserted through a stub `PATH`, never executed for real; the lockfile blocks a second instance; the trap removes it on every signal; the eject retry loop honours `EJECT_RETRIES` and the no-eject flag file |
 
 **Regression fixtures**, kept in the file as here-docs: the real
 `backup_manifest.plist` shape as macOS 26 writes it (nested `volumeStoreInfo`,
@@ -1928,7 +1970,7 @@ without ever being destructive.
   content differs; `my-tm --completion bash` prints the bash one. A word
   starting with `-` completes to the commands and options `--help` names (the
   suite holds the two lists to each other); any other word, in any position,
-  to a handle or a file — `my-tm /Use<TAB>` is a `--lookup` in the making.
+  to a handle or a file — `my-tm /Use<TAB>` is a `lookup` in the making.
   A shell that is already open keeps the version it loaded: open a new one.
 * **Full Disk Access**: `tmutil listbackups|compare|delete|verifychecksums` need
   it. my-tm detects the denial and prints one pointer line rather than a stack
