@@ -559,12 +559,16 @@ $CACHE_DIR/index/<loc>.versions/ -> the version store: a baseline plus one
   snapshot count and the ETA, because while it runs Time Machine's thinning is
   blocked on whatever it currently holds. That is acceptable for a run you do
   **once**, which is what this is. A backup writing to that same disk is not:
-  the walk does not start the next snapshot while one runs -- it says so and
-  waits for it (`INDEX_BACKUP_POLL`, `INDEX_BACKUP_MAX_WAIT`), and Ctrl-C is
-  safe, since the next walk takes up where this one stopped. So the sweep does
-  not fight it either: an indexing run marks its mount `indexer` in the mount
-  record (§8) and it is exempt while
-  it works. In exchange it **cleans up behind itself** — it holds exactly the one
+  the walk does not start the next snapshot while one runs — it says so and
+  waits, repeating every `INDEX_BACKUP_POLL` that it still is. It waits with
+  **no bound** by default (`INDEX_BACKUP_MAX_WAIT="none"`, and anything that is
+  not a duration reads as none): a backup running for hours is the normal case,
+  not a stuck process, so a bound would end an overnight walk for doing exactly
+  what it was told to. Ctrl-C is the bound, and it is safe — the next walk
+  takes up where this one stopped. So the sweep does not fight it either: an
+  indexing run marks its mount `indexer` in the mount record (§8), and it is
+  exempt while it works. In exchange it **cleans up behind itself** — it holds
+  exactly the one
   snapshot it is walking and releases it before opening the next, so at any
   instant at most one snapshot is pinned, not four hundred. Interrupt it and
   that last mount is left for the **sweep**, which releases it on its next

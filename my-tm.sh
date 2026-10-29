@@ -34,8 +34,8 @@ US="${0##*/}"
 ## so the ROOT-OWNED COPY the daemons run -- which has no git beside it -- can
 ## still say which release it is and whether it is one.
 MY_TM_VERSION="0.9.1"
-SCRIPT_COMMIT="81a9b16"
-SCRIPT_RELEASE="v0.9.1-110-g81a9b16"
+SCRIPT_COMMIT="a9e40d1"
+SCRIPT_RELEASE="v0.9.1-112-ga9e40d1"
 
 ## The first 12 hex of this file's own SHA-256: the value that identifies the
 ## bytes. my-tm is COPIED to its installed path, so this is what tells the
@@ -182,7 +182,7 @@ IMAGE_SCAN_TTL=300
 INDEX_BASELINES="newest oldest"
 INDEX_INC_MAX=16
 INDEX_BACKUP_POLL="5m"
-INDEX_BACKUP_MAX_WAIT="4h"
+INDEX_BACKUP_MAX_WAIT="none"
 SHADOW_SSH_INDEX_FILES=1
 SSH_CONNECT_TIMEOUT=3
 SSH_RUN_TIMEOUT="10m"
@@ -457,8 +457,12 @@ INDEX_INC_MAX=16                # consolidate the increments once there are
 INDEX_BACKUP_POLL="5m"          # how often --index --all looks at a running
                                 # Time Machine backup it is waiting for, and
                                 # the cadence of the lines saying it still is
-INDEX_BACKUP_MAX_WAIT="4h"      # waiting longer than this for a backup to
-                                # finish is an error, not patience
+INDEX_BACKUP_MAX_WAIT="none"    # a duration, or none: how long --index --all
+                                # waits for a backup before giving up. A backup
+                                # that runs for hours is the normal case, not a
+                                # stuck process, so the default waits it out and
+                                # Ctrl-C is the bound. Anything that is not a
+                                # duration is read as none
 SHADOW_SSH_INDEX_FILES=1        # keep a shadow copy of an ssh location's index
                                 # here as well, so --find answers while that
                                 # host is offline. The index itself lives on the
@@ -4011,14 +4015,23 @@ index_is_due() {
 index_wait_for_backup() {
 	tm_backup_running || return 0
 	_iwb_w0=$(now_epoch)
-	_iwb_max=$(parse_interval "${INDEX_BACKUP_MAX_WAIT:-4h}") || _iwb_max=14400
+	## 0 is NO bound, and it is the default. The attach wait this is modelled
+	## on gives up because a long wait there means a stuck hdiutil -- a fault;
+	## a Time Machine backup running for hours is not a fault, it is the thing
+	## being waited for, so a bound would end an overnight walk for doing
+	## exactly what it was told to. Ctrl-C is the bound instead, and a value
+	## that is not a duration is read as none rather than guessed at.
+	case "${INDEX_BACKUP_MAX_WAIT:-none}" in
+		none|"") _iwb_max=0 ;;
+		*) _iwb_max=$(parse_interval "$INDEX_BACKUP_MAX_WAIT") || _iwb_max=0 ;;
+	esac
 	_iwb_poll=$(parse_interval "${INDEX_BACKUP_POLL:-5m}") || _iwb_poll=300
 	[ "$_iwb_poll" -ge 1 ] || _iwb_poll=1
 	warn "$1: a Time Machine backup is running -- waiting for it to finish before the next snapshot, so the walk does not block its thinning. Ctrl-C is safe."
 	while tm_backup_running; do
 		_iwb_waited=$(( $(now_epoch) - _iwb_w0 ))
-		[ "$_iwb_waited" -ge "$_iwb_max" ] &&
-			err "waited $(human_secs "$_iwb_waited") for the Time Machine backup to finish and it is still running (INDEX_BACKUP_MAX_WAIT) -- index once it has, or raise that key"
+		[ "$_iwb_max" -gt 0 ] && [ "$_iwb_waited" -ge "$_iwb_max" ] &&
+			err "waited $(human_secs "$_iwb_waited") for the Time Machine backup to finish and it is still running (INDEX_BACKUP_MAX_WAIT=$INDEX_BACKUP_MAX_WAIT) -- index once it has, or set it to none"
 		[ "$_iwb_waited" -gt 0 ] &&
 			minor "the backup is still running, $(human_secs "$_iwb_waited") so far -- waiting"
 		sleep "$_iwb_poll"
@@ -9975,6 +9988,35 @@ t_test_index_waits_out_a_backup() {
 		index_wait_for_backup horse ) 2>&1 )
 	t_eq "a backup that never finishes ends the run, naming the key to raise" \
 		"$(printf '%s\n' "$_iw_slow" | count_match 'INDEX_BACKUP_MAX_WAIT')" "1"
+
+	## ...but that bound is OPT-IN. The default waits a backup out, however
+	## long it takes: ending an overnight walk because the thing it waits for
+	## is still happening is the failure this default exists to prevent.
+	( INDEX_BACKUP_POLL="1s"; INDEX_BACKUP_MAX_WAIT="none"
+	  # shellcheck disable=SC2329  # called by index_wait_for_backup
+	  tm_backup_running() { return 0; }
+	  index_wait_for_backup horse ) >/dev/null 2>&1 &
+	_iw_bg=$!
+	sleep 2
+	t_eq "with none a backup that runs on leaves it waiting, not gone" \
+		"$(kill -0 "$_iw_bg" 2>/dev/null && echo waiting || echo gone)" "waiting"
+	kill "$_iw_bg" 2>/dev/null; wait "$_iw_bg" 2>/dev/null
+
+	## a value that is not a duration is read as none, never guessed at
+	printf '2\n' >"$_iw_d/left2"
+	_iw_junk=$( ( INDEX_BACKUP_POLL="1s"; INDEX_BACKUP_MAX_WAIT="whenever"
+		# shellcheck disable=SC2329
+		tm_backup_running() {
+			_n=$(cat "$_iw_d/left2")
+			[ "$_n" -le 0 ] && return 1
+			printf '%s\n' "$(( _n - 1 ))" >"$_iw_d/left2"
+			return 0
+		}
+		index_wait_for_backup horse ) 2>&1 )
+	t_eq "...and a value that is not a duration bounds nothing either" \
+		"$(printf '%s\n' "$_iw_junk" | count_match 'INDEX_BACKUP_MAX_WAIT')" "0"
+	t_eq "...it just waits, then walks on" \
+		"$(printf '%s\n' "$_iw_junk" | count_match 'walking on')" "1"
 
 	## the waiter is wired into the --all walk, and ONLY there: the baseline
 	## walk is two snapshots, and the post-backup one runs on purpose while
