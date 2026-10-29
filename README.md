@@ -142,15 +142,21 @@ MAINTAIN -- these need root + Full Disk Access
                                  delete the snapshots a retention policy does
                                  not keep; every location and the configured
                                  policy if omitted. Dry-run unless you type `go`
-  backup  [--eject|--no-eject]   run a backup now and wait for it, then do
-                                 what POST_BACKUP says with the disk:
-                                 none | unmount | eject -- unless the no-eject
-                                 list covers it.
-                                 [daemon: run on BACKUP_SCHEDULE]
-  stop                           stop the backup that is running
-  trigger                        ask the backup job to run one, and return at
+  backup  [<SET>] [--eject|--no-eject]
+                                 run a backup now and wait for it, then do what
+                                 POST_BACKUP says with the disk: none | unmount
+                                 | eject -- unless the no-eject list covers it.
+                                 [daemon: one job per set, on its BACKUP_SCHEDULE]
+  stop    [<SET>]                stop the backup that is running
+  trigger [<SET>]                ask that set's job to run one, and return at
                                  once -- it outlives this process, so this is
                                  what a script or another machine asks for
+
+  A <SET> is one named backup: what runs it, what it backs up to, when,
+  what is done with the disk afterwards, and the commands to run around
+  it. `timemachine` is always one and is what you get when no <SET> is
+  named. BACKUP_SETS adds more, and set_backup_parameters in the config
+  gives each one its own values -- see --create-config.
 
 INSTALL & SET UP
   --install [<SSH-HOST>] [go] | --uninstall [<SSH-HOST>] [go]
@@ -1780,6 +1786,39 @@ bridges drop off the bus and need the cable pulled — those want `unmount`.
 startup; the pre-backup mount, the post-backup action and the rule below all
 use that one value. More than one destination and my-tm refuses and asks,
 rather than picking one.
+
+### Backup sets
+
+A **backup set** is one named backup: what runs it (its ENGINE), what it backs
+up to, when, what is done with the disk afterwards, and the commands to run
+around it. `timemachine` is always a set and is what `my-tm backup` runs when
+none is named, so every existing caller and job keeps working.
+
+```sh
+BACKUP_SETS="nightly"                 # beyond timemachine, which is always there
+set_backup_parameters() {             # asked for the ENGINE, then for the SET
+    case "$1" in
+        timemachine) POST_BACKUP_CMD="" ;;
+        nightly)     BACKUP_SCHEDULE="03:00" ;;
+    esac
+}
+```
+
+Scope is **default → engine → set, last wins**: `BACKUP_SCHEDULE_DEFAULT` in the
+config, then whatever the function sets for the engine, then for the set. It is
+the mechanism `set_location_parameters` already is, asked twice — which is why
+a set may not be named after an engine, and why my-tm refuses one that is.
+
+`--install` writes one launchd job per set that has a schedule. The
+`timemachine` set keeps the job label it has always had, so no installed
+machine gets a renamed job.
+
+**`PRE_BACKUP_CMD` and `POST_BACKUP_CMD` are command lines**, run by the shell
+as written; `POST_BACKUP` is one of three words my-tm performs itself. That is
+why they are two keys: a typo'd `ejectt` has to be a rejected value, not a
+command that fails silently at 03:00. The post command runs **before** the
+disposition, so a command that wants the disk still has it. A hook that fails
+is reported and the backup goes on.
 
 ### The no-eject list
 

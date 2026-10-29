@@ -34,8 +34,8 @@ US="${0##*/}"
 ## so the ROOT-OWNED COPY the daemons run -- which has no git beside it -- can
 ## still say which release it is and whether it is one.
 MY_TM_VERSION="0.9.1"
-SCRIPT_COMMIT="87c853e"
-SCRIPT_RELEASE="v0.9.1-117-g87c853e"
+SCRIPT_COMMIT="9773033"
+SCRIPT_RELEASE="v0.9.1-118-g9773033"
 
 ## The first 12 hex of this file's own SHA-256: the value that identifies the
 ## bytes. my-tm is COPIED to its installed path, so this is what tells the
@@ -213,7 +213,17 @@ LOCAL_SNAP_INTERVAL=""
 LOCAL_SNAP_KEEP_H=24
 LOCAL_SNAP_MAX=48
 BACKUP_JOB="local.my-tm.backup"
-BACKUP_SCHEDULE="on-boot"
+BACKUP_SETS=""
+# shellcheck disable=SC2034  # read through backup_param, which builds its name
+BACKUP_SCHEDULE_DEFAULT="on-boot"
+# shellcheck disable=SC2034  # read through backup_param, which builds its name
+BACKUP_ENGINE_DEFAULT="timemachine"
+# shellcheck disable=SC2034  # read through backup_param, which builds its name
+BACKUP_TARGET_DEFAULT=""
+# shellcheck disable=SC2034  # read through backup_param, which builds its name
+PRE_BACKUP_CMD_DEFAULT=""
+# shellcheck disable=SC2034  # read through backup_param, which builds its name
+POST_BACKUP_CMD_DEFAULT=""
 BACKUP_VOLUME=""
 POST_BACKUP_DEFAULT="eject"
 NOTIFY_CMD=""
@@ -564,7 +574,29 @@ LOCAL_SNAP_INTERVAL=""          # "" = off. <N>m or <N>h, 1 minute .. 1 day.
 LOCAL_SNAP_KEEP_H=24            # h; matches macOS's own ~24h rotation
 LOCAL_SNAP_MAX=48               # cap for high-frequency intervals
 BACKUP_JOB="local.my-tm.backup"
-BACKUP_SCHEDULE="on-boot"       # on-boot | <N>s|m|h | HH:MM | Mon HH:MM ...
+BACKUP_SETS=""                  # extra backup sets, by name, space separated.
+                                # "timemachine" is always there and needs no
+                                # line here; a set may NOT be named after an
+                                # engine, because the two are one key space.
+BACKUP_SCHEDULE_DEFAULT="on-boot"   # on-boot | <N>s|m|h | HH:MM | Mon HH:MM ...
+BACKUP_ENGINE_DEFAULT="timemachine" # what runs the backup
+BACKUP_TARGET_DEFAULT=""        # what it backs up to; the engine reads it.
+                                # timemachine: the destination volume, ""
+                                # = ask tmutil destinationinfo
+PRE_BACKUP_CMD_DEFAULT=""       # run before it, while the disk is mounted
+POST_BACKUP_CMD_DEFAULT=""      # run after it, BEFORE POST_BACKUP parks
+                                # the disk -- a command that wants the disk
+                                # needs it still mounted
+#
+# Per set, the same way per-location parameters are set.  Asked TWICE:
+# first with the ENGINE name, then with the SET name, so the set wins over
+# the engine and the engine over the defaults above.
+#set_backup_parameters() {
+#	case "$1" in
+#		timemachine) POST_BACKUP_CMD="" ;;
+#		nightly)     BACKUP_SCHEDULE="03:00" ;;
+#	esac
+#}
 JOBS_RUN_WITH_FULL_DISK_ACCESS=0 # 1: the jobs run my-tm through JOBS_LAUNCHER,
                                 # which holds Full Disk Access once it is added in
                                 # System Settings > Privacy & Security > Full Disk
@@ -714,6 +746,12 @@ _EOF
 ## sourced again right before its own is called. All of it in a subshell: nothing
 ## set for one location reaches the next, or my-tm itself.
 LOCATION_PARAMETERS="THIN_POLICY_TO_KEEP POST_BACKUP HEALTH_MAX_AGE INDEX_INTERVAL"
+## What a BACKUP SET may set for itself.  Same shape as the per-location
+## parameters above, and the same mechanism -- see backup_param().
+BACKUP_PARAMETERS="BACKUP_ENGINE BACKUP_TARGET BACKUP_SCHEDULE PRE_BACKUP_CMD POST_BACKUP_CMD"
+## The engines my-tm can run a set with.  A set may not be named after one:
+## set_backup_parameters() is asked for both, so the two share a key space.
+BACKUP_ENGINES="timemachine"
 
 loc_param() {
 	case " $LOCATION_PARAMETERS " in
@@ -735,6 +773,98 @@ loc_param() {
 		done
 		eval "printf '%s\n' \"\${$2-}\""
 	)
+}
+
+## Every backup job this config asks for, one label per line -- what the
+## install, the uninstall and the job list all walk, so none of them can
+## forget a set's job.
+backup_jobs_all() {
+	for _bja in $(backup_sets_all); do
+		[ -n "$(backup_param "$_bja" BACKUP_SCHEDULE)" ] || continue
+		backup_job_label "$_bja"
+	done
+}
+
+## The launchd job that runs one set. The Time Machine set keeps the label
+## it has always had, so no machine's installed job is renamed.
+backup_job_label() {            # <set>
+	case "$1" in
+		timemachine) printf '%s\n' "$BACKUP_JOB" ;;
+		*)           printf '%s.%s\n' "$BACKUP_JOB" "$1" ;;
+	esac
+}
+
+## A command the config asked to run around a backup. It is a command LINE,
+## not something my-tm interprets, so the shell runs it as written. A hook
+## that fails is reported and the backup goes on: the backup is the job, the
+## hook is around it.
+backup_run_cmd() {              # <when> <command line>
+	[ -n "${2:-}" ] || return 0
+	msg "$1: $2"
+	sh -c "$2" || warn "the $1 command exited $? -- the backup goes on [$2]"
+	return 0
+}
+
+## Every backup set there is. `timemachine` is always one -- it is what my-tm
+## has always done -- so a config that names no set still has exactly one.
+backup_sets_all() {
+	printf 'timemachine\n'
+	for _bsa_n in $BACKUP_SETS; do
+		## checked HERE, the one place BACKUP_SETS is read: a set named after
+		## an engine would make the config's set_backup_parameters ambiguous,
+		## because it is asked for both.
+		case " $BACKUP_ENGINES " in
+			*" $_bsa_n "*) err "backup set '$_bsa_n' is named after an engine -- set_backup_parameters is asked for both, so the two would collide; rename the set" ;;
+		esac
+		printf '%s\n' "$_bsa_n"
+	done
+}
+
+## One parameter of one set.  The config's set_backup_parameters() is asked
+## TWICE -- with the ENGINE name, then with the SET name -- so the set wins
+## over the engine and the engine over the _DEFAULT.  The engine has to be
+## learnt from the set first, which is the third call below.
+backup_param() {                # <set> <NAME>
+	case " $BACKUP_PARAMETERS " in
+		*" $2 "*) : ;;
+		*) err "backup_param: '$2' is not a per-backup parameter" ;;
+	esac
+	(
+		_bp_reset() { for _bp_n in $BACKUP_PARAMETERS; do eval "$_bp_n=\${${_bp_n}_DEFAULT-}"; done; }
+		_bp_ask() {
+			for _bp_f in $CONFIG_SOURCED; do
+				unset -f set_backup_parameters 2>/dev/null
+				# shellcheck source=/dev/null
+				. "$_bp_f" >/dev/null 2>&1
+				command -v set_backup_parameters >/dev/null 2>&1 || continue
+				for _bp_a in "$@"; do set_backup_parameters "$_bp_a"; done
+			done
+		}
+		_bp_reset; _bp_ask "$1"          # what engine does this set run?
+		_bp_eng="${BACKUP_ENGINE:-}"
+		_bp_reset; _bp_ask "$_bp_eng" "$1"
+		eval "printf '%s\n' \"\${$2-}\""
+	)
+}
+
+## The engine of a set, checked: an unknown one would otherwise be discovered
+## at 03:00, by a job with nobody watching.
+backup_engine_of() {            # <set>
+	_beo=$(backup_param "$1" BACKUP_ENGINE)
+	case " $BACKUP_ENGINES " in
+		*" ${_beo:-} "*) printf '%s\n' "$_beo"; return 0 ;;
+	esac
+	err "backup set '$1' asks for engine '${_beo:-}' -- my-tm runs: $BACKUP_ENGINES"
+}
+
+## The set my-tm was asked to run, checked: a name nobody configured would
+## otherwise be discovered at 03:00, by a job with nobody watching.
+backup_set_resolve() {          # [<set>] -> <set>
+	_bsr="${1:-timemachine}"
+	_bsr_all=$(backup_sets_all) || return 1
+	printf '%s\n' "$_bsr_all" | grep -qx "$_bsr" ||
+		err "no backup set '$_bsr' -- there is: $(printf '%s' "$_bsr_all" | tr '\n' ' ')"
+	printf '%s\n' "$_bsr"
 }
 
 ## Settings that became per-location parameters. A config still setting one is
@@ -770,6 +900,17 @@ config_refuse_old_names() {
 ## machine's config still does until its rollout step has run. Read the verb
 ## out of it rather than failing a bare `my-tm`, and say so once per run --
 ## the file is root's, so nobody can fix it from here.
+## BACKUP_SCHEDULE was one global value; it is a per-set parameter now, so
+## the config key is BACKUP_SCHEDULE_DEFAULT like every other default. Read
+## the old name rather than failing every machine, and say so once per run.
+config_backup_schedule_default() {
+	[ -n "${BACKUP_SCHEDULE:-}" ] || return 0
+	warn "BACKUP_SCHEDULE=\"$BACKUP_SCHEDULE\" is the old name (config:$CONFIG_SOURCED) -- read as BACKUP_SCHEDULE_DEFAULT; a set sets BACKUP_SCHEDULE for itself now"
+	# shellcheck disable=SC2034  # read through backup_param, which builds its name
+	BACKUP_SCHEDULE_DEFAULT="$BACKUP_SCHEDULE"
+	BACKUP_SCHEDULE=""
+}
+
 config_default_cmd_verb() {
 	case "${DEFAULT_CMD:-}" in
 		--*) ;;
@@ -6280,7 +6421,7 @@ _EOF
 	fi
 
 	## the jobs we installed
-	for _j in "$MAINT_JOB" "$HEALTH_JOB" "$BACKUP_JOB"; do
+	for _j in "$MAINT_JOB" "$HEALTH_JOB" $(backup_jobs_all); do
 		_pl="$JOBS_DIR/$_j.plist"
 		[ -f "$_pl" ] || continue
 		_prog=$(plutil -extract ProgramArguments.0 raw -o - "$_pl" 2>/dev/null)
@@ -6802,7 +6943,8 @@ do_post_backup() {
 ## NOT `kickstart -k`: -k kills a running instance first, which for a backup
 ## means killing the backup you were asking for.
 cmd_trigger() {
-	_tr_job="${BACKUP_JOB:-}"
+	_tr_set=$(backup_set_resolve "${1:-}") || return 1
+	_tr_job=$(backup_job_label "$_tr_set")
 	[ -n "$_tr_job" ] || err "no backup job is configured (BACKUP_JOB)"
 	[ -f "$JOBS_DIR/$_tr_job.plist" ] ||
 		err "$_tr_job is not installed, so there is nothing to ask -- $US --install writes it"
@@ -6820,7 +6962,7 @@ cmd_backup() {
 	## --no-eject writes `all`; bare --eject clears the list.
 	## --set-* are the old spellings, kept working. The flag is named for what
 	## it does; that it PERSISTS is said in the output.
-	_be_op=""; _be_names=""
+	_be_op=""; _be_names=""; _bk_set=""
 	for _a in "$@"; do
 		case "$_a" in
 			--no-eject|--set-no-eject)
@@ -6832,7 +6974,10 @@ cmd_backup() {
 				[ -n "$_be_op" ] && no_eject_set "$_be_op" $_be_names
 				_be_op="rm"; _be_names="" ;;
 			-*) : ;;
-			*)  [ -n "$_be_op" ] && _be_names="$_be_names $_a" ;;
+			## a bare word before any flag is the SET; after one it is a
+			## name for that flag's list
+			*)  if [ -n "$_be_op" ]; then _be_names="$_be_names $_a"
+			    else _bk_set="$_a"; fi ;;
 		esac
 	done
 	# shellcheck disable=SC2086  # a list of names, split on purpose
@@ -6842,6 +6987,20 @@ cmd_backup() {
 		"") return 0 ;;
 		*) err "backup takes start or stop" ;;
 	esac
+
+	## Which set, and everything it says about itself -- read ONCE, here,
+	## where the arguments enter. do_post_backup and the no-eject list read
+	## BACKUP_SET and BACKUP_ENGINE from here.
+	BACKUP_SET=$(backup_set_resolve "$_bk_set") || return 1
+	BACKUP_ENGINE=$(backup_engine_of "$BACKUP_SET") || return 1
+	BACKUP_TARGET=$(backup_param "$BACKUP_SET" BACKUP_TARGET)
+	PRE_BACKUP_CMD=$(backup_param "$BACKUP_SET" PRE_BACKUP_CMD)
+	POST_BACKUP_CMD=$(backup_param "$BACKUP_SET" POST_BACKUP_CMD)
+	## the timemachine engine's target IS its destination volume
+	[ "$BACKUP_ENGINE" = "timemachine" ] && [ -n "$BACKUP_TARGET" ] &&
+		BACKUP_VOLUME="$BACKUP_TARGET"
+	[ "$BACKUP_SET" = "timemachine" ] || minor "backup set $BACKUP_SET [engine $BACKUP_ENGINE]"
+
 	require_root "backup"
 
 	if [ -e "$LOCKFILE" ]; then
@@ -6854,9 +7013,12 @@ cmd_backup() {
 
 	if [ "$_action" = "stop" ]; then
 		run tmutil stopbackup
+		backup_run_cmd "POST_BACKUP_CMD" "$POST_BACKUP_CMD"
 		do_post_backup
 		return 0
 	fi
+
+	backup_run_cmd "PRE_BACKUP_CMD" "$PRE_BACKUP_CMD"
 
 	_bv=$(backup_volume)
 	if [ -n "$_bv" ] && [ ! -d "/Volumes/$_bv" ]; then
@@ -6909,6 +7071,7 @@ cmd_backup() {
 			msg "indexing $_bk_h before the disk is parked"
 			cmd_index "$_bk_h"
 		done
+		backup_run_cmd "POST_BACKUP_CMD" "$POST_BACKUP_CMD"
 		do_post_backup
 	fi
 	return "$_bk_rc"
@@ -7676,7 +7839,7 @@ cmd_install() {
 	minor "cache:      $CACHE_DIR  (root:$_group $CACHE_MODE)"
 	minor "mounts:     $MOUNT_ROOT"
 	minor "firmlink:   $FIRMLINK -> /$_target  (via $_synth, after a reboot)"
-	minor "jobs:       $MAINT_JOB${HEALTH_INTERVAL:+, $HEALTH_JOB}${BACKUP_SCHEDULE:+, $BACKUP_JOB}"
+	minor "jobs:       $MAINT_JOB${HEALTH_INTERVAL:+, $HEALTH_JOB}$(backup_jobs_all | sed 's/^/, /' | tr -d '\n')"
 	minor "tree:       built by $MAINT_JOB on its first run, not here"
 	minor "logs:       $LOG_DIR_ROOT"
 	minor "exclude:    $CACHE_DIR from Time Machine backups"
@@ -7757,7 +7920,16 @@ cmd_install() {
 	else
 		minor "HEALTH_INTERVAL is empty -- no health daemon installed"
 	fi
-	[ -n "$BACKUP_SCHEDULE" ] && write_job "$BACKUP_JOB" "$BACKUP_SCHEDULE" backup start
+	## one job per SET that has a schedule; the Time Machine set keeps the
+	## label it has always had, so no installed job is renamed
+	for _in_bs in $(backup_sets_all); do
+		_in_sched=$(backup_param "$_in_bs" BACKUP_SCHEDULE)
+		if [ -n "$_in_sched" ]; then
+			write_job "$(backup_job_label "$_in_bs")" "$_in_sched" backup "$_in_bs"
+		else
+			minor "backup set $_in_bs has no BACKUP_SCHEDULE -- no job installed for it"
+		fi
+	done
 	note "the $FIRMLINK tree is built by $MAINT_JOB on its first run -- to build it now: $US refresh"
 
 	## 5. the config -- copied only where a plain run would otherwise find none
@@ -7907,7 +8079,7 @@ cmd_uninstall() {
 	_fl="${FIRMLINK#/}"
 
 	msg "my-tm --uninstall$([ "$_go" = "1" ] || printf ' (dry run -- add the word go to do it)')"
-	minor "jobs:      $MAINT_JOB $HEALTH_JOB $BACKUP_JOB"
+	minor "jobs:      $MAINT_JOB $HEALTH_JOB $(backup_jobs_all | tr '\n' ' ')"
 	minor "unmounts:  everything under $MOUNT_ROOT"
 	minor "$_synth:   the comment + entry pair for $FIRMLINK"
 	minor "keeps:     $CACHE_DIR (asked about separately -- the index is expensive)"
@@ -7920,7 +8092,7 @@ cmd_uninstall() {
 		run rm -f "$JOBS_LAUNCHER" && msg "removed the launcher $JOBS_LAUNCHER"
 	fi
 
-	for _j in "$MAINT_JOB" "$HEALTH_JOB" "$BACKUP_JOB"; do
+	for _j in "$MAINT_JOB" "$HEALTH_JOB" $(backup_jobs_all); do
 		_pl="$JOBS_DIR/$_j.plist"
 		[ -f "$_pl" ] || continue
 		run launchctl unload "$_pl" >/dev/null 2>&1
@@ -8265,15 +8437,21 @@ MAINTAIN -- these need root + Full Disk Access
                                  delete the snapshots a retention policy does
                                  not keep; every location and the configured
                                  policy if omitted. Dry-run unless you type \`go\`
-  backup  [--eject|--no-eject]   run a backup now and wait for it, then do
-                                 what POST_BACKUP says with the disk:
-                                 none | unmount | eject -- unless the no-eject
-                                 list covers it.
-                                 [daemon: run on BACKUP_SCHEDULE]
-  stop                           stop the backup that is running
-  trigger                        ask the backup job to run one, and return at
+  backup  [<SET>] [--eject|--no-eject]
+                                 run a backup now and wait for it, then do what
+                                 POST_BACKUP says with the disk: none | unmount
+                                 | eject -- unless the no-eject list covers it.
+                                 [daemon: one job per set, on its BACKUP_SCHEDULE]
+  stop    [<SET>]                stop the backup that is running
+  trigger [<SET>]                ask that set's job to run one, and return at
                                  once -- it outlives this process, so this is
                                  what a script or another machine asks for
+
+  A <SET> is one named backup: what runs it, what it backs up to, when,
+  what is done with the disk afterwards, and the commands to run around
+  it. \`timemachine\` is always one and is what you get when no <SET> is
+  named. BACKUP_SETS adds more, and set_backup_parameters in the config
+  gives each one its own values -- see --create-config.
 
 INSTALL & SET UP
   --install [<SSH-HOST>] [go] | --uninstall [<SSH-HOST>] [go]
@@ -8632,6 +8810,7 @@ main() {
 	[ "$DEEPDBG" = "1" ] && { PS4='+ '; set -x; }
 
 	load_config || true
+	config_backup_schedule_default
 	case "${CMD:-}" in
 		--run-tests|--create-config|--help|--version) : ;;
 		*) config_refuse_old_names ;;
@@ -9487,6 +9666,15 @@ t_test_help() {
 	## written up is one nobody can find, and a command written up and since
 	## removed is a promise the tool no longer keeps. `trigger` and `stop`
 	## were in the dispatch and in neither place.
+	## The usage text is an UNQUOTED heredoc, so a bare backtick is command
+	## substitution: one of them ran `backup` as a command and another
+	## swallowed the word it was quoting. Every backtick in there is escaped.
+	_h_body=$(sed -n '/^usage() {$/,/^}$/p' "$T_MYTM")
+	t_eq "every backtick in the usage text is escaped" \
+		"$(printf '%s' "$_h_body" | grep -o '`' | count_lines)" \
+		"$(printf '%s' "$_h_body" | grep -o '\\`' | count_lines)"
+	t_eq "and rendering it says nothing on stderr" \
+		"$( ( usage ) 2>&1 >/dev/null | count_lines )" "0"
 	t_eq "--help documents exactly the commands there are" \
 		"$(printf '%s\n' "$_u" | sed -n '/^INSPECT/,/^OPTIONS/p' |
 			sed -nE 's/^  ([a-z][a-z-]*)( {2,}|[<[|]| +[<[|]).*/\1/p' | LC_ALL=C sort -u)" \
@@ -14189,10 +14377,85 @@ t_test_backup_already_running() {
 }
 
 # shellcheck disable=SC2031  # another test changes these settings only inside its own subshell
+## A backup SET is a named thing my-tm runs, parks and can wrap commands
+## around. Adversarial: the scope chain is default -> engine -> set, and the
+## easy bug is the middle one -- an engine value that the set does not
+## override must still beat the default, and a set value must beat both.
+t_test_backup_sets() {
+	printf '\nBackup sets: the scope chain, the names, the jobs\n'
+	_bs_save_c="$CONFIG_SOURCED"; _bs_save_s="$BACKUP_SETS"
+	_bs_conf="$T_ROOT/sets.conf"
+	cat >"$_bs_conf" <<'_EOF'
+set_backup_parameters() {
+	case "$1" in
+		timemachine) PRE_BACKUP_CMD="engine-pre" ;;
+		nightly)     BACKUP_SCHEDULE="03:00"; POST_BACKUP_CMD="set-post" ;;
+		weekly)      BACKUP_SCHEDULE="" ;;
+	esac
+}
+_EOF
+	CONFIG_SOURCED=" $_bs_conf"; BACKUP_SETS="nightly weekly"
+
+	t_eq "timemachine is always a set" \
+		"$(backup_sets_all | tr '\n' ' ')" "timemachine nightly weekly "
+	t_eq "a set's own value wins" "$(backup_param nightly POST_BACKUP_CMD)" "set-post"
+	t_eq "its engine's value reaches a set that does not set it" \
+		"$(backup_param nightly PRE_BACKUP_CMD)" "engine-pre"
+	t_eq "and the default reaches a set neither names" \
+		"$(backup_param weekly POST_BACKUP_CMD)" "$POST_BACKUP_CMD_DEFAULT"
+	t_eq "every set runs an engine, timemachine unless it says otherwise" \
+		"$(backup_engine_of nightly)" "timemachine"
+
+	## the jobs: one per set WITH a schedule, and the Time Machine set keeps
+	## the label every installed machine already has
+	t_eq "the Time Machine set keeps its label" "$(backup_job_label timemachine)" "$BACKUP_JOB"
+	t_eq "another set gets one of its own" "$(backup_job_label nightly)" "$BACKUP_JOB.nightly"
+	t_eq "a set with no schedule gets no job" \
+		"$(backup_jobs_all | tr '\n' ' ')" "$BACKUP_JOB $BACKUP_JOB.nightly "
+
+	## the boundary: both ways a config can make the key space ambiguous
+	BACKUP_SETS="timemachine"
+	t_match "a set named after an engine is refused" \
+		"$( ( backup_sets_all ) 2>&1 )" "named after an engine"
+	BACKUP_SETS="nightly"
+	t_match "and a set nobody configured is refused" \
+		"$( ( backup_set_resolve nosuchset ) 2>&1 )" "no backup set 'nosuchset'"
+	t_eq "no set named means the Time Machine one" "$(backup_set_resolve)" "timemachine"
+	cat >"$_bs_conf" <<'_EOF'
+set_backup_parameters() {
+	case "$1" in
+		nightly) BACKUP_ENGINE="rsync" ;;
+	esac
+}
+_EOF
+	t_match "an engine my-tm cannot run is refused" \
+		"$( ( backup_engine_of nightly ) 2>&1 )" "my-tm runs:"
+
+	## the hooks are command LINES, and one that fails does not take the
+	## backup with it
+	t_eq "a hook runs" "$(backup_run_cmd PRE 'printf ran' 2>/dev/null | tail -n 1)" "ran"
+	t_eq "an empty hook runs nothing" "$(backup_run_cmd PRE '' 2>&1 | count_lines)" "0"
+	t_match "a hook that fails is reported" "$( ( backup_run_cmd PRE 'exit 7' ) 2>&1 )" "exited 7"
+	t_eq "(and the backup goes on)" "$( ( backup_run_cmd PRE 'exit 7' ) >/dev/null 2>&1; echo $?)" "0"
+
+	## the old global name, read rather than fatal -- every machine's config
+	## still has it until its rollout step has run
+	_bs_err="$T_ROOT/sched.err"; _bs_save_d="$BACKUP_SCHEDULE_DEFAULT"
+	BACKUP_SCHEDULE="weekly-ish"; config_backup_schedule_default 2>"$_bs_err"
+	t_eq "the old BACKUP_SCHEDULE becomes the default" "$BACKUP_SCHEDULE_DEFAULT" "weekly-ish"
+	t_match "and the line is named" "$(cat "$_bs_err")" "old name"
+	t_eq "(and it is not left to shadow a set's own)" "${BACKUP_SCHEDULE:-}" ""
+	BACKUP_SCHEDULE_DEFAULT="$_bs_save_d"; rm -f "$_bs_err" "$_bs_conf"
+	CONFIG_SOURCED="$_bs_save_c"; BACKUP_SETS="$_bs_save_s"
+	return 0
+}
+
 t_test_post_backup() {
 	printf '\nPost-backup disk action\n'
 	_pb_save_v="$BACKUP_VOLUME"; _pb_save_p="$POST_BACKUP_DEFAULT"
-	_pb_save_l="$CONFIG_SOURCED"; _pb_save_f="$NO_EJECT_FLAGFILE"
+	_pb_save_l="$CONFIG_SOURCED"
+	# shellcheck disable=SC2031  # saved and restored in THIS shell; the subshell shellcheck sees is backup_param's
+	_pb_save_f="$NO_EJECT_FLAGFILE"
 	NO_EJECT_FLAGFILE="$T_ROOT/no-eject"
 	CONFIG_SOURCED=""
 	BACKUP_VOLUME="TestVol"
@@ -14432,6 +14695,7 @@ _rt_list() {
 	_rt help                                 && t_test_help
 	_rt paths                                && t_test_paths
 	_rt version_output                       && t_test_version_output
+	_rt backup_sets                          && t_test_backup_sets
 	_rt post_backup                          && t_test_post_backup
 	_rt backup_already_running               && t_test_backup_already_running
 	_rt backup_volume_unmounted              && t_test_backup_volume_unmounted
