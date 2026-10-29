@@ -354,8 +354,10 @@ a walk is running. `INDEX` is that location's index on disk (database,
 increments, coverage record, version store); while coverage is partial it adds
 `/ ~<size>`, the per-snapshot average times every snapshot — linear, so it runs
 high. `PER SNAP` is `INDEX` over the snapshots covered. Below the table, one
-line per indexed location says what is being walked or when it last ran,
-whether new backups follow automatically, and how many older snapshots only
+line per indexed location says what is being walked, or that it is waiting for a
+Time Machine backup to finish (nothing is mounted during that wait, so it would
+otherwise read as idle), or when it last ran, whether new backups follow
+automatically, and how many older snapshots only
 `--index <LOC> --all` will cover: the automatic runs take each new backup, never
 the history in between. `--ls` marks every snapshot `yes`, `no` or `now`. Anything longer than
 ~2 lines of prose belongs in `--help`, not in runtime output.
@@ -481,6 +483,7 @@ $CACHE_DIR/index/system.db     -> the live volume: reuse /var/db/locate.database
 $CACHE_DIR/index/<loc>.db      -> consolidated union of paths seen in that history
 $CACHE_DIR/index/<loc>.inc.NN.db -> per-snapshot increments (new paths only), folded in on consolidation
 $CACHE_DIR/index/<loc>.covered -> snapshot IDs already indexed
+$CACHE_DIR/index/<loc>.waiting -> a walk waiting for a backup: its pid and since when
 $CACHE_DIR/index/<loc>.versions/ -> the version store: a baseline plus one
                                   compressed delta per snapshot (path, size, mtime), §6
 ```
@@ -614,6 +617,13 @@ $CACHE_DIR/index/<loc>.versions/ -> the version store: a baseline plus one
   harmless to a query — they only cost space until the next consolidation,
   which is the usual log-structured trade and the reason an `--index` run never
   has to read the existing index first.
+* **Two indexers at once is normal**, so the increment name is **claimed**, not
+  looked up: the `--all` walk and the daemon indexing the backup that has just
+  finished both run as themselves, and two mount records flagged `indexer` is
+  the ordinary sight. Each one creates its `inc.NN.db` under `noclobber`, so
+  the create is atomic and the loser takes the next number — looking for the
+  first name that does not exist hands both the same one, and the increment
+  that loses is overwritten while `.covered` says both snapshots are indexed.
 * **A store is searched through its own index, or not at all.** The system
   database is THIS Mac's live disk, so it answers for `local` and nothing else.
   It used to be added to every location's search: on ada, a search in horse's

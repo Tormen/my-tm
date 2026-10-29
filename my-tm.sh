@@ -34,8 +34,8 @@ US="${0##*/}"
 ## so the ROOT-OWNED COPY the daemons run -- which has no git beside it -- can
 ## still say which release it is and whether it is one.
 MY_TM_VERSION="0.9.1"
-SCRIPT_COMMIT="a9e40d1"
-SCRIPT_RELEASE="v0.9.1-112-ga9e40d1"
+SCRIPT_COMMIT="e4943d9"
+SCRIPT_RELEASE="v0.9.1-113-ge4943d9"
 
 ## The first 12 hex of this file's own SHA-256: the value that identifies the
 ## bytes. my-tm is COPIED to its installed path, so this is what tells the
@@ -2942,11 +2942,11 @@ snap_mount() {
 	need_dir "$_mp" || { warn "cannot create mountpoint: $_mp"; return 1; }
 	## echo the command, then silence only ITS output: "run cmd >/dev/null 2>&1"
 	## swallows the echo too, which made -V hide the very calls it exists to show
-	run_echo mount_apfs -s "$_apfs" "$_vol_src" "$_mp"
+	run_echo mount_apfs -o nobrowse -s "$_apfs" "$_vol_src" "$_mp"
 	## its error is KEPT for the warning below: without it a failure cannot
 	## say whether the disk went away, was busy, or refused the snapshot
-	if _sm_err=$(mount_apfs -s "$_apfs" "$_vol_src" "$_mp" 2>&1 >/dev/null); then
-		why "read-only snapshot mount; no root needed, and it pins the snapshot until released"
+	if _sm_err=$(mount_apfs -o nobrowse -s "$_apfs" "$_vol_src" "$_mp" 2>&1 >/dev/null); then
+		why "read-only snapshot mount, nobrowse so it does not land on the desktop; no root needed, and it pins the snapshot until released"
 		mount_record_add "$_id" "$_loc" "$_mp" "$_ttl" "$_flags"
 		printf '%s\n' "$_mp"
 		return 0
@@ -3909,6 +3909,39 @@ index_dbs() {
 }
 
 index_covered_file() { printf '%s/%s.covered\n' "$(index_dir)" "$1"; }
+index_waiting_file() { printf '%s/%s.waiting\n' "$(index_dir)" "$1"; }
+
+## The next free increment name for a location, CLAIMED, not merely found.
+## Two indexers run at once as a matter of course -- the --all walk and the
+## daemon indexing the backup that just finished -- and both looking for the
+## first name that does not exist lets both pick it: one increment then
+## overwrites the other while .covered says both snapshots are indexed, so
+## --find quietly loses the paths of one of them. noclobber makes the create
+## atomic, so the loser takes the next number instead.
+index_claim_increment() {
+	_ici_n=0
+	while [ "$_ici_n" -lt 100 ]; do
+		_ici_f="$1/$2.inc.$(printf '%02d' "$_ici_n").db"
+		if ( set -C; : >"$_ici_f" ) 2>/dev/null; then
+			printf '%s\n' "$_ici_f"
+			return 0
+		fi
+		_ici_n=$(( _ici_n + 1 ))
+	done
+	return 1
+}
+
+## How long an --index run has been waiting for a Time Machine backup, or
+## nothing when none is. The marker carries the waiter's pid, and ps answers
+## for it rather than kill -0: the indexer runs as root, and kill -0 from
+## anyone else answers "not permitted", which reads exactly like "not running".
+index_waiting_age() {
+	_iwa_f=$(index_waiting_file "$1")
+	[ -f "$_iwa_f" ] || return 1
+	read -r _iwa_pid _iwa_at <"$_iwa_f" 2>/dev/null || return 1
+	ps -p "${_iwa_pid:-0}" >/dev/null 2>&1 || return 1
+	printf '%s\n' "$(( $(now_epoch) - ${_iwa_at:-0} ))"
+}
 
 ## How long since this location was last indexed. The .covered file is
 ## rewritten by every snapshot indexed, so its mtime IS the answer -- no second
@@ -4028,6 +4061,9 @@ index_wait_for_backup() {
 	_iwb_poll=$(parse_interval "${INDEX_BACKUP_POLL:-5m}") || _iwb_poll=300
 	[ "$_iwb_poll" -ge 1 ] || _iwb_poll=1
 	warn "$1: a Time Machine backup is running -- waiting for it to finish before the next snapshot, so the walk does not block its thinning. Ctrl-C is safe."
+	## so --status can say "waiting" instead of "idle": nothing is mounted
+	## during the wait, which is the state it otherwise reads that from
+	printf '%s %s\n' "$$" "$_iwb_w0" >"$(index_waiting_file "$1")" 2>/dev/null
 	while tm_backup_running; do
 		_iwb_waited=$(( $(now_epoch) - _iwb_w0 ))
 		[ "$_iwb_max" -gt 0 ] && [ "$_iwb_waited" -ge "$_iwb_max" ] &&
@@ -4036,6 +4072,7 @@ index_wait_for_backup() {
 			minor "the backup is still running, $(human_secs "$_iwb_waited") so far -- waiting"
 		sleep "$_iwb_poll"
 	done
+	rm -f "$(index_waiting_file "$1")"
 	minor "the backup finished after $(human_secs "$(( $(now_epoch) - _iwb_w0 ))") -- walking on"
 }
 
@@ -4319,6 +4356,8 @@ _EOF
 			## ever be covered without being asked
 			if [ -n "$_prog" ]; then
 				_ixs="walking $(ts_display "${_prog% *}") now, $(human_age "${_prog#* }") in"
+			elif _ixw=$(index_waiting_age "$_h"); then
+				_ixs="waiting for a Time Machine backup, $(human_age "$_ixw") so far"
 			elif [ -n "$(printf '%s' "$_covs" | tr -d ' ')" ]; then
 				_ixs="idle, last indexed $(human_age "$(index_age "$_h")") ago"
 			else
@@ -5588,9 +5627,6 @@ index_one() {
 	_base=$(mnt_volume_path "$_h" "$_ts" "$_vol")
 	_dir=$(index_dir)
 	need_dir "$_dir" || { snap_umount "$_mp"; return 1; }
-	_n=0
-	while [ -f "$_dir/$_h.inc.$(printf '%02d' "$_n").db" ]; do _n=$(( _n + 1 )); done
-	_inc="$_dir/$_h.inc.$(printf '%02d' "$_n").db"
 
 	_paths=$(tmp_file idx) || { snap_umount "$_mp"; return 1; }
 	## One walk, stats included: path + size + mtime for every entry, batched
@@ -5647,6 +5683,12 @@ index_one() {
 	dbg "index: $_new of $_count paths are new to the name index"
 	if [ "$_new" -gt 0 ]; then
 		if _mk=$(locate_tool locate.mklocatedb); then
+			_inc=$(index_claim_increment "$_dir" "$_h") || {
+				warn "$_ts: no increment name left for '$_h' -- consolidate first"
+				rm -f "$_paths" "$_stats"
+				snap_umount "$_mp" >/dev/null 2>&1
+				return 1
+			}
 			if ! "$_mk" <"$_paths" >"$_inc" 2>/dev/null || [ ! -s "$_inc" ]; then
 				warn "$_ts: building the name index failed -- nothing was written"
 				rm -f "$_inc"
@@ -11000,6 +11042,72 @@ t_test_a_cut_short_walk_stays_unindexed() {
 	rm -rf "$(vs_dir store)" "$_cw_fs"
 }
 
+## A snapshot my-tm mounts is a VOLUME: without nobrowse it lands on the
+## desktop. Adversarial: not "does nobrowse appear somewhere" -- one call that
+## forgets is one icon -- but "is there any mount_apfs without it", and the
+## echoed command must carry the same options as the executed one, or -V shows
+## a command nobody ran. The sparsebundle path got this right (hdiutil
+## -nobrowse) two functions away, which is what makes the omission a slip.
+t_test_snapshot_mounts_are_nobrowse() {
+	printf '\nA snapshot my-tm mounts does not land on the desktop\n'
+	snap_mount store 2026-08-20-155805 60 "" "$T_ROOT/nb.mp" >/dev/null 2>&1
+	t_eq "no mount_apfs call omits nobrowse" \
+		"$(awk '/mount_apfs/ && !/-o nobrowse/ {n++} END {print n+0}' "$(t_calls)")" "0"
+	t_eq "...and one did ask for it" \
+		"$(awk '/mount_apfs -o nobrowse -s/ {n++} END {print (n ? "yes" : "no")}' "$(t_calls)")" "yes"
+	# shellcheck disable=SC2016  # the source line is matched literally
+	t_eq "the -V echo carries the same options as the call" \
+		"$(sed -n '/^snap_mount() {$/,/^}$/p' "$T_MYTM" |
+			count_match 'run_echo mount_apfs -o nobrowse -s')" "1"
+	snap_umount "$T_ROOT/nb.mp" >/dev/null 2>&1
+}
+
+## Increment names are CLAIMED, not found. Adversarial: the bug is invisible
+## to any test that claims once -- it needs two claims with nothing written in
+## between, which is exactly the window two live indexers sit in. Scanning for
+## the first name that does not exist hands both of them the same one.
+t_test_increment_names_are_claimed() {
+	printf '\nTwo indexers never claim one increment name\n'
+	_ci_d="$T_ROOT/claim"; mkdir -p -- "$_ci_d"
+	_ci_a=$(index_claim_increment "$_ci_d" store)
+	_ci_b=$(index_claim_increment "$_ci_d" store)
+	t_ne "a second claim, before either is written, gets another name" "$_ci_a" "$_ci_b"
+	t_eq "the first is 00" "${_ci_a##*/}" "store.inc.00.db"
+	t_eq "the second is 01" "${_ci_b##*/}" "store.inc.01.db"
+	_ci_n=0
+	while [ "$_ci_n" -lt 100 ]; do
+		: >"$_ci_d/store.inc.$(printf '%02d' "$_ci_n").db"
+		_ci_n=$(( _ci_n + 1 ))
+	done
+	t_eq "with every name taken it refuses instead of spinning" \
+		"$(index_claim_increment "$_ci_d" store >/dev/null 2>&1; echo $?)" "1"
+	rm -rf "$_ci_d"
+}
+
+## "idle" while a walk waits for a backup is the tool stating something that
+## is not true -- nothing is mounted during the wait, which is where --status
+## reads "walking now" from. Adversarial: the marker must not outlive its run,
+## because a status stuck on "waiting" for ever is worse than one saying idle.
+t_test_status_says_waiting_not_idle() {
+	printf '\nA walk waiting for a backup does not read as idle\n'
+	_sw_f=$(index_waiting_file store)
+	mkdir -p -- "$(dirname "$_sw_f")"
+	printf '%s %s\n' "$$" "$(( $(now_epoch) - 120 ))" >"$_sw_f"
+	t_eq "a live wait is reported, with its age" \
+		"$(_sw_a=$(index_waiting_age store)
+		   [ "${_sw_a:-0}" -ge 120 ] && [ "${_sw_a:-0}" -lt 180 ] && echo ok || echo "${_sw_a:-none}")" "ok"
+	printf '%s %s\n' "999999" "$(( $(now_epoch) - 120 ))" >"$_sw_f"
+	t_eq "a marker whose run is gone is ignored" \
+		"$(index_waiting_age store >/dev/null 2>&1; echo $?)" "1"
+	rm -f "$_sw_f"
+	t_eq "...and so is no marker at all" \
+		"$(index_waiting_age store >/dev/null 2>&1; echo $?)" "1"
+	# shellcheck disable=SC2016  # the source line is matched literally
+	t_eq "--status asks before it is allowed to say idle" \
+		"$(sed -n '/^cmd_status() {$/,/^}$/p' "$T_MYTM" |
+			count_match 'elif _ixw=$(index_waiting_age')" "1"
+}
+
 ## A row with nothing in it used to be a wall of "-": no snapshots, no span, no
 ## last backup, and no way to tell whether the store was empty, unreadable, or
 ## simply never opened -- which is exactly what was asked about a registered
@@ -14094,6 +14202,9 @@ _rt_list() {
 	_rt no_exclusive_size_claims             && t_test_no_exclusive_size_claims
 	_rt index_increment_only_new             && t_test_index_increment_only_new
 	_rt a_cut_short_walk_stays_unindexed     && t_test_a_cut_short_walk_stays_unindexed
+	_rt snapshot_mounts_are_nobrowse         && t_test_snapshot_mounts_are_nobrowse
+	_rt increment_names_are_claimed          && t_test_increment_names_are_claimed
+	_rt status_says_waiting_not_idle         && t_test_status_says_waiting_not_idle
 	_rt site_conf_dir_from_env               && t_test_site_conf_dir_from_env
 	_rt detached_store_still_answers         && t_test_detached_store_still_answers
 	_rt rm_needs_the_store                   && t_test_rm_needs_the_store
