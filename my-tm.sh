@@ -34,8 +34,8 @@ US="${0##*/}"
 ## so the ROOT-OWNED COPY the daemons run -- which has no git beside it -- can
 ## still say which release it is and whether it is one.
 MY_TM_VERSION="0.9.1"
-SCRIPT_COMMIT="0db1dce"
-SCRIPT_RELEASE="v0.9.1-114-g0db1dce"
+SCRIPT_COMMIT="62feb22"
+SCRIPT_RELEASE="v0.9.1-115-g62feb22"
 
 ## The first 12 hex of this file's own SHA-256: the value that identifies the
 ## bytes. my-tm is COPIED to its installed path, so this is what tells the
@@ -2951,15 +2951,20 @@ snap_mount() {
 		printf '%s\n' "$_mp"
 		return 0
 	fi
-	## "Operation not permitted" is not a mount problem: macOS refused this
-	## process the Time Machine volume. Every other snapshot here will be
-	## refused the same way, so it is reported as the one thing it is and the
-	## caller is told to stop rather than hear it 57 times.
+	## Is the LOCATION the problem rather than this snapshot? Two causes, one
+	## verdict: macOS refusing the volume, and the volume no longer being
+	## there. Each gives the same answer for every remaining snapshot, so each
+	## is named once and 3 tells the caller to stop instead of hearing it 57
+	## times. Anything else below belongs to this snapshot alone.
 	case "$_sm_err" in
 		*"Operation not permitted"*)
 			warn "$_loc: Full Disk Access is missing -- macOS refuses every snapshot mount here. The jobs run through a launcher that holds the grant; run this the same way ($US --install builds it, my-fda list shows it)."
 			return 3 ;;
 	esac
+	if ! loc_reachable "$_loc"; then
+		warn "$_loc: gone -- the disk is no longer attached, so no snapshot of it can be mounted"
+		return 3
+	fi
 	if ! snap_names "$_loc" 2>/dev/null | grep -qx "$_ts"; then
 		## Time Machine adds and thins constantly, and local snapshots are
 		## purgeable at any age: a list read a minute ago can already be wrong
@@ -5635,7 +5640,9 @@ index_one() {
 	_mp=$(mnt_point_for "$_h" "$_ts")
 	msg "indexing $(ts_display "$_ts") of '$_h'"
 	snap_mount "$_h" "$_ts" 86400 "indexer" >/dev/null || {
-		## 3 is the refusal above: it belongs to the LOCATION, not this snapshot
+		## 3 is a verdict about the LOCATION, not this snapshot: the grant is
+		## missing, or the disk is gone. Either way the next snapshot cannot
+		## go better, so it is handed up rather than flattened.
 		[ "$?" = "3" ] && return 3
 		warn "$_ts: mount failed"
 		return 1
@@ -5669,13 +5676,17 @@ index_one() {
 	## snapshot for good -- --find would answer from half of it, for ever.
 	## Leaving it unindexed costs one more walk; the next run resumes here.
 	_wrc=$(cat "$_walkrc" 2>/dev/null); rm -f "$_walkrc"
+	_gone=0
+	loc_reachable "$_h" || _gone=1
 	_why=""
-	loc_reachable "$_h" || _why="'$_h' is no longer reachable"
+	[ "$_gone" = "1" ] && _why="'$_h' is no longer reachable"
 	[ -z "$_why" ] && [ "${_wrc:-1}" != "0" ] && _why="find exited ${_wrc:-?}"
 	if [ -n "$_why" ]; then
 		warn "$_ts: the walk did not finish ($_why) -- the snapshot stays unindexed, so the next --index walks it again"
 		rm -f "$_stats" "$_paths"
 		snap_umount "$_mp" >/dev/null 2>&1
+		## the disk being gone is not this snapshot's problem: 3 stops the walk
+		[ "$_gone" = "1" ] && return 3
 		return 1
 	fi
 
@@ -11035,11 +11046,13 @@ t_test_a_cut_short_walk_stays_unindexed() {
 		mnt_volume_path() { printf '%s/%s\n' "$_cw_fs" "$2"; }
 		# shellcheck disable=SC2329
 		loc_reachable() { return 1; }
-		index_one store "$_cw_ts"
+		index_one store "$_cw_ts"; printf 'rc=%s\n' "$?"
 	) 2>&1 )
 	t_eq "a location that went away is named as the reason" \
 		"$(printf '%s\n' "$_cw_gone" | count_match 'is no longer reachable')" "1"
 	t_eq "...and that snapshot stays uncovered too" "$(index_covered_count store)" "0"
+	t_eq "...and it answers 3, not 1: the disk is gone, not this snapshot" \
+		"$(printf '%s\n' "$_cw_gone" | count_match 'rc=3')" "1"
 
 	## 3. the same snapshot walked cleanly -- this is what resuming IS
 	_cw_ok=$( (
@@ -11133,8 +11146,8 @@ t_test_status_says_waiting_not_idle() {
 ## treated 57 identical refusals as 57 unrelated mount failures. So the checks
 ## are: is it NAMED, and does the walk STOP; and, the other way round, an
 ## ordinary mount failure must still be just that and not end the run.
-t_test_refused_access_stops_the_walk() {
-	printf '\nmacOS refusing the volume stops the walk, by name\n'
+t_test_location_failures_stop_the_walk() {
+	printf '\nWhat is wrong with the LOCATION stops the walk, by name\n'
 	_fa_err="mount_apfs: volume could not be mounted: Operation not permitted"
 	_fa_out=$( (
 		# shellcheck disable=SC2329  # called by snap_mount
@@ -11177,6 +11190,21 @@ t_test_refused_access_stops_the_walk() {
 		cmd_index store ) 2>&1 )
 	t_eq "a plain mount failure does not end the walk" \
 		"$(printf '%s\n' "$_fa_one" | count_match 'stopping -- nothing here can be indexed')" "0"
+
+	## the OTHER cause of the same verdict: the disk is simply not there any
+	## more. Adversarial: it must not be confused with the snapshot having been
+	## thinned away, which belongs to one snapshot and the walk must survive it
+	_fa_gone=$( (
+		# shellcheck disable=SC2329
+		mount_apfs() { printf 'mount_apfs: No such file or directory\n' >&2; return 1; }
+		# shellcheck disable=SC2329
+		loc_reachable() { return 1; }
+		snap_mount store 2026-08-20-155805 60 "indexer" "$T_ROOT/fg.mp"
+		printf 'rc=%s\n' "$?" ) 2>&1 )
+	t_eq "a location that is gone says so, naming the disk" \
+		"$(printf '%s\n' "$_fa_gone" | count_match 'gone -- the disk is no longer attached')" "1"
+	t_eq "...with the same verdict 3, so the walk stops" \
+		"$(printf '%s\n' "$_fa_gone" | count_match 'rc=3')" "1"
 	rm -f "$(index_covered_file store)"
 }
 
@@ -14277,7 +14305,7 @@ _rt_list() {
 	_rt snapshot_mounts_are_nobrowse         && t_test_snapshot_mounts_are_nobrowse
 	_rt increment_names_are_claimed          && t_test_increment_names_are_claimed
 	_rt status_says_waiting_not_idle         && t_test_status_says_waiting_not_idle
-	_rt refused_access_stops_the_walk        && t_test_refused_access_stops_the_walk
+	_rt location_failures_stop_the_walk      && t_test_location_failures_stop_the_walk
 	_rt site_conf_dir_from_env               && t_test_site_conf_dir_from_env
 	_rt detached_store_still_answers         && t_test_detached_store_still_answers
 	_rt rm_needs_the_store                   && t_test_rm_needs_the_store

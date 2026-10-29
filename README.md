@@ -558,14 +558,16 @@ $CACHE_DIR/index/<loc>.versions/ -> the version store: a baseline plus one
   pipeline ends in `sort`, which succeeds on a truncated read just as well, so
   `find`'s own status is kept and checked; nothing is written from half a walk,
   neither the name index nor the version store's delta.
-* **A refusal is not a failure.** `mount_apfs: Operation not permitted` is
-  macOS withholding the Time Machine volume from this process, and it is the
-  same answer for every snapshot on it. So it is named once as Full Disk
-  Access, with the pointer to the launcher that holds the grant, and the walk
-  **stops** — rather than reporting it as 57 unrelated mount failures while the
-  run looks busy for hours and indexes nothing, which is how it actually went
-  on horse on 2026-10-29. An ordinary mount failure still belongs to its own
-  snapshot and the walk carries on.
+* **Some failures belong to the LOCATION, not the snapshot**, and they get one
+  verdict: named once, and the walk **stops**. Two causes qualify, because each
+  gives the same answer for every snapshot left. `mount_apfs: Operation not
+  permitted` is macOS withholding the volume from this process — reported as
+  Full Disk Access, with the pointer to the launcher that holds the grant;
+  that is how it actually went on horse on 2026-10-29, where the walk took 57
+  identical refusals for 57 unrelated mount failures and spent the morning
+  looking busy while indexing nothing. The disk no longer being attached is
+  the other. An ordinary mount failure, and a snapshot thinned away since the
+  list was read, still belong to their own snapshot and the walk carries on.
 * **`--index --all` and the sweep.** It starts with a warning naming the
   snapshot count and the ETA, because while it runs Time Machine's thinning is
   blocked on whatever it currently holds. That is acceptable for a run you do
