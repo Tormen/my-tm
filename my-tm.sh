@@ -34,8 +34,8 @@ US="${0##*/}"
 ## so the ROOT-OWNED COPY the daemons run -- which has no git beside it -- can
 ## still say which release it is and whether it is one.
 MY_TM_VERSION="0.9.1"
-SCRIPT_COMMIT="9773033"
-SCRIPT_RELEASE="v0.9.1-118-g9773033"
+SCRIPT_COMMIT="8676562"
+SCRIPT_RELEASE="v0.9.1-119-g8676562"
 
 ## The first 12 hex of this file's own SHA-256: the value that identifies the
 ## bytes. my-tm is COPIED to its installed path, so this is what tells the
@@ -225,6 +225,7 @@ PRE_BACKUP_CMD_DEFAULT=""
 # shellcheck disable=SC2034  # read through backup_param, which builds its name
 POST_BACKUP_CMD_DEFAULT=""
 BACKUP_VOLUME=""
+CCC_CLI="/Applications/Carbon Copy Cloner.app/Contents/MacOS/ccc"
 POST_BACKUP_DEFAULT="eject"
 NOTIFY_CMD=""
 NO_EJECT_FLAGFILE="/var/lib/my-tm/no-eject"
@@ -594,7 +595,10 @@ POST_BACKUP_CMD_DEFAULT=""      # run after it, BEFORE POST_BACKUP parks
 #set_backup_parameters() {
 #	case "$1" in
 #		timemachine) POST_BACKUP_CMD="" ;;
-#		nightly)     BACKUP_SCHEDULE="03:00" ;;
+#		ccc)         POST_BACKUP_CMD="" ;;
+#		nightly)     BACKUP_ENGINE="ccc"
+#		             BACKUP_TARGET="CCC Backup Task@bkp-ccc"
+#		             BACKUP_SCHEDULE="03:00" ;;
 #	esac
 #}
 JOBS_RUN_WITH_FULL_DISK_ACCESS=0 # 1: the jobs run my-tm through JOBS_LAUNCHER,
@@ -641,6 +645,8 @@ POST_BACKUP_DEFAULT="eject"     # what happens when a backup finishes:
 #		horse@ada)  HEALTH_MAX_AGE="0" ;;
 #	esac
 #}
+CCC_CLI="/Applications/Carbon Copy Cloner.app/Contents/MacOS/ccc"
+                                # the ccc engine's command line tool
 NOTIFY_CMD=""                   # optional external notifier; empty = osascript
 NO_EJECT_FLAGFILE="/var/lib/my-tm/no-eject"
 LOCKFILE="/var/lib/my-tm/backup.lock"
@@ -751,7 +757,7 @@ LOCATION_PARAMETERS="THIN_POLICY_TO_KEEP POST_BACKUP HEALTH_MAX_AGE INDEX_INTERV
 BACKUP_PARAMETERS="BACKUP_ENGINE BACKUP_TARGET BACKUP_SCHEDULE PRE_BACKUP_CMD POST_BACKUP_CMD"
 ## The engines my-tm can run a set with.  A set may not be named after one:
 ## set_backup_parameters() is asked for both, so the two share a key space.
-BACKUP_ENGINES="timemachine"
+BACKUP_ENGINES="timemachine ccc"
 
 loc_param() {
 	case " $LOCATION_PARAMETERS " in
@@ -6953,6 +6959,45 @@ cmd_trigger() {
 	msg "asked $_tr_job to run a backup now"
 	why "it runs as its own launchd job, so this returns at once and the backup outlives this process"
 }
+## <task>@<volume> -- split on the LAST @, so a task name may contain one.
+## Printed as two tab-separated fields.
+ccc_target_split() {            # <target> -> <task>\t<volume>
+	case "${1:-}" in
+		*@*) printf '%s\t%s\n' "${1%@*}" "${1##*@}" ;;
+		*)   err "the ccc engine's BACKUP_TARGET is '<task>@<volume>'; got '${1:-}'" ;;
+	esac
+}
+
+## Carbon Copy Cloner. `--watch` is what makes --start BLOCK until the task is
+## finished -- CCC's own help: "Keep running and print task output until the
+## task is finished" -- so it is the counterpart of tmutil's --block, and the
+## disposition below runs after a backup that really ended.
+backup_ccc() {                  # start|stop
+	[ -x "$CCC_CLI" ] ||
+		err "CCC_CLI is not an executable: $CCC_CLI -- the ccc engine needs Carbon Copy Cloner's command line tool"
+	_cc=$(ccc_target_split "$BACKUP_TARGET") || return 1
+	_cc_task=$(printf '%s' "$_cc" | cut -f 1)
+	_cc_vol=$(printf '%s' "$_cc" | cut -f 2)
+
+	if [ "$1" = "stop" ]; then
+		run "$CCC_CLI" --stop="$_cc_task"
+		return 0
+	fi
+
+	[ -d "/Volumes/$_cc_vol" ] || run diskutil mount "$_cc_vol" ||
+		err "could not mount $_cc_vol for the ccc task '$_cc_task'"
+	[ "$NOTIFY_BEGIN" = "1" ] && notify "CCC backup '$_cc_task' starting"
+	run "$CCC_CLI" --start="$_cc_task" --watch
+	_cc_rc=$?
+	if [ "$_cc_rc" = "0" ]; then
+		msg "ccc task '$_cc_task' finished [rc $_cc_rc]"
+		[ "$NOTIFY_END" = "1" ] && notify "CCC backup '$_cc_task' finished"
+	else
+		warn "ccc task '$_cc_task' FAILED [rc $_cc_rc]"
+		[ "$NOTIFY_END" = "1" ] && notify "CCC backup '$_cc_task' FAILED ($_cc_rc)"
+	fi
+	return "$_cc_rc"
+}
 
 cmd_backup() {
 	_action="${1:-}"
@@ -7012,13 +7057,28 @@ cmd_backup() {
 	trap 'backup_cleanup' EXIT INT TERM HUP
 
 	if [ "$_action" = "stop" ]; then
-		run tmutil stopbackup
+		case "$BACKUP_ENGINE" in
+			ccc) backup_ccc stop ;;
+			*)   run tmutil stopbackup ;;
+		esac
 		backup_run_cmd "POST_BACKUP_CMD" "$POST_BACKUP_CMD"
 		do_post_backup
 		return 0
 	fi
 
 	backup_run_cmd "PRE_BACKUP_CMD" "$PRE_BACKUP_CMD"
+
+	## Everything below this point is Time Machine's: the destination id, the
+	## RESULT it records, the snapshot tables to re-read, the index to update.
+	## None of it exists for another engine, so the special case sits HERE, at
+	## the top of the caller, rather than as an "except when ccc" in each.
+	if [ "$BACKUP_ENGINE" != "timemachine" ]; then
+		backup_ccc start
+		_bk_rc=$?
+		backup_run_cmd "POST_BACKUP_CMD" "$POST_BACKUP_CMD"
+		do_post_backup
+		return "$_bk_rc"
+	fi
 
 	_bv=$(backup_volume)
 	if [ -n "$_bv" ] && [ ! -d "/Volumes/$_bv" ]; then
@@ -8452,6 +8512,12 @@ MAINTAIN -- these need root + Full Disk Access
   it. \`timemachine\` is always one and is what you get when no <SET> is
   named. BACKUP_SETS adds more, and set_backup_parameters in the config
   gives each one its own values -- see --create-config.
+
+  Its ENGINE is what actually runs it:
+    timemachine  tmutil startbackup --block, onto BACKUP_TARGET (the
+                 destination volume; empty asks tmutil destinationinfo)
+    ccc          Carbon Copy Cloner, \`CCC_CLI --start --watch\`, onto
+                 BACKUP_TARGET written as <task>@<volume>
 
 INSTALL & SET UP
   --install [<SSH-HOST>] [go] | --uninstall [<SSH-HOST>] [go]
@@ -14450,6 +14516,66 @@ _EOF
 	return 0
 }
 
+## The ccc engine. Adversarial: the two ways it could quietly do nothing --
+## a target my-tm cannot split, and a CCC_CLI that is not there -- have to be
+## refusals, not a backup that "succeeded" having run no task. And the
+## Time Machine path must not be entered for it: tmutil on a CCC set would
+## back up the wrong thing entirely.
+t_test_backup_ccc() {
+	printf '\nThe ccc engine\n'
+	_cc_save_cli="$CCC_CLI"; _cc_save_t="${BACKUP_TARGET:-}"
+	_cc_save_e="${BACKUP_ENGINE:-}"
+	# shellcheck disable=SC2031  # saved and restored in THIS shell; the subshell shellcheck sees is backup_param's
+	_cc_save_b="$NOTIFY_BEGIN"
+	# shellcheck disable=SC2031  # ditto
+	_cc_save_n="$NOTIFY_END"
+	NOTIFY_BEGIN=0; NOTIFY_END=0
+
+	t_eq "a target splits into task and volume" \
+		"$(ccc_target_split 'CCC Backup Task@bkp-ccc' | tr '\t' '|')" "CCC Backup Task|bkp-ccc"
+	t_eq "and on the LAST @, so a task may contain one" \
+		"$(ccc_target_split 'a@b@vol' | tr '\t' '|')" "a@b|vol"
+	t_match "a target with no volume is refused" \
+		"$( ( ccc_target_split 'just a task' ) 2>&1 )" "<task>@<volume>"
+
+	CCC_CLI="$T_ROOT/nosuch-ccc"; BACKUP_TARGET='T@bkp-ccc'
+	t_match "a CCC_CLI that is not executable is refused" \
+		"$( ( backup_ccc start ) 2>&1 )" "not an executable"
+
+	## a stub that records what it was called with
+	CCC_CLI="$T_ROOT/ccc"
+	# shellcheck disable=SC2016  # writing a stub script: $* and $T_CCC_RC are ITS own
+	printf '#!/bin/dash\nprintf "ccc %%s\\n" "$*" >>"%s"\nexit ${T_CCC_RC:-0}\n' "$(t_calls)" >"$CCC_CLI"
+	chmod 755 "$CCC_CLI"
+	_cc_n() { count_lines < "$(t_calls)"; }
+
+	_b=$(_cc_n); backup_ccc start >/dev/null 2>&1
+	_new=$(sed -n "$(( _b + 1 )),\$p" "$(t_calls)")
+	t_match "start runs the task and waits for it" "$_new" 'ccc --start=T --watch'
+	t_match "and mounts the volume first" "$_new" "diskutil mount bkp-ccc"
+
+	_b=$(_cc_n); backup_ccc stop >/dev/null 2>&1
+	_new=$(sed -n "$(( _b + 1 )),\$p" "$(t_calls)")
+	t_match "stop names the task" "$_new" 'ccc --stop=T'
+
+	_b=$(_cc_n); ( T_CCC_RC=4; export T_CCC_RC; backup_ccc start ) >/dev/null 2>&1
+	t_eq "a task that fails is a failure" \
+		"$( ( T_CCC_RC=4; export T_CCC_RC; backup_ccc start ) >/dev/null 2>&1; echo $?)" "4"
+
+	## the engine branch: a ccc set must not reach tmutil
+	_b=$(_cc_n)
+	BACKUP_ENGINE="ccc"
+	( backup_ccc start ) >/dev/null 2>&1
+	_new=$(sed -n "$(( _b + 1 )),\$p" "$(t_calls)")
+	t_eq "and nothing of Time Machine's runs for it" \
+		"$(printf '%s\n' "$_new" | count_match 'tmutil')" "0"
+
+	rm -f "$CCC_CLI"
+	CCC_CLI="$_cc_save_cli"; BACKUP_TARGET="$_cc_save_t"
+	BACKUP_ENGINE="$_cc_save_e"; NOTIFY_BEGIN="$_cc_save_b"; NOTIFY_END="$_cc_save_n"
+	return 0
+}
+
 t_test_post_backup() {
 	printf '\nPost-backup disk action\n'
 	_pb_save_v="$BACKUP_VOLUME"; _pb_save_p="$POST_BACKUP_DEFAULT"
@@ -14696,6 +14822,7 @@ _rt_list() {
 	_rt paths                                && t_test_paths
 	_rt version_output                       && t_test_version_output
 	_rt backup_sets                          && t_test_backup_sets
+	_rt backup_ccc                           && t_test_backup_ccc
 	_rt post_backup                          && t_test_post_backup
 	_rt backup_already_running               && t_test_backup_already_running
 	_rt backup_volume_unmounted              && t_test_backup_volume_unmounted

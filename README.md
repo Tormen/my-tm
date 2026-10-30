@@ -158,6 +158,12 @@ MAINTAIN -- these need root + Full Disk Access
   named. BACKUP_SETS adds more, and set_backup_parameters in the config
   gives each one its own values -- see --create-config.
 
+  Its ENGINE is what actually runs it:
+    timemachine  tmutil startbackup --block, onto BACKUP_TARGET (the
+                 destination volume; empty asks tmutil destinationinfo)
+    ccc          Carbon Copy Cloner, `CCC_CLI --start --watch`, onto
+                 BACKUP_TARGET written as <task>@<volume>
+
 INSTALL & SET UP
   --install [<SSH-HOST>] [go] | --uninstall [<SSH-HOST>] [go]
                                  initial setup: dirs, /tm firmlink, daemons.
@@ -1808,6 +1814,19 @@ Scope is **default → engine → set, last wins**: `BACKUP_SCHEDULE_DEFAULT` in
 config, then whatever the function sets for the engine, then for the set. It is
 the mechanism `set_location_parameters` already is, asked twice — which is why
 a set may not be named after an engine, and why my-tm refuses one that is.
+
+Its **engine** is what actually runs it:
+
+| engine | runs | `BACKUP_TARGET` |
+|---|---|---|
+| `timemachine` | `tmutil startbackup --block` | the destination volume; empty asks `tmutil destinationinfo` |
+| `ccc` | `CCC_CLI --start=<task> --watch` | `<task>@<volume>`, split on the last `@` |
+
+`--watch` is what makes CCC's `--start` block until the task is finished, so
+it is the counterpart of tmutil's `--block` and the disposition below runs
+after a backup that really ended. An engine my-tm does not know, a target it
+cannot split, and a `CCC_CLI` that is not executable are all refused up front
+rather than discovered at 03:00 by a job with nobody watching.
 
 `--install` writes one launchd job per set that has a schedule. The
 `timemachine` set keeps the job label it has always had, so no installed
