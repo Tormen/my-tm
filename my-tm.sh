@@ -34,8 +34,8 @@ US="${0##*/}"
 ## so the ROOT-OWNED COPY the daemons run -- which has no git beside it -- can
 ## still say which release it is and whether it is one.
 MY_TM_VERSION="0.9.1"
-SCRIPT_COMMIT="4c6138d"
-SCRIPT_RELEASE="v0.9.1-121-g4c6138d"
+SCRIPT_COMMIT="e5f73c3"
+SCRIPT_RELEASE="v0.9.1-122-ge5f73c3"
 
 ## The first 12 hex of this file's own SHA-256: the value that identifies the
 ## bytes. my-tm is COPIED to its installed path, so this is what tells the
@@ -7941,7 +7941,14 @@ cmd_install() {
 	for _d in "$CACHE_DIR" "$MOUNT_ROOT" "$CACHE_DIR/index" "$LOG_DIR_ROOT"; do
 		need_dir "$_d" || err "cannot create $_d"
 	done
-	run chown -R "root:$_group" "$CACHE_DIR" || warn "chown failed on $CACHE_DIR"
+	## $MOUNT_ROOT is INSIDE $CACHE_DIR and holds MOUNTED snapshots, so a -R
+	## here descends into every one of them: they are read-only, so it fails
+	## once per file, and it walks a whole backup to do it. The directory is
+	## the boundary -- own what my-tm WRITES, never descend into what it
+	## MOUNTS. $MOUNT_ROOT is a plain directory itself, so it is named here.
+	run find "$CACHE_DIR" -path "$MOUNT_ROOT" -prune -o \
+		-exec chown "root:$_group" {} + || warn "chown failed under $CACHE_DIR"
+	run chown "root:$_group" "$MOUNT_ROOT" || warn "chown failed on $MOUNT_ROOT"
 	run chmod "$CACHE_MODE" "$CACHE_DIR" "$MOUNT_ROOT" || warn "chmod failed"
 	why "root writes, the group reads, others see nothing -- the daemons act on what is in here"
 
@@ -14050,6 +14057,41 @@ t_test_runs_without_home() {
 	rm -f "$_nh_err"
 }
 
+## --install owns its own tree, and $MOUNT_ROOT sits inside it with read-only
+## snapshot mounts under it. A `chown -R` there fails once per file in every
+## mounted snapshot and walks a whole backup doing it -- seen on horse,
+## thousands of "Read-only file system" lines in a rollout log. Adversarial:
+## the boundary is checked BOTH ways -- the tree is covered, and the mounts
+## are not entered -- because a prune that pruned everything would also
+## produce no errors.
+t_test_install_never_walks_mounts() {
+	printf '\nThe install owns its tree without descending into the mounts\n'
+	_iw_body=$(sed -n '/^cmd_install() {$/,/^}$/p' "$T_MYTM")
+	## count_match is a LITERAL substring (awk index), not a regex: the
+	## first version of this asked for 'chown -R .*CACHE_DIR' and so could
+	## never match anything. Caught by neutering the fix and watching it
+	## pass anyway.
+	t_eq "no chown -R anywhere in the install" \
+		"$(printf '%s\n' "$_iw_body" | count_match 'chown -R')" "0"
+	# shellcheck disable=SC2016  # a search pattern; awk -v unescapes the \$
+	t_eq "the mount root is pruned instead" \
+		"$(printf '%s\n' "$_iw_body" | count_match 'path "\$MOUNT_ROOT" -prune')" "1"
+
+	## and the expression really does that, on a tree shaped like the real one
+	_iw=$(tmp_dir mountwalk) || return 1
+	mkdir -p -- "$_iw/index" "$_iw/mount/.mnt/horse/2026" "$_iw/other"
+	touch "$_iw/a" "$_iw/index/b" "$_iw/mount/.mnt/horse/2026/deep"
+	_iw_hit=$(find "$_iw" -path "$_iw/mount" -prune -o -print)
+	t_eq "the tree my-tm writes is covered" \
+		"$(printf '%s\n' "$_iw_hit" | count_match 'index/b')" "1"
+	t_eq "(and so is the rest of it)" \
+		"$(printf '%s\n' "$_iw_hit" | count_match 'other')" "1"
+	t_eq "nothing under the mount root is touched" \
+		"$(printf '%s\n' "$_iw_hit" | count_match 'mount/')" "0"
+	rm -rf "$_iw"
+	return 0
+}
+
 t_test_install_builds_no_tree() {
 	printf '\n--install leaves the tree to the maintenance job\n'
 	_ib=$(sed -n '/^cmd_install() {$/,/^}$/p' "$T_MYTM")
@@ -14907,6 +14949,7 @@ _rt_list() {
 	_rt remote_progress_reaches_the_caller   && t_test_remote_progress_reaches_the_caller
 	_rt remote_command_is_bounded            && t_test_remote_command_is_bounded
 	_rt lsof_never_answers                   && t_test_lsof_never_answers
+	_rt install_never_walks_mounts           && t_test_install_never_walks_mounts
 	_rt install_builds_no_tree               && t_test_install_builds_no_tree
 	_rt runs_without_home                    && t_test_runs_without_home
 	_rt autodetect_mode                      && t_test_autodetect_mode
