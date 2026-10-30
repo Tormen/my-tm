@@ -34,8 +34,8 @@ US="${0##*/}"
 ## so the ROOT-OWNED COPY the daemons run -- which has no git beside it -- can
 ## still say which release it is and whether it is one.
 MY_TM_VERSION="0.9.1"
-SCRIPT_COMMIT="8676562"
-SCRIPT_RELEASE="v0.9.1-119-g8676562"
+SCRIPT_COMMIT="f4d38ac"
+SCRIPT_RELEASE="v0.9.1-120-gf4d38ac"
 
 ## The first 12 hex of this file's own SHA-256: the value that identifies the
 ## bytes. my-tm is COPIED to its installed path, so this is what tells the
@@ -209,9 +209,9 @@ INTERRUPTED_AFTER="1h"
 HEADLESS_NOTIFY_HEALTH_WARNINGS=1
 MAINT_JOB="local.my-tm.maintenance"
 MAINT_INTERVAL=120
-LOCAL_SNAP_INTERVAL=""
-LOCAL_SNAP_KEEP_H=24
-LOCAL_SNAP_MAX=48
+FS_SNAP_INTERVAL=""
+FS_SNAP_KEEP_H=24
+FS_SNAP_MAX=48
 BACKUP_JOB="local.my-tm.backup"
 BACKUP_SETS=""
 # shellcheck disable=SC2034  # read through backup_param, which builds its name
@@ -568,12 +568,12 @@ HEADLESS_NOTIFY_HEALTH_WARNINGS=1   # a health nobody is watching notifies on
 # --- jobs installed by --install ---
 MAINT_JOB="local.my-tm.maintenance"   # mount sweep + /tm refresh + local snaps
 MAINT_INTERVAL=120              # s between maintenance runs
-LOCAL_SNAP_INTERVAL=""          # "" = off. <N>m or <N>h, 1 minute .. 1 day.
+FS_SNAP_INTERVAL=""             # "" = off. <N>m or <N>h, 1 minute .. 1 day.
                                 # A short interval is a safety-net undo;
                                 # cheap (metadata only), but PURGEABLE -- macOS
                                 # deletes them under pressure. Not an archive.
-LOCAL_SNAP_KEEP_H=24            # h; matches macOS's own ~24h rotation
-LOCAL_SNAP_MAX=48               # cap for high-frequency intervals
+FS_SNAP_KEEP_H=24               # h; matches macOS's own ~24h rotation
+FS_SNAP_MAX=48                  # cap for high-frequency intervals
 BACKUP_JOB="local.my-tm.backup"
 BACKUP_SETS=""                  # extra backup sets, by name, space separated.
                                 # "timemachine" is always there and needs no
@@ -906,15 +906,35 @@ config_refuse_old_names() {
 ## machine's config still does until its rollout step has run. Read the verb
 ## out of it rather than failing a bare `my-tm`, and say so once per run --
 ## the file is root's, so nobody can fix it from here.
-## BACKUP_SCHEDULE was one global value; it is a per-set parameter now, so
-## the config key is BACKUP_SCHEDULE_DEFAULT like every other default. Read
-## the old name rather than failing every machine, and say so once per run.
-config_backup_schedule_default() {
-	[ -n "${BACKUP_SCHEDULE:-}" ] || return 0
-	warn "BACKUP_SCHEDULE=\"$BACKUP_SCHEDULE\" is the old name (config:$CONFIG_SOURCED) -- read as BACKUP_SCHEDULE_DEFAULT; a set sets BACKUP_SCHEDULE for itself now"
-	# shellcheck disable=SC2034  # read through backup_param, which builds its name
-	BACKUP_SCHEDULE_DEFAULT="$BACKUP_SCHEDULE"
-	BACKUP_SCHEDULE=""
+## Keys that were RENAMED, as <old>:<new>:<why>. Unlike config_refuse_old_names
+## above -- which stops the run, because ignoring those would change what the
+## backups keep -- these are read under their new name with one line saying so:
+## a key whose meaning did not change must not fail every machine between the
+## release and the rollout step that renames it.
+CONFIG_RENAMED_KEYS="\
+BACKUP_SCHEDULE:BACKUP_SCHEDULE_DEFAULT:a set sets BACKUP_SCHEDULE for itself now
+LOCAL_SNAP_INTERVAL:FS_SNAP_INTERVAL:the command is fs-snap
+LOCAL_SNAP_KEEP_H:FS_SNAP_KEEP_H:the command is fs-snap
+LOCAL_SNAP_MAX:FS_SNAP_MAX:the command is fs-snap"
+
+config_rename_old_keys() {
+	## one LINE per key: the reason field has spaces in it, so a word loop
+	## would split it -- and then read the fragments as key names
+	while IFS= read -r _ro; do
+		[ -n "$_ro" ] || continue
+		_ro_old=${_ro%%:*}; _ro_rest=${_ro#*:}
+		_ro_new=${_ro_rest%%:*}; _ro_why=${_ro_rest#*:}
+		eval "_ro_set=\${$_ro_old+set}"
+		[ -n "$_ro_set" ] || continue
+		eval "_ro_val=\$$_ro_old"
+		warn "$_ro_old is the old name (config:$CONFIG_SOURCED) -- read as $_ro_new; $_ro_why"
+		## UNSET, not emptied: an emptied name is still "set", so a second
+		## call would fire again and overwrite the new value with nothing
+		eval "$_ro_new=\$_ro_val; unset $_ro_old"
+	done <<_EOF
+$CONFIG_RENAMED_KEYS
+_EOF
+	return 0
 }
 
 config_default_cmd_verb() {
@@ -4442,7 +4462,7 @@ _EOF
 				elif is_remote_target "$_t"; then
 					status_footnote "$(remote_host "$_t") has not read it yet, and a status never makes it open the store -- it could take minutes there. Read it once with: $US ls $_h"
 				elif [ "$_t" = "local" ]; then
-					status_footnote "this Mac keeps no local snapshots right now -- Time Machine makes them only while backing THIS Mac up, and a Mac that is just a backup target has none. my-tm can take them itself: $US local-snap takes one now, LOCAL_SNAP_INTERVAL=1h in the config keeps taking them"
+					status_footnote "this Mac keeps no local snapshots right now -- Time Machine makes them only while backing THIS Mac up, and a Mac that is just a backup target has none. my-tm can take them itself: $US fs-snap takes one now, FS_SNAP_INTERVAL=1h in the config keeps taking them"
 				else
 					status_footnote "the store is readable but holds no backups yet -- Time Machine has not written one here. $US backup runs one"
 				fi
@@ -6138,22 +6158,22 @@ cmd_verify() {
 }
 
 #############################################################################
-## local-snapshot
+## filesystem snapshot
 #############################################################################
 
-cmd_local_snap() {
+cmd_fs_snap() {
 	run tmutil localsnapshot || err "could not take a local snapshot"
 	why "an APFS snapshot: metadata only, and PURGEABLE -- macOS deletes it under pressure"
 	return 0
 }
 
-local_snap_trim() {
+fs_snap_trim() {
 	_names=$(tmutil listlocalsnapshots /System/Volumes/Data 2>/dev/null |
 		sed -nE 's/^com\.apple\.TimeMachine\.([0-9-]+)\.local$/\1/p' | sort)
 	[ -n "$_names" ] || return 0
 	_n=$(printf '%s\n' "$_names" | count_lines)
 	_now=$(now_epoch)
-	_cut=$(( _now - LOCAL_SNAP_KEEP_H * 3600 ))
+	_cut=$(( _now - FS_SNAP_KEEP_H * 3600 ))
 	_drop=""
 	while IFS= read -r _ts; do
 		[ -n "$_ts" ] || continue
@@ -6163,7 +6183,7 @@ local_snap_trim() {
 	done <<_EOF
 $_names
 _EOF
-	_over=$(( _n - LOCAL_SNAP_MAX ))
+	_over=$(( _n - FS_SNAP_MAX ))
 	if [ "$_over" -gt 0 ]; then
 		_extra=$(printf '%s\n' "$_names" | head -n "$_over")
 		_drop="$_drop $_extra"
@@ -6350,8 +6370,8 @@ _EOF
 		health_say warn "no local APFS snapshots -- the only history that works with no backup disk attached"
 	## and the other way round: they live ON the boot volume, so a pile that
 	## never gets trimmed is a startup disk filling up
-	[ "$_lsn" -gt "$(( ${LOCAL_SNAP_MAX:-48} * 2 ))" ] &&
-		health_say warn "$_lsn local APFS snapshots on / (LOCAL_SNAP_MAX $LOCAL_SNAP_MAX) -- they take space on the boot volume ($US local-snap trims to the cap)"
+	[ "$_lsn" -gt "$(( ${FS_SNAP_MAX:-48} * 2 ))" ] &&
+		health_say warn "$_lsn local APFS snapshots on / (FS_SNAP_MAX $FS_SNAP_MAX) -- they take space on the boot volume ($US fs-snap trims to the cap)"
 
 	## paths that MUST be backed up
 	if [ -n "$HEALTH_WATCH_PATHS" ]; then
@@ -8244,8 +8264,8 @@ cmd_maintenance() {
 		dbg "maintenance: $_mi has a backup its index has not seen"
 		cmd_index "$_mi"
 	done
-	if [ -n "$LOCAL_SNAP_INTERVAL" ]; then
-		_iv=$(parse_interval "$LOCAL_SNAP_INTERVAL") || _iv=""
+	if [ -n "$FS_SNAP_INTERVAL" ]; then
+		_iv=$(parse_interval "$FS_SNAP_INTERVAL") || _iv=""
 		if [ -n "$_iv" ]; then
 			_last=$(tmutil listlocalsnapshots /System/Volumes/Data 2>/dev/null |
 				sed -nE 's/^com\.apple\.TimeMachine\.([0-9-]+)\.local$/\1/p' | sort | tail -n 1)
@@ -8256,9 +8276,9 @@ cmd_maintenance() {
 			fi
 			if [ "$_due" = "1" ]; then
 				dbg "maintenance: a local snapshot is due"
-				cmd_local_snap
+				cmd_fs_snap
 			fi
-			local_snap_trim
+			fs_snap_trim
 		fi
 	fi
 	return 0
@@ -8303,7 +8323,7 @@ _my-tm() {
     'no-index:stop indexing a location, keep its index'
     'rm-index:stop indexing a location and delete its index'
     'verify:re-check stored checksums'
-    'local-snap:take an APFS local snapshot'
+    'fs-snap:take a filesystem snapshot of this Mac now'
     'health:run the health checks'
     'rm:delete snapshots'
     'thin:apply a retention policy'
@@ -8352,7 +8372,7 @@ completion_bash() {
 _my_tm() {
   local cur="${COMP_WORDS[COMP_CWORD]}"
   local cmds="status ls lookup find show mount umount open cat
-    cp diff index no-index rm-index verify local-snap
+    cp diff index no-index rm-index verify fs-snap
     health rm thin backup --eject --no-eject
     --install --uninstall --setup add forget refresh
     --create-config --config --completion --source --all --limit --json
@@ -8485,8 +8505,12 @@ MAINTAIN
   rm-index <LOCATION>...         stop indexing it and delete its index
   verify  <ID> [<PATH>...]       re-check the checksums stored at backup time;
                                  the whole snapshot if no <PATH> given
-  local-snap[shot]               take an APFS local snapshot now.
-                                 [daemon: taken every LOCAL_SNAP_INTERVAL]
+  fs-snap                        take a filesystem snapshot of this Mac
+                                 now: an APFS local snapshot, on the boot
+                                 volume, not on a backup disk. Metadata
+                                 only, and PURGEABLE -- macOS deletes it
+                                 under pressure.
+                                 [daemon: taken every FS_SNAP_INTERVAL]
   health  [<LOCATION>]           run the health checks, exit non-zero on the
                                  worst; all configured locations if omitted.
                                  [daemon: run every HEALTH_INTERVAL]
@@ -8660,7 +8684,7 @@ no_such_location() {            # <word>
 ## flags (--install, --setup, --create-config, --config, --completion,
 ## --run-tests, --version, --help), and so do the modifiers.
 COMMANDS="status ls lookup find show mount umount open cat cp diff
-index no-index rm-index verify local-snap health rm thin backup trigger stop
+index no-index rm-index verify fs-snap health rm thin backup trigger stop
 add forget refresh"
 
 ## Is this word one of them? Exact match only: a near-miss is answered
@@ -8679,7 +8703,7 @@ bare_command() {                # <word> -> <command>
 	case "$1" in
 		list)           printf 'ls\n';         return 0 ;;
 		search)         printf 'find\n';       return 0 ;;
-		local-snapshot) printf 'local-snap\n'; return 0 ;;
+		local-snap|local-snapshot) printf 'fs-snap\n'; return 0 ;;
 	esac
 	return 1
 }
@@ -8689,7 +8713,7 @@ dispatch_bare_command() {       # <word> <command> [<arg>]
 	minor "'$1' taken as $2"
 	case "$2" in
 		ls)         cmd_ls ${3:+"$3"} ;;
-		local-snap) cmd_local_snap ;;
+		fs-snap) cmd_fs_snap ;;
 		find)       [ -n "${3:-}" ] || err "find needs a <GLOB>"; cmd_find "$3" ;;
 	esac
 }
@@ -8876,7 +8900,7 @@ main() {
 	[ "$DEEPDBG" = "1" ] && { PS4='+ '; set -x; }
 
 	load_config || true
-	config_backup_schedule_default
+	config_rename_old_keys
 	case "${CMD:-}" in
 		--run-tests|--create-config|--help|--version) : ;;
 		*) config_refuse_old_names ;;
@@ -8942,7 +8966,7 @@ main() {
 		no-index)       cmd_no_index "$@" ;;
 		rm-index)       cmd_rm_index "$@" ;;
 		verify)         [ "$#" -ge 1 ] || err "verify needs an <ID>"; cmd_verify "$@" ;;
-		local-snap|local-snapshot) cmd_local_snap ;;
+		fs-snap) cmd_fs_snap ;;
 		health)         cmd_health "$@" ;;
 		--maintenance)  cmd_maintenance ;;
 		--sweep)        sweep ;;
@@ -9765,7 +9789,7 @@ t_test_paths() {
 	t_true path_is_user_writable "$T_ROOT/wtest"
 }
 
-t_test_local_snapshots() {
+t_test_fs_snapshots() {
 	printf '\nLocal snapshots\n'
 	if [ "${T_WITH_SNAPSHOTS:-0}" != "1" ]; then
 		t_skip "taking a real local snapshot" "needs --run-tests --with-snapshots"
@@ -9775,7 +9799,7 @@ t_test_local_snapshots() {
 	PATH="${PATH#"$_sd"}"
 	export PATH
 	_before=$(tmutil listlocalsnapshots /System/Volumes/Data 2>/dev/null | count_match 'com.apple')
-	cmd_local_snap >/dev/null 2>&1
+	cmd_fs_snap >/dev/null 2>&1
 	_after=$(tmutil listlocalsnapshots /System/Volumes/Data 2>/dev/null | count_match 'com.apple')
 	if [ "$_after" -gt "$_before" ]; then
 		t_ok "a local snapshot was created"
@@ -10695,11 +10719,11 @@ t_test_ssh_locations() {
 ## Which locations health covers, and the checks the README promises.
 ## Adversarial: LOCAL must NOT mean ALL -- it was a synonym, so every daemon
 ## run on this Mac reached across the network to another host's store; and the
-## local-snapshot check has to fire in BOTH directions, since none at all and
+## filesystem snapshot check has to fire in BOTH directions, since none at all and
 ## far too many are different failures with the same cause.
 t_test_health_scope() {
 	printf '\nWhat a health run covers\n'
-	_h8_l="${HEALTH_LOCATIONS:-}"; _h8_m="${LOCAL_SNAP_MAX:-48}"
+	_h8_l="${HEALTH_LOCATIONS:-}"; _h8_m="${FS_SNAP_MAX:-48}"
 
 	_h8=$( ( HEALTH_LOCATIONS=LOCAL; health_locations ) )
 	t_eq "LOCAL covers this Mac's own stores and leaves another host's alone" \
@@ -10716,11 +10740,11 @@ t_test_health_scope() {
 
 	## local snapshots: too few and too many are both worth saying
 	t_eq "a pile of local snapshots on the boot volume is a warning" \
-		"$( ( LOCAL_SNAP_MAX=0; cmd_health local ) 2>&1 | count_match 'local APFS snapshots on /')" "1"
+		"$( ( FS_SNAP_MAX=0; cmd_health local ) 2>&1 | count_match 'local APFS snapshots on /')" "1"
 	t_eq "and a normal number is not" \
-		"$( ( LOCAL_SNAP_MAX=48; cmd_health local ) 2>&1 | count_match 'local APFS snapshots on /')" "0"
+		"$( ( FS_SNAP_MAX=48; cmd_health local ) 2>&1 | count_match 'local APFS snapshots on /')" "0"
 
-	HEALTH_LOCATIONS="$_h8_l"; LOCAL_SNAP_MAX="$_h8_m"
+	HEALTH_LOCATIONS="$_h8_l"; FS_SNAP_MAX="$_h8_m"
 }
 
 ## Every default my-tm carries must be in the config --create-config emits.
@@ -14504,14 +14528,32 @@ _EOF
 	t_match "a hook that fails is reported" "$( ( backup_run_cmd PRE 'exit 7' ) 2>&1 )" "exited 7"
 	t_eq "(and the backup goes on)" "$( ( backup_run_cmd PRE 'exit 7' ) >/dev/null 2>&1; echo $?)" "0"
 
-	## the old global name, read rather than fatal -- every machine's config
-	## still has it until its rollout step has run
-	_bs_err="$T_ROOT/sched.err"; _bs_save_d="$BACKUP_SCHEDULE_DEFAULT"
-	BACKUP_SCHEDULE="weekly-ish"; config_backup_schedule_default 2>"$_bs_err"
+	## A RENAMED config key is read under its new name with one line saying
+	## so -- a key whose meaning did not change must not fail every machine
+	## between the release and the rollout step. Adversarial: the reason
+	## field has spaces in it, and a word loop would split it and then read
+	## the fragments as key names, which is exactly what the first version
+	## did. So check a key whose reason has several words, and that nothing
+	## of the old name is left to shadow the new.
+	## drain whatever THIS machine's config happens to set, so the count
+	## below is this test's doing and not the host's
+	config_rename_old_keys 2>/dev/null
+	_bs_err="$T_ROOT/sched.err"
+	_bs_save_d="$BACKUP_SCHEDULE_DEFAULT"; _bs_save_i="${FS_SNAP_INTERVAL:-}"
+	BACKUP_SCHEDULE="weekly-ish"
+	# shellcheck disable=SC2034  # the point of the test: read under its NEW name
+	LOCAL_SNAP_INTERVAL="3h"
+	config_rename_old_keys 2>"$_bs_err"
 	t_eq "the old BACKUP_SCHEDULE becomes the default" "$BACKUP_SCHEDULE_DEFAULT" "weekly-ish"
-	t_match "and the line is named" "$(cat "$_bs_err")" "old name"
-	t_eq "(and it is not left to shadow a set's own)" "${BACKUP_SCHEDULE:-}" ""
-	BACKUP_SCHEDULE_DEFAULT="$_bs_save_d"; rm -f "$_bs_err" "$_bs_conf"
+	t_eq "and LOCAL_SNAP_INTERVAL becomes FS_SNAP_INTERVAL" "$FS_SNAP_INTERVAL" "3h"
+	t_eq "one line per key, and no fragment read as a key" \
+		"$(count_lines < "$_bs_err")" "2"
+	t_match "each says it is the old name" "$(cat "$_bs_err")" "is the old name"
+	t_match "and the whole reason survives, spaces and all" \
+		"$(cat "$_bs_err")" "the command is fs-snap"
+	t_eq "(and the old name is not left to shadow the new)" "${BACKUP_SCHEDULE:-}" ""
+	BACKUP_SCHEDULE_DEFAULT="$_bs_save_d"; FS_SNAP_INTERVAL="$_bs_save_i"
+	unset LOCAL_SNAP_INTERVAL; rm -f "$_bs_err" "$_bs_conf"
 	CONFIG_SOURCED="$_bs_save_c"; BACKUP_SETS="$_bs_save_s"
 	return 0
 }
@@ -14932,7 +14974,7 @@ _rt_list() {
 	_rt local_list_never_cached              && t_test_local_list_never_cached
 	_rt maintenance_keeps_other_tables       && t_test_maintenance_keeps_other_tables
 	_rt commands_keep_other_tables           && t_test_commands_keep_other_tables
-	_rt local_snapshots                      && t_test_local_snapshots
+	_rt fs_snapshots                         && t_test_fs_snapshots
 	_rt parallel_blocks_cover_every_test     && t_test_parallel_blocks_cover_every_test
 	_rt run_list_is_complete                 && t_test_run_list_is_complete
 	_rt ''

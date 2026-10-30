@@ -130,8 +130,12 @@ MAINTAIN
   rm-index <LOCATION>...         stop indexing it and delete its index
   verify  <ID> [<PATH>...]       re-check the checksums stored at backup time;
                                  the whole snapshot if no <PATH> given
-  local-snap[shot]               take an APFS local snapshot now.
-                                 [daemon: taken every LOCAL_SNAP_INTERVAL]
+  fs-snap                        take a filesystem snapshot of this Mac
+                                 now: an APFS local snapshot, on the boot
+                                 volume, not on a backup disk. Metadata
+                                 only, and PURGEABLE -- macOS deletes it
+                                 under pressure.
+                                 [daemon: taken every FS_SNAP_INTERVAL]
   health  [<LOCATION>]           run the health checks, exit non-zero on the
                                  worst; all configured locations if omitted.
                                  [daemon: run every HEALTH_INTERVAL]
@@ -335,7 +339,7 @@ horse   /Volumes/TimeMachine.Horse   71  2025-09-28..2026-09-17   1d?  3.59T/1.8
 Every line under the table **starts with the mark it answers** — `?`, `??`
 or a superscript number — so the eye goes from the cell straight to its
 answer, and every one says **what removes the mark**: attach the disk, run
-`my-tm ls <LOC>` once, `my-tm local-snap`, `my-tm backup`, and so on.
+`my-tm ls <LOC>` once, `my-tm fs-snap`, `my-tm backup`, and so on.
 A mark with a way out gets one: an image that is already attached (by a
 command, or by the Mac backing up into it) is read live and carries no `?` —
 its cached table is checked against it like a disk's — and `local`'s
@@ -373,7 +377,7 @@ LOC    DESTINATION                                     SNAPS  SPAN  LAST      US
 horse  /Volumes/backup/timeMachine/horse.sparsebundle      -  -       -¹    9.65T/4.90T  no
 local  / + /System/Volumes/Data                            -  -       -²  281.7G/165.3G  no
 ¹ horse: nothing has been read from it yet, and a status never attaches a sparsebundle -- it would take minutes. Read it once with: my-tm ls horse (about 4m34s, once)
-² local: this Mac keeps no local snapshots right now -- Time Machine makes them only while backing THIS Mac up. my-tm can take them itself: my-tm local-snap takes one now, LOCAL_SNAP_INTERVAL=1h in the config keeps taking them
+² local: this Mac keeps no local snapshots right now -- Time Machine makes them only while backing THIS Mac up. my-tm can take them itself: my-tm fs-snap takes one now, FS_SNAP_INTERVAL=1h in the config keeps taking them
 ```
 
 A mark takes one column per digit, where `(1)` took three. Columns are sized
@@ -801,8 +805,8 @@ It does three cheap things, and a third daemon is not needed for any of them:
    `--install`. That is what keeps `ls /tm` truthful at all times; without it new
    snapshots are missing from `/tm` and deleted ones leave stale dirs and
    dangling `latest`/`by-id` links until someone happens to run my-tm;
-3. **takes a local snapshot** if `LOCAL_SNAP_INTERVAL` says one is due, and
-   trims by `LOCAL_SNAP_KEEP_H` / `LOCAL_SNAP_MAX`.
+3. **takes a local snapshot** if `FS_SNAP_INTERVAL` says one is due, and
+   trims by `FS_SNAP_KEEP_H` / `FS_SNAP_MAX`.
 
 A location on a network volume (SMB, NFS, AFP, WebDAV — read from `mount`,
 matched on whole path components) is treated like any other: the expensive
@@ -921,19 +925,19 @@ is mounted, so `ls` still tells you which snapshots exist. An empty
 my-tm mounts what does exist for you on `mount`, `open`, `cat`, `cp`
 and `diff`.
 
-**Making local snapshots.** `local-snapshot` (`local-snap`) runs
+**Making local snapshots.** `fs-snap` (`fs-snap`) runs
 `tmutil localsnapshot` — an immediate on-disk snapshot, useful right before an
 upgrade or a risky edit. **No root needed** (verified on macOS 26: an ordinary
 user created one). `rm <ID> go` deletes one (§10).
 
 They can also be taken on a schedule, by the maintenance job:
-`LOCAL_SNAP_INTERVAL` — `<N>m` or `<N>h`, any value from one minute up to a
+`FS_SNAP_INTERVAL` — `<N>m` or `<N>h`, any value from one minute up to a
 day (`90m` is fine, it needs no explanation); empty means off.
 A short interval is a genuinely useful safety net — a minute-granular undo for
 the file you are about to ruin — and it is cheap, because an APFS snapshot is a
 metadata operation, not a copy. But **they do not stick around**: macOS treats
 local snapshots as purgeable and deletes them under disk or memory pressure, and
-`LOCAL_SNAP_MAX` trims the oldest itself. They are an undo buffer for the next
+`FS_SNAP_MAX` trims the oldest itself. They are an undo buffer for the next
 hours, never an archive.
 
 A my-tm snapshot is created by the same `tmutil localsnapshot` call macOS uses
@@ -955,9 +959,9 @@ distinguishes a snapshot my-tm made from one macOS made — they are all
   space" when the boot volume fills, at any age, without warning.
 
 So retention is bounded by macOS whatever my-tm does, and
-`LOCAL_SNAP_KEEP_H` (default `24`, matching the OS) is the primary knob;
-`LOCAL_SNAP_MAX` is only a cap for the high-frequency case — at
-`LOCAL_SNAP_INTERVAL="1m"` you would otherwise accumulate 1440 a day inside that
+`FS_SNAP_KEEP_H` (default `24`, matching the OS) is the primary knob;
+`FS_SNAP_MAX` is only a cap for the high-frequency case — at
+`FS_SNAP_INTERVAL="1m"` you would otherwise accumulate 1440 a day inside that
 window. Both thin the oldest first, regardless of who created them, and my-tm
 says so before it does.
 
@@ -1166,7 +1170,7 @@ non-zero on the worst — suitable for cron and for a LaunchDaemon.
 | stuck backups | leftover `.inprogress` / `.interrupted` dirs above `HEALTH_MAX_INTERRUPTED` |
 | drift spike | ADDED past `HEALTH_DRIFT_FACTOR` × the running average (§4) |
 | exclusion drift | a path in `HEALTH_WATCH_PATHS` is excluded from backup (`tmutil isexcluded`), or does not exist at all |
-| local snapshots | none at all (no history without a disk attached), or more than 2 × `LOCAL_SNAP_MAX` piling up on `/` |
+| local snapshots | none at all (no history without a disk attached), or more than 2 × `FS_SNAP_MAX` piling up on `/` |
 | stale mounts | a my-tm mount past its TTL that `lsof` says is idle but could not be released |
 | jobs | a my-tm LaunchDaemon points at a program that is not executable |
 | my-tm excluded | `$CACHE_DIR` is no longer excluded from Time Machine (mounted snapshots and rebuildable caches would be backed up) |
@@ -1687,12 +1691,12 @@ INTERRUPTED_AFTER="1h"          # a backup into an image that Time Machine still
 # --- jobs installed by --install ---
 MAINT_JOB="local.my-tm.maintenance"   # mount sweep + /tm refresh + local snaps
 MAINT_INTERVAL=120              # s between maintenance runs
-LOCAL_SNAP_INTERVAL=""          # "" = off. <N>m or <N>h, 1 minute .. 1 day.
+FS_SNAP_INTERVAL=""          # "" = off. <N>m or <N>h, 1 minute .. 1 day.
                                 # A short interval is a safety-net undo;
                                 # cheap (metadata only), but PURGEABLE — macOS
                                 # deletes them under pressure. Not an archive.
-LOCAL_SNAP_KEEP_H=24            # h; matches macOS's own ~24h rotation
-LOCAL_SNAP_MAX=48               # cap for high-frequency intervals (oldest thinned)
+FS_SNAP_KEEP_H=24            # h; matches macOS's own ~24h rotation
+FS_SNAP_MAX=48               # cap for high-frequency intervals (oldest thinned)
 BACKUP_JOB="local.my-tm.backup"
 BACKUP_SCHEDULE="on-boot"       # space-separated, combinable. Examples:
                                 #   on-boot            -> RunAtLoad
@@ -2019,7 +2023,7 @@ Each of these runs twice (idempotence), against a fixture root, and asserts the
 | `refresh` | the `/tm` placeholder dirs and `latest`/`by-id` symlinks match the fixture exactly; stale entries for deleted snapshots are removed; a user-made `/tm/<custom>` mount dir is not touched |
 | mount bookkeeping | the record matches the real mount table; a TTL expires exactly once; the sweep respects `lsof`; a mount released behind my-tm's back (`umount(8)`) is silently dropped from the record; a mount whose target vanished is cleaned up; a `transient`-flagged leftover is reaped; TTL parsing of `7m`/`4h`/`5h3m`/`2d` and rejection of `4`, `0m` |
 | `rm` / `thin` | **dry-run output only** — the dry run *prints* the exact `tmutil delete` command line it would run and the fixture asserts that string; that nothing runs without the literal `go`; and that `go` without root refuses and still runs nothing. No test ever deletes a real snapshot |
-| `local-snap` | skipped by default; enabled only by `--run-tests --with-snapshots`, and then it creates one, finds it in `ls local`, and deletes it again |
+| `fs-snap` | skipped by default; enabled only by `--run-tests --with-snapshots`, and then it creates one, finds it in `ls local`, and deletes it again |
 | `backup` | the `tmutil` / `diskutil` calls are asserted through a stub `PATH`, never executed for real; the lockfile blocks a second instance; the trap removes it on every signal; the eject retry loop honours `EJECT_RETRIES` and the no-eject flag file |
 
 **Regression fixtures**, kept in the file as here-docs: the real
