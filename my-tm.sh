@@ -34,8 +34,8 @@ US="${0##*/}"
 ## so the ROOT-OWNED COPY the daemons run -- which has no git beside it -- can
 ## still say which release it is and whether it is one.
 MY_TM_VERSION="0.9.1"
-SCRIPT_COMMIT="e5f73c3"
-SCRIPT_RELEASE="v0.9.1-122-ge5f73c3"
+SCRIPT_COMMIT="f5815fe"
+SCRIPT_RELEASE="v0.9.1-123-gf5815fe"
 
 ## The first 12 hex of this file's own SHA-256: the value that identifies the
 ## bytes. my-tm is COPIED to its installed path, so this is what tells the
@@ -7713,6 +7713,26 @@ snitch_plan() {
 		minor "snitch:     $LITTLE_SNITCH not found -- no Little Snitch rule checked (LITTLE_SNITCH)"
 		return 0
 	}
+	## A set that runs CCC makes my-tm the parent of a new network program,
+	## and Little Snitch names the script at the top of the tree. A daemon
+	## has nobody at the screen to answer the alert, so it would simply stop
+	## talking. The rule cannot be written from here -- which host CCC needs
+	## is only known once it has tried -- so the gap is NAMED, not guessed.
+	for _sp_s in $(backup_sets_all); do
+		[ "$(backup_param "$_sp_s" BACKUP_ENGINE)" = "ccc" ] || continue
+		if "$SNITCH_CMD" list 2>/dev/null | grep -q 'via [^ ]*ccc '; then
+			minor "snitch:     ccc has a rule (backup set $_sp_s)"
+		else
+			minor "snitch:     backup set $_sp_s runs ccc, and ccc has no rule yet"
+			## a status line, not an echoed command, so this is minor() and not
+			## why(): a VRB-gated explanation of a gap this consequential would
+			## be invisible in exactly the run that needs it
+			minor "            a daemon cannot answer an alert; after its first run:"
+			minor "            $LITTLE_SNITCH log ccc --denied, then allow go"
+		fi
+		break
+	done
+
 	_sp_ports=$(locations_all | awk -F'\t' '{print $2}' | while IFS= read -r _sp_t; do
 		is_remote_target "$_sp_t" || continue
 		ssh -G "$(remote_host "$_sp_t")" </dev/null 2>/dev/null | awk '$1 == "port" { print $2; exit }'
@@ -8703,26 +8723,20 @@ is_command() {
 	return 1
 }
 
-## The words that mean a command without BEING one. The parser takes every
-## exact command itself, so only these reach here; a word that is neither is
-## left to the ladder below, as a name to look for.
-bare_command() {                # <word> -> <command>
+## Words that are NOT commands but evidently mean one. my-tm has ONE spelling
+## per command, so these are ANSWERED by name rather than run: an alias that
+## works silently is invisible -- it is in neither --help nor the completion,
+## so it only ever helps someone who already guessed it, while a second
+## vocabulary costs every reader of the help. The answer costs one keypress,
+## once, and then the right word is the one that comes to mind.
+command_near_miss() {           # <word> -> <the command it means>
 	case "$1" in
-		list)           printf 'ls\n';         return 0 ;;
-		search)         printf 'find\n';       return 0 ;;
-		local-snap|local-snapshot) printf 'fs-snap\n'; return 0 ;;
+		list)                      printf 'ls\n' ;;
+		search)                    printf 'find\n' ;;
+		local-snap|local-snapshot) printf 'fs-snap\n' ;;
+		*) return 1 ;;
 	esac
-	return 1
-}
-
-## Run a command a bare word named, saying what it was taken for.
-dispatch_bare_command() {       # <word> <command> [<arg>]
-	minor "'$1' taken as $2"
-	case "$2" in
-		ls)         cmd_ls ${3:+"$3"} ;;
-		fs-snap) cmd_fs_snap ;;
-		find)       [ -n "${3:-}" ] || err "find needs a <GLOB>"; cmd_find "$3" ;;
-	esac
+	return 0
 }
 
 ## Is this word already something -- a snapshot ID or a location -- and so NOT
@@ -8779,19 +8793,16 @@ classify_one() {
 
 ## the smart form: up to two bare words, in either order
 dispatch_bare() {
-	## Another word for a command, in either position: `my-tm list horse` and
-	## `my-tm horse list` both mean `ls horse`. Without this, `list` was a name
-	## to SEARCH for, and the search printed every path containing it.
-	if [ "$#" -ge 1 ] && ! word_is_claimed "$1"; then
-		if _bc=$(bare_command "$1"); then
-			dispatch_bare_command "$1" "$_bc" "${2:-}"; return $?
-		fi
-	fi
-	if [ "$#" -ge 2 ] && ! word_is_claimed "$2"; then
-		if _bc=$(bare_command "$2"); then
-			dispatch_bare_command "$2" "$_bc" "$1"; return $?
-		fi
-	fi
+	## A near miss, in either position: `my-tm list horse` and `my-tm horse
+	## list` both evidently mean `ls`. Say so instead of searching the whole
+	## history for a file called "list". A word that already means something
+	## -- a location, a snapshot ID -- keeps that meaning.
+	for _bc in "$1" "${2:-}"; do
+		[ -n "$_bc" ] || continue
+		word_is_claimed "$_bc" && continue
+		_bcm=$(command_near_miss "$_bc") || continue
+		err "no \`$_bc\` command -- you mean \`$US $_bcm\`"
+	done
 	_c1=$(classify_one "$1")
 	_t1=$(printf '%s' "$_c1" | awk -F'\t' '{print $1}')
 	_v1=$(printf '%s' "$_c1" | awk -F'\t' '{print $2}')
@@ -12211,38 +12222,48 @@ t_test_find_searches_only_the_stores_index() {
 ## things. Adversarial: a location that happens to be named like a command
 ## keeps its meaning, and a real search for a plain name still searches.
 t_test_bare_command_words() {
-	printf '\nA command typed without its dashes is read as that command\n'
-	_bw_out=$(dispatch_bare list store 2>&1)
-	t_match "'list store' lists the store" "$_bw_out" "'list' taken as ls"
-	t_match "(it is the ls table)" "$_bw_out" "SNAPSHOT"
-	t_match "'store list' means the same" "$(dispatch_bare store list 2>&1)" "'list' taken as ls"
+	printf '\nA word that is not a command but means one is ANSWERED\n'
+	## my-tm has one spelling per command. A near miss is named, in either
+	## position, instead of being run silently or searched for as a file.
+	t_match "'list store' names ls" "$( ( dispatch_bare list store ) 2>&1 )" "you mean .*ls"
+	t_match "'store list' names it too" "$( ( dispatch_bare store list ) 2>&1 )" "you mean .*ls"
+	t_match "'search' names find" "$( ( dispatch_bare search 'x*' ) 2>&1 )" "you mean .*find"
+	t_match "the old 'local-snap' names fs-snap" \
+		"$( ( dispatch_bare local-snap ) 2>&1 )" "you mean .*fs-snap"
+	t_match "and so does 'local-snapshot'" \
+		"$( ( dispatch_bare local-snapshot ) 2>&1 )" "you mean .*fs-snap"
+	## ...and it does NOT run the command it names
+	t_eq "(nothing is run on the way)" \
+		"$( ( dispatch_bare list store ) 2>&1 | count_match 'SNAPSHOT')" "0"
+
 	## The parser takes every exact verb itself, so dispatch_bare never sees
-	## one and there is no dashed form to escalate to. A destructive command
-	## is held by its own `go`, and a dashed verb is answered by name.
+	## one. A destructive command is held by its own `go`, and a dashed verb
+	## is answered by name.
 	_bw_conf="$T_ROOT/bare.conf"
 	dash "$T_MYTM" --create-config "$_bw_conf" >/dev/null 2>&1
 	_bw_run() { HOME="$T_ROOT/home" MY_TM_CONFIG="$_bw_conf" dash "$T_MYTM" "$@" 2>&1; }
 	t_match "'rm' reaches rm, which needs go" "$(_bw_run rm)" "the literal word go"
 	t_match "and '--rm' is answered by name" "$(_bw_run --rm)" "you mean"
 
-	## a word that already means something keeps that meaning
+	## a word that already means something keeps that meaning -- a location
+	## called `list` is a location, not an answer about `ls`
 	_bw_save=$(cat "$T_ROOT/cache/locations.tsv")
-	printf 'health\t%s/store\t\n' "$T_ROOT" >>"$T_ROOT/cache/locations.tsv"
+	printf 'list\t%s/store\t\n' "$T_ROOT" >>"$T_ROOT/cache/locations.tsv"
 	locations_run_cache_drop
-	t_eq "a location named 'health' is listed, not taken as health" \
-		"$(dispatch_bare health 2>&1 | count_match 'taken as')" "0"
+	t_eq "a location named 'list' is listed, not answered" \
+		"$( ( dispatch_bare list ) 2>&1 | count_match 'you mean')" "0"
 	printf '%s\n' "$_bw_save" >"$T_ROOT/cache/locations.tsv"
 	locations_run_cache_drop
 
 	## a plain name that is no command is still a search
 	t_eq "a plain name is still searched for" \
-		"$(dispatch_bare some-file-name 2>&1 | count_match 'taken as')" "0"
+		"$( ( dispatch_bare some-file-name ) 2>&1 | count_match 'you mean')" "0"
 
-	## the near miss
+	## the near miss on a LOCATION name is a different thing and still works
 	t_match "a location one letter off is named" "$( ( cmd_ls stroe ) 2>&1 )" "did you mean 'store'"
 	t_eq "a word nowhere near one is not given a guess" \
 		"$( ( cmd_ls zzzzzzzz ) 2>&1 | count_match 'did you mean')" "0"
-	t_match "and 'list stroe' gets there too" "$( ( dispatch_bare list stroe ) 2>&1 )" "did you mean 'store'"
+	return 0
 }
 
 ## "Every dash is explained" is a promise that rots the moment a column is
@@ -13858,6 +13879,31 @@ d4d4d4\tany via com.apple.curl  allow  any  tcp/2222  system
 	t_eq "--install shows the rules in its plan and writes them on go" \
 		"$(sed -n '/^cmd_install() {$/,/^}$/p' "$T_MYTM" | count_match 'snitch_plan'):$(sed -n '/^cmd_install() {$/,/^}$/p' "$T_MYTM" | count_match 'snitch_write')" "1:1"
 
+	## A ccc set is a new network program under a new parent. The rule cannot
+	## be written from here, so --install must NAME the gap -- silence is how
+	## a nightly backup stops talking with no error of its own. Adversarial:
+	## it must say nothing when no set runs ccc, or the line is noise nobody
+	## reads.
+	_ls_sets="$BACKUP_SETS"; _ls_conf="$CONFIG_SOURCED"
+	## the case above left LITTLE_SNITCH empty, which would make both checks
+	## below pass on an empty string rather than on the behaviour
+	LITTLE_SNITCH="$_ls_d/lsn"
+	t_eq "no ccc set, nothing said about ccc" \
+		"$(snitch_plan 2>&1 | count_match 'ccc')" "0"
+	cat >"$_ls_d/ccc.conf" <<'_EOF'
+set_backup_parameters() {
+	case "$1" in
+		nightly) BACKUP_ENGINE="ccc" ;;
+	esac
+}
+_EOF
+	BACKUP_SETS="nightly"; CONFIG_SOURCED=" $_ls_d/ccc.conf"
+	t_match "a ccc set with no rule is named" \
+		"$(snitch_plan 2>&1)" "runs ccc, and ccc has no rule yet"
+	t_match "and the way to find what to allow comes with it" \
+		"$(snitch_plan 2>&1)" "log ccc --denied"
+	BACKUP_SETS="$_ls_sets"; CONFIG_SOURCED="$_ls_conf"
+	rm -f "$_ls_d/ccc.conf"
 	LITTLE_SNITCH="$_ls_c"; mv -f "$T_ROOT/ssh.ls" "$_ls_stub"; rm -rf "$_ls_d"
 }
 
