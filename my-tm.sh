@@ -34,8 +34,8 @@ US="${0##*/}"
 ## so the ROOT-OWNED COPY the daemons run -- which has no git beside it -- can
 ## still say which release it is and whether it is one.
 MY_TM_VERSION="0.9.1"
-SCRIPT_COMMIT="f4d38ac"
-SCRIPT_RELEASE="v0.9.1-120-gf4d38ac"
+SCRIPT_COMMIT="4c6138d"
+SCRIPT_RELEASE="v0.9.1-121-g4c6138d"
 
 ## The first 12 hex of this file's own SHA-256: the value that identifies the
 ## bytes. my-tm is COPIED to its installed path, so this is what tells the
@@ -14760,9 +14760,15 @@ t_test_post_backup() {
 
 t_test_version_output() {
 	printf '\n--version\n'
-	_err=$( "$T_MYTM" --version 2>&1 >/dev/null )
+	## a config of its own: the machine's (/LINKS/default/my-tm.conf) is not the
+	## test's -- an old key name in it made this fail on one machine only
+	: >"$T_ROOT/version.conf"
+	printf 'LOCAL_SNAP_MAX=3\n' >"$T_ROOT/version-old.conf"
+	_err=$( MY_TM_CONFIG="$T_ROOT/version.conf" "$T_MYTM" --version 2>&1 >/dev/null )
 	t_eq "it prints no errors" "$_err" ""
-	_out=$( "$T_MYTM" --version 2>/dev/null )
+	_err=$( MY_TM_CONFIG="$T_ROOT/version-old.conf" "$T_MYTM" --version 2>&1 >/dev/null )
+	t_match "...and the config it reads is the test's own (an old name there is named)" "$_err" "LOCAL_SNAP_MAX is the old name"
+	_out=$( MY_TM_CONFIG="$T_ROOT/version.conf" "$T_MYTM" --version 2>/dev/null )
 	t_match "the version number is there" "$_out" "[0-9]\.[0-9]"
 	t_match "and the file it ran from" "$_out" "my-tm"
 	t_eq "the path is clean" "$(printf '%s' "$_out" | count_match '/./')" "0"
