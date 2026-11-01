@@ -641,7 +641,11 @@ $CACHE_DIR/index/<loc>.versions/ -> the version store: a baseline plus one
   not a duration reads as none): a backup running for hours is the normal case,
   not a stuck process, so a bound would end an overnight walk for doing exactly
   what it was told to. Ctrl-C is the bound, and it is safe — the next walk
-  takes up where this one stopped. So the sweep does not fight it either: an
+  takes up where this one stopped. It **ends on a result** — `indexed 28 of 57
+  · 29 gone before the walk reached them` — counting thinned-away and
+  unmountable apart, because they are opposite verdicts: the first is Time
+  Machine working as designed and reads as information at any fraction, the
+  second warns at any count. So the sweep does not fight it either: an
   indexing run marks its mount `indexer` in the mount record (§8), and it is
   exempt while it works. In exchange it **cleans up behind itself** — it holds
   exactly the one

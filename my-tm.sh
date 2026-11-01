@@ -34,8 +34,8 @@ US="${0##*/}"
 ## so the ROOT-OWNED COPY the daemons run -- which has no git beside it -- can
 ## still say which release it is and whether it is one.
 MY_TM_VERSION="0.9.1"
-SCRIPT_COMMIT="f5815fe"
-SCRIPT_RELEASE="v0.9.1-123-gf5815fe"
+SCRIPT_COMMIT="a0ebafc"
+SCRIPT_RELEASE="v0.9.1-124-ga0ebafc"
 
 ## The first 12 hex of this file's own SHA-256: the value that identifies the
 ## bytes. my-tm is COPIED to its installed path, so this is what tells the
@@ -3151,9 +3151,13 @@ snap_mount() {
 		## Time Machine adds and thins constantly, and local snapshots are
 		## purgeable at any age: a list read a minute ago can already be wrong
 		warn "$(ts_display "$_ts"): gone from '$_loc' since the list was read ($US refresh $_loc)"
-	else
-		warn "mount failed: $_apfs on $_vol_src${_sm_err:+: $(printf '%s' "$_sm_err" | tr '\n' ' ')}"
+		## 4, not 1: nothing failed to mount -- the snapshot is not there any
+		## more. The two are opposite verdicts for whoever counts them. One is
+		## Time Machine working as designed, the other is something to fix.
+		rmdir "$_mp" 2>/dev/null
+		return 4
 	fi
+	warn "mount failed: $_apfs on $_vol_src${_sm_err:+: $(printf '%s' "$_sm_err" | tr '\n' ' ')}"
 	rmdir "$_mp" 2>/dev/null
 	return 1
 }
@@ -5745,21 +5749,26 @@ $(printf '%s\n' "$_rows" | head -n 1 | awk -F'\t' '{print $2}')" ;;
 				esac
 			done
 		fi
+		_iw_n=0; _iw_ok=0; _iw_gone=0; _iw_fail=0; _iw_stop=0
 		while IFS= read -r _ts; do
 			[ -n "$_ts" ] || continue
+			_iw_n=$((_iw_n + 1))
 			## the baseline walk is two snapshots and the post-backup one
 			## runs while the disk is deliberately still spinning: only the
 			## hours-long --all walk steps aside for a running backup
 			[ "$OPT_ALL" = "1" ] && index_wait_for_backup "$_h"
-			index_one "$_h" "$_ts" || {
-				[ "$?" = "3" ] || continue
-				warn "$_h: stopping -- nothing here can be indexed until that is fixed"
-				break
-			}
+			index_one "$_h" "$_ts" && { _iw_ok=$((_iw_ok + 1)); continue; }
+			case "$?" in
+				3)  warn "$_h: stopping -- nothing here can be indexed until that is fixed"
+				    _iw_stop=1; break ;;
+				4)  _iw_gone=$((_iw_gone + 1)) ;;
+				*)  _iw_fail=$((_iw_fail + 1)) ;;
+			esac
 		done <<_EOF
 $_list
 _EOF
 		index_consolidate "$_h"
+		index_walk_verdict "$_h" "$_iw_n" "$_iw_ok" "$_iw_gone" "$_iw_fail" "$_iw_stop"
 	done
 	return 0
 }
@@ -5807,6 +5816,35 @@ cmd_rm_index() {
 	return 0
 }
 
+## What a finished walk is worth saying. The --all walk ANNOUNCES a plan
+## ("walking all 57 snapshots"), so it owes a result: without one, a walk that
+## reached 28 of 57 ended in exactly the same silence as one that reached all
+## 57, and the only way to tell was to count the warnings by hand.
+##
+## Gone and unmountable are counted apart because they mean opposite things,
+## and the FRACTION is not the signal -- the cause is. Snapshots thinned away
+## while the walk ran are Time Machine working, at 5% or at 45%, so the line
+## stays informational; a mount that really failed is something to fix at any
+## count, so that one warns.
+index_walk_verdict() {
+	_wv_h="$1"; _wv_n="$2"; _wv_ok="$3"; _wv_gone="$4"; _wv_fail="$5"; _wv_stop="$6"
+	[ "$_wv_n" -gt 0 ] || return 0
+	## nothing to report on the quiet path: the baseline walk is two snapshots
+	## after every backup, and it already said which it indexed
+	[ "$OPT_ALL" = "1" ] || [ "$((_wv_gone + _wv_fail))" -gt 0 ] || return 0
+	_wv_s="$_wv_h: indexed $_wv_ok of $_wv_n"
+	[ "$_wv_gone" -gt 0 ] && _wv_s="$_wv_s · $_wv_gone gone before the walk reached them"
+	[ "$_wv_fail" -gt 0 ] && _wv_s="$_wv_s · $_wv_fail could not be mounted"
+	[ "$_wv_stop" = "1" ] && _wv_s="$_wv_s · stopped early"
+	if [ "$_wv_fail" -gt 0 ] || [ "$_wv_stop" = "1" ]; then
+		warn "$_wv_s"
+	else
+		msg "$_wv_s"
+	fi
+	[ "$_wv_gone" -gt 0 ] && minor "normal on a live Time Machine disk -- it thins as it goes, and the newest hourlies go first: $US index $_wv_h --all again picks up what is still there"
+	return 0
+}
+
 ## walk ONE snapshot: path list -> locate db, plus its exclusive size.
 ## Exactly one snapshot is pinned at a time, and it is released before the next.
 index_one() {
@@ -5821,14 +5859,26 @@ index_one() {
 	_id=$(snap_id "$(loc_uuid "$_h")" "$_ts")
 	_mp=$(mnt_point_for "$_h" "$_ts")
 	msg "indexing $(ts_display "$_ts") of '$_h'"
-	snap_mount "$_h" "$_ts" 86400 "indexer" >/dev/null || {
-		## 3 is a verdict about the LOCATION, not this snapshot: the grant is
-		## missing, or the disk is gone. Either way the next snapshot cannot
-		## go better, so it is handed up rather than flattened.
-		[ "$?" = "3" ] && return 3
-		warn "$_ts: mount failed"
-		return 1
-	}
+	## The status is captured in the statement right after the call, not read
+	## inside an `|| { ... }`: in that block any command put above the return --
+	## a warn is the obvious one -- overwrites $? with its own 0, and then every
+	## failed mount is handed back as a walked snapshot.
+	snap_mount "$_h" "$_ts" 86400 "indexer" >/dev/null
+	_io_rc="$?"
+	if [ "$_io_rc" != "0" ]; then
+		## Handed up unflattened, because each code is a different verdict and
+		## only the caller can act on it: 3 is about the LOCATION (the grant is
+		## missing, or the disk is gone), so the next snapshot cannot go
+		## better; 4 is this snapshot gone since the list was read, which a
+		## walk counts apart from a mount that really failed.
+		##
+		## And no second warning here. snap_mount has already named the cause;
+		## restating it as "mount failed" printed two lines for one event, the
+		## second one wrong -- a snapshot thinned away never failed to mount --
+		## and with a raw timestamp beside the first line's display form, so
+		## the pair did not even read as the same snapshot.
+		return "$_io_rc"
+	fi
 	why "held only while this one snapshot is walked, and exempt from the sweep meanwhile"
 
 	_base=$(mnt_volume_path "$_h" "$_ts" "$_vol")
@@ -11556,6 +11606,87 @@ t_test_a_cut_short_walk_stays_unindexed() {
 	rm -rf "$(vs_dir store)" "$_cw_fs"
 }
 
+## An overnight walk that lost 29 of its 57 targets ended on the same silence
+## as one that walked all 57 (horse, 2026-10-31): the only record was 29 pairs
+## of warnings, and reading them was how anyone found out. Worse, each pair was
+## ONE event said twice -- snap_mount naming the snapshot as gone, index_one
+## restating it as "mount failed" with a raw timestamp, so the two lines did
+## not even read as the same snapshot.
+##
+## Adversarial: the trap is a verdict that is technically present but useless.
+## So the checks are that gone and unmountable are counted APART (they are
+## opposite verdicts: one is Time Machine working, the other is something to
+## fix), that only the second one warns, that one event produces ONE line, and
+## -- the other way round -- that a clean baseline walk after every backup
+## stays silent instead of growing a summary nobody needs.
+t_test_index_walk_reports_its_result() {
+	printf '\nA walk says what it got, and gone is not failed\n'
+	rm -f "$(index_covered_file store)"
+
+	t_eq "snap_mount's 'gone since the list was read' is 4, not a mount failure" \
+		"$( ( # shellcheck disable=SC2329  # called by snap_mount
+		      mount_apfs() { printf 'mount_apfs: No such file or directory\n' >&2; return 1; }
+		      # shellcheck disable=SC2329
+		      snap_names() { printf 'something-else\n'; }
+		      snap_mount store 2026-08-20-155805 60 "indexer" "$T_ROOT/wv.mp" \
+		        >/dev/null 2>&1; echo $?) )" "4"
+
+	_wv_one=$( ( # shellcheck disable=SC2329
+	             snap_mount() { warn "2026-08-20_1558.05: gone from 'store' since the list was read"; return 4; }
+	             index_one store 2026-08-20-155805; printf 'rc=%s\n' "$?" ) 2>&1 )
+	t_eq "index_one hands the 4 on, so a walk can tell the two apart" \
+		"$(printf '%s\n' "$_wv_one" | count_match 'rc=4')" "1"
+	t_eq "...and says nothing of its own: one event, one line" \
+		"$(printf '%s\n' "$_wv_one" | count_match 'mount failed')" "0"
+
+	## every snapshot thinned away under the walk
+	_wv_gone=$( ( OPT_ALL=1
+		# shellcheck disable=SC2329
+		tm_backup_running() { return 1; }
+		# shellcheck disable=SC2329
+		snap_mount() { return 4; }
+		# shellcheck disable=SC2329
+		snap_umount() { return 0; }
+		cmd_index store ) 2>&1 )
+	t_eq "the walk reports what it got, counting the ones that were gone" \
+		"$(printf '%s\n' "$_wv_gone" | count_match 'gone before the walk reached them')" "1"
+	t_eq "...as information, not a warning: thinning is the disk working" \
+		"$(printf '%s\n' "$_wv_gone" | count_match ' >>> store: indexed 0 of ')" "1"
+	t_eq "...and it does not call them mount failures" \
+		"$(printf '%s\n' "$_wv_gone" | count_match 'could not be mounted')" "0"
+	t_eq "...and names the one command that picks up what is still there" \
+		"$(printf '%s\n' "$_wv_gone" | count_match 'again picks up what is still there')" "1"
+
+	## the same walk, but the mounts really failed
+	_wv_fail=$( ( OPT_ALL=1
+		# shellcheck disable=SC2329
+		tm_backup_running() { return 1; }
+		# shellcheck disable=SC2329
+		snap_mount() { return 1; }
+		# shellcheck disable=SC2329
+		snap_umount() { return 0; }
+		cmd_index store ) 2>&1 )
+	t_eq "a mount that really failed is counted as that" \
+		"$(printf '%s\n' "$_wv_fail" | count_match 'could not be mounted')" "1"
+	t_eq "...and warns, at any count: it is something to fix" \
+		"$(printf '%s\n' "$_wv_fail" | count_match ' !!! store: indexed 0 of ')" "1"
+	t_eq "...and is not reported as thinning" \
+		"$(printf '%s\n' "$_wv_fail" | count_match 'gone before the walk reached them')" "0"
+
+	## and the quiet path: the baseline walk runs after EVERY backup
+	_wv_ok=$( ( # shellcheck disable=SC2329
+		snap_mount() { return 0; }
+		# shellcheck disable=SC2329
+		snap_umount() { return 0; }
+		# shellcheck disable=SC2329
+		index_one() { return 0; }
+		cmd_index store ) 2>&1 )
+	t_eq "a clean baseline walk adds no summary nobody asked for" \
+		"$(printf '%s\n' "$_wv_ok" | count_match 'store: indexed ')" "0"
+
+	rm -f "$(index_covered_file store)"
+}
+
 ## A snapshot my-tm mounts is a VOLUME: without nobrowse it lands on the
 ## desktop. Adversarial: not "does nobrowse appear somewhere" -- one call that
 ## forgets is one icon -- but "is there any mount_apfs without it", and the
@@ -15060,6 +15191,7 @@ _rt_list() {
 	_rt increment_names_are_claimed          && t_test_increment_names_are_claimed
 	_rt status_says_waiting_not_idle         && t_test_status_says_waiting_not_idle
 	_rt location_failures_stop_the_walk      && t_test_location_failures_stop_the_walk
+	_rt index_walk_reports_its_result        && t_test_index_walk_reports_its_result
 	_rt site_conf_dir_from_env               && t_test_site_conf_dir_from_env
 	_rt detached_store_still_answers         && t_test_detached_store_still_answers
 	_rt rm_needs_the_store                   && t_test_rm_needs_the_store
