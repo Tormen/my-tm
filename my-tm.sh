@@ -34,8 +34,8 @@ US="${0##*/}"
 ## so the ROOT-OWNED COPY the daemons run -- which has no git beside it -- can
 ## still say which release it is and whether it is one.
 MY_TM_VERSION="0.9.1"
-SCRIPT_COMMIT="a0ebafc"
-SCRIPT_RELEASE="v0.9.1-124-ga0ebafc"
+SCRIPT_COMMIT="2d0ffdb"
+SCRIPT_RELEASE="v0.9.1-126-g2d0ffdb"
 
 ## The first 12 hex of this file's own SHA-256: the value that identifies the
 ## bytes. my-tm is COPIED to its installed path, so this is what tells the
@@ -15346,7 +15346,7 @@ run_tests() {
 
 	## then each block's own output, in one piece: interleaved blocks are
 	## unreadable, and a reader wants the checks of one test together
-	_rt_p=0; _rt_f=0; _rt_s=0; _rt_rc=0
+	_rt_p=0; _rt_f=0; _rt_s=0; _rt_rc=0; _rt_nf=""
 	_rt_b=0
 	while [ "$_rt_b" -lt "$_rt_jobs" ]; do
 		printf '\n >>> block %s of %s\n' "$(( _rt_b + 1 ))" "$_rt_jobs"
@@ -15357,11 +15357,37 @@ run_tests() {
 		_rt_f=$(( _rt_f + $(printf '%s' "$_rt_sum" | awk '{print $3+0}') ))
 		_rt_s=$(( _rt_s + $(printf '%s' "$_rt_sum" | awk '{print $5+0}') ))
 		[ "$(cat "$_rt_d/b$_rt_b.rc" 2>/dev/null || echo 1)" = "0" ] || _rt_rc=1
+		## a word the shell could not run AT ALL. `F2` -- a function key that a
+		## terminal wrote as two characters -- sat in a test from 2026-10-28,
+		## printing "F2: not found" on every suite run on every machine, while
+		## each run still ended in success: the line WAS printed, in the block
+		## output above, and nobody read it. shellcheck cannot see it, because a
+		## bare command name is valid shell (0 findings on the file that had it),
+		## so the run itself has to refuse. Matched on dash's own shape --
+		## "<file>: <line>: <word>: not found" -- which my-tm's own "config not
+		## found: ..." and "$LITTLE_SNITCH not found -- ..." do not have.
+		## the WHOLE line, not just the match: the file and the line number in
+		## front of it are what the reader needs to find the word
+		_rt_bad=$(grep -hE ': [0-9][0-9]*: [^ ]*: not found' "$_rt_d/b$_rt_b.out" 2>/dev/null | sort -u)
+		[ -n "$_rt_bad" ] && _rt_nf="$_rt_nf$_rt_bad
+"
 		_rt_b=$(( _rt_b + 1 ))
 	done
 	rm -rf "$_rt_d"
-	printf '\n%s passed, %s failed, %s skipped  (in %s blocks)\n' \
-		"$_rt_p" "$_rt_f" "$_rt_s" "$_rt_jobs"
+	_rt_nfs=""
+	if [ -n "$_rt_nf" ]; then
+		warn "the run called a word the shell could not find -- a stray keystroke in the source, not a failing check:"
+		printf '%s' "$_rt_nf" | while IFS= read -r _rt_l; do
+			[ -n "$_rt_l" ] && minor "$_rt_l"
+		done
+		## the summary is the LAST line and the one a watcher reads, so it carries
+		## the reason too: "0 failed" beside a non-zero exit is a contradiction,
+		## and this run is exactly the case where no check failed
+		_rt_nfs=" -- and $(printf '%s' "$_rt_nf" | count_lines) word(s) the shell could not find"
+		_rt_rc=1
+	fi
+	printf '\n%s passed, %s failed, %s skipped  (in %s blocks)%s\n' \
+		"$_rt_p" "$_rt_f" "$_rt_s" "$_rt_jobs" "$_rt_nfs"
 	[ "$_rt_f" -eq 0 ] && [ "$_rt_rc" -eq 0 ] || return 1
 	return 0
 }
