@@ -11348,7 +11348,6 @@ t_test_open_keeps_what_it_hands_over() {
 	t_eq "the file keeps its own name, so the application knows it" \
 		"$(basename "$_op_path")" "report.pdf"
 	t_eq "and holds what was fetched" "$(cat "$_op_path")" "the fetched bytes"
-F2
 	t_match "and the run says it stays" "$_op_out" "stays there"
 	rm -rf "$_op_t" "$_op_bait" "$_op_calls"
 }
