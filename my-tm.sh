@@ -34,8 +34,8 @@ US="${0##*/}"
 ## so the ROOT-OWNED COPY the daemons run -- which has no git beside it -- can
 ## still say which release it is and whether it is one.
 MY_TM_VERSION="0.9.1"
-SCRIPT_COMMIT="2d0ffdb"
-SCRIPT_RELEASE="v0.9.1-126-g2d0ffdb"
+SCRIPT_COMMIT="93564df"
+SCRIPT_RELEASE="v0.9.1-127-g93564df"
 
 ## The first 12 hex of this file's own SHA-256: the value that identifies the
 ## bytes. my-tm is COPIED to its installed path, so this is what tells the
@@ -4392,6 +4392,37 @@ status_open_cost() {            # <target>
 	printf ' (about %s, once)' "$(human_secs "$_soc_s")"
 }
 
+## Why a READABLE store shows no backups. A folder that holds sparsebundles is
+## not an empty store: Time Machine writes INSIDE one, so the location is the
+## folder they sit in and the bundle itself is what my-tm reads. Saying "Time
+## Machine has not written one here" about such a folder was a cause invented
+## from an absence (macado, 2026-11-03: 843G of them sitting right there).
+status_empty_store_why() {      # <target>
+	_esw_t="$1"
+	_esw_n=0; _esw_names=""
+	for _esw_f in "$_esw_t"/*.sparsebundle; do
+		[ -e "$_esw_f" ] || continue
+		_esw_n=$(( _esw_n + 1 ))
+		if [ "$_esw_n" -le 3 ]; then
+			_esw_names="${_esw_names:+$_esw_names, }$(basename "$_esw_f")"
+		elif [ "$_esw_n" = 4 ]; then
+			_esw_names="$_esw_names, ..."
+		fi
+	done
+	if [ "$_esw_n" = 0 ]; then
+		printf '%s\n' "the store is readable but holds no backups yet -- Time Machine has not written one here. $US backup runs one"
+		return 0
+	fi
+	## over a share my-tm reads the bundle where it is STORED, so the command it
+	## names here is the one `add` itself names when it refuses a share path
+	if _esw_nv=$(network_volume_of "$_esw_t"); then
+		_esw_h=$(network_mount_host "$_esw_nv")
+		printf '%s\n' "no backups of its OWN -- it is the folder that holds $_esw_n sparsebundle(s) ($_esw_names), and Time Machine writes INSIDE one. It comes over a share from ${_esw_h:-another host}, so read the bundle where it is stored: $US add ${_esw_h:-<host>}:<path on ${_esw_h:-that host}>/<NAME>.sparsebundle"
+		return 0
+	fi
+	printf '%s\n' "no backups of its OWN -- it is the folder that holds $_esw_n sparsebundle(s) ($_esw_names), and Time Machine writes INSIDE one. Register the bundle itself: $US add $_esw_t/<NAME>.sparsebundle"
+}
+
 cmd_status() {
 	_only="${1:-}"
 	if [ -n "$_only" ]; then
@@ -4466,9 +4497,9 @@ _EOF
 				elif is_remote_target "$_t"; then
 					status_footnote "$(remote_host "$_t") has not read it yet, and a status never makes it open the store -- it could take minutes there. Read it once with: $US ls $_h"
 				elif [ "$_t" = "local" ]; then
-					status_footnote "this Mac keeps no local snapshots right now -- Time Machine makes them only while backing THIS Mac up, and a Mac that is just a backup target has none. my-tm can take them itself: $US fs-snap takes one now, FS_SNAP_INTERVAL=1h in the config keeps taking them"
+					status_footnote "this Mac keeps no local snapshots right now -- Time Machine makes them only while it is backing THIS Mac up, so a Mac that backs nothing up, or that is only a backup target for others, has none. my-tm can take them itself: $US fs-snap takes one now, FS_SNAP_INTERVAL=1h in the config keeps taking them"
 				else
-					status_footnote "the store is readable but holds no backups yet -- Time Machine has not written one here. $US backup runs one"
+					status_footnote "$(status_empty_store_why "$_t")"
 				fi
 				_mark="$FN_MARK"
 			fi
@@ -12502,6 +12533,44 @@ t_test_status_footnotes() {
 	t_match "an unopened sparsebundle says a status never attaches one" \
 		"$_sf_out3" "never attaches a sparsebundle"
 	t_match "and names the command that reads it once" "$_sf_out3" "ls bundle"
+
+	## An empty row must not invent a CAUSE. macado's `timemachine` row said
+	## "Time Machine has not written one here" while 843G of sparsebundles sat in
+	## that very folder (2026-11-03) -- the adversarial input is a store that IS
+	## readable and IS empty of snapshots, where both answers look plausible.
+	_sf_empty="$T_ROOT/emptystore"
+	mkdir "$_sf_empty"
+	t_match "a store with nothing in it says Time Machine wrote nothing here" \
+		"$(status_empty_store_why "$_sf_empty")" "has not written one here"
+
+	_sf_hold="$T_ROOT/holdsbundles"
+	mkdir "$_sf_hold" "$_sf_hold/macado0.sparsebundle" "$_sf_hold/horse.sparsebundle"
+	_sf_why=$(status_empty_store_why "$_sf_hold")
+	t_match "a folder OF sparsebundles says so, and counts them" "$_sf_why" "holds 2 sparsebundle(s)"
+	t_match "and names them" "$_sf_why" "horse.sparsebundle, macado0.sparsebundle"
+	t_eq "and never claims Time Machine wrote nothing there" \
+		"$(printf '%s\n' "$_sf_why" | count_match 'has not written one here')" "0"
+	t_match "locally it names the bundle to register" "$_sf_why" "add $_sf_hold/<NAME>.sparsebundle"
+
+	## the SAME folder over a share: my-tm reads a bundle where it is STORED, so
+	## the command named here is the one `add` itself names when it refuses a
+	## share path -- one vocabulary, not two
+	_sf_mt="$T_ROOT/mount-table"
+	printf '//me@ada/timeMachine on %s (smbfs, nodev, nosuid)\n' "$_sf_hold" >"$_sf_mt"
+	_sf_why2=$(MOUNT_TABLE_FILE="$_sf_mt" status_empty_store_why "$_sf_hold")
+	t_match "over a share it names the host it comes from" "$_sf_why2" "over a share from ada"
+	t_match "and reads the bundle where it is stored" "$_sf_why2" \
+		"add ada:<path on ada>/<NAME>.sparsebundle"
+	rm -rf "$_sf_empty" "$_sf_hold" "$_sf_mt"
+
+	## the `local` row's note states the CONDITION, never a cause nothing
+	## established: macado is a backup CLIENT whose Time Machine was off, and the
+	## note blamed "a Mac that is just a backup target" for it (2026-11-03)
+	_sf_loc=$(awk '/^[\t ]*status_footnote "this Mac keeps no local snapshots/' "$T_MYTM")
+	t_ne "the local row's note is there to be read" "$_sf_loc" ""
+	t_match "it covers a Mac that backs nothing up" "$_sf_loc" "backs nothing up"
+	t_eq "and blames being only a target for nothing" \
+		"$(printf '%s\n' "$_sf_loc" | count_match 'is just a backup target')" "0"
 
 	printf '%s\n' "$_sf_save" >"$T_ROOT/cache/locations.tsv"
 	locations_run_cache_drop
