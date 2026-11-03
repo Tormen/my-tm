@@ -9125,8 +9125,10 @@ t_ne() {
 	if [ "$2" != "$3" ]; then t_ok "$1"; else t_bad "$1" "expected something other than '$3'"; fi
 }
 t_true()  { if "$@" >/dev/null 2>&1; then t_ok "$1"; else t_bad "$1" "command failed"; fi; }
+## -e names the pattern: without it a pattern starting with a dash is read by
+## grep as an option, and the check fails on a value that was right.
 t_match() {
-	if printf '%s' "$2" | grep -q "$3"; then t_ok "$1"; else t_bad "$1" "'$2' does not match /$3/"; fi
+	if printf '%s' "$2" | grep -q -e "$3"; then t_ok "$1"; else t_bad "$1" "'$2' does not match /$3/"; fi
 }
 
 t_stub_dir() { printf '%s/stub\n' "$T_ROOT"; }
