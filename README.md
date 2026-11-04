@@ -1076,7 +1076,17 @@ The launcher, `my-tm-launcher.c` (carried inside my-tm, byte for byte):
   rebuilds it only when it is missing or its `--version` no longer matches,
   and refuses a `JOBS_LAUNCHER`
   inside a group- or world-writable tree. Without `clang` or `codesign` the
-  jobs run my-tm directly, and `--install` says so.
+  jobs run my-tm directly, and `--install` says so;
+* is COMMITTED where it lands, when that is a git work tree, by the run that
+  wrote it -- `--install` after building it, `--uninstall` after removing it,
+  each naming what and why. A machine may point `JOBS_LAUNCHER` at a tracked
+  directory so the launcher travels with it, and a file left uncommitted there
+  blocks whoever maintains that tree next: they cannot tell a tool's write
+  from a hand edit, and my-tm can. Only that one path is committed, never a
+  neighbour's work, and nothing is pushed -- publishing the tree belongs to
+  whoever owns it. Outside a repository it does nothing and says nothing, and
+  a commit that cannot be made is a warning naming the command, not a failed
+  install.
 
 **One manual step:** System Settings > Privacy & Security > Full Disk Access >
 add the launcher. macOS ties the grant to that exact build: a rebuild needs

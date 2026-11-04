@@ -34,8 +34,8 @@ US="${0##*/}"
 ## so the ROOT-OWNED COPY the daemons run -- which has no git beside it -- can
 ## still say which release it is and whether it is one.
 MY_TM_VERSION="0.9.1"
-SCRIPT_COMMIT="93564df"
-SCRIPT_RELEASE="v0.9.1-127-g93564df"
+SCRIPT_COMMIT="6160fe3"
+SCRIPT_RELEASE="v0.9.1-129-g6160fe3"
 
 ## The first 12 hex of this file's own SHA-256: the value that identifies the
 ## bytes. my-tm is COPIED to its installed path, so this is what tells the
@@ -1064,6 +1064,37 @@ path_is_user_writable() {
 		[ "$_p" = "/" ] && return 1
 		_p=$(dirname "$_p")
 	done
+}
+
+## git_commit_write <path> <why>  -- commit PATH where it lives, if that is a
+## git work tree. A file this tool wrote into a tracked tree is this tool's to
+## commit: JOBS_LAUNCHER can sit in one (a machine points it at a directory
+## that travels between hosts), and a change nobody committed there has no
+## author and no reason -- it only blocks whoever maintains that tree next.
+## Whoever finds it later cannot tell a tool's write from a hand edit and must
+## stop; my-tm can, so it says so here instead.
+##
+## Silent when there is no repository, or nothing of PATH to commit, so a
+## re-install that rebuilt nothing says nothing. Never fatal: the file is in
+## place and the jobs run either way, so a commit that cannot be made is a
+## warning that names the command, not a failed install. Commits only PATH --
+## a pathspec, so a neighbour's work in the same tree is never swept in -- and
+## does not push: publishing that tree belongs to whoever owns it.
+git_commit_write() {    # <path> <why>
+	_gcw_p="$1"; _gcw_why="$2"
+	_gcw_d=$(dirname "$_gcw_p")
+	[ -d "$_gcw_d" ] || return 0
+	_gcw_top=$(git -C "$_gcw_d" rev-parse --show-toplevel 2>/dev/null) || return 0
+	[ -n "$_gcw_top" ] || return 0
+	[ -n "$(git -C "$_gcw_top" status --porcelain -- "$_gcw_p" 2>/dev/null)" ] || return 0
+
+	if run git -C "$_gcw_top" add -- "$_gcw_p" &&
+	   run git -C "$_gcw_top" commit -q -m "$US: $_gcw_why" -- "$_gcw_p"; then
+		msg "committed $_gcw_p in $_gcw_top -- $_gcw_why"
+		return 0
+	fi
+	warn "$_gcw_p is written but NOT committed in $_gcw_top -- it will stop anything that needs that tree clean. As root: git -C $_gcw_top commit -m \"$US: $_gcw_why\" -- $_gcw_p"
+	return 1
 }
 
 #############################################################################
@@ -7762,6 +7793,7 @@ launcher_install() {
 	fi
 	msg "built the launcher $_li_path"
 	why "a rebuilt launcher is a new program to macOS -- an earlier grant does not carry over"
+	git_commit_write "$_li_path" "--install built the launcher the jobs run through"
 	fda_add "$_li_path" \
 		|| todo "grant it Full Disk Access: System Settings > Privacy & Security > Full Disk Access > add $_li_path${FDA_CMD:+ (or: $FDA_CMD add $_li_path)}"
 	return 0
@@ -8277,7 +8309,10 @@ cmd_uninstall() {
 	[ "$_go" = "1" ] || return 0
 
 	if [ -e "$JOBS_LAUNCHER" ]; then
-		run rm -f "$JOBS_LAUNCHER" && msg "removed the launcher $JOBS_LAUNCHER"
+		if run rm -f "$JOBS_LAUNCHER"; then
+			msg "removed the launcher $JOBS_LAUNCHER"
+			git_commit_write "$JOBS_LAUNCHER" "--uninstall removed the launcher"
+		fi
 	fi
 
 	for _j in "$MAINT_JOB" "$HEALTH_JOB" $(backup_jobs_all); do
@@ -14173,6 +14208,71 @@ t_test_launcher() {
 	rm -rf "$_ln_d"
 }
 
+t_test_git_commit_write() {
+	printf '\nCommitting what --install wrote into a tracked tree\n'
+	if ! command -v git >/dev/null 2>&1; then
+		t_skip "committing the launcher" "needs git"
+		return 0
+	fi
+	_gc_d="$T_ROOT/gcw"
+	mkdir "$_gc_d"
+
+	## NOT a repository: the default JOBS_LAUNCHER (/usr/local/sbin) is no
+	## tree, and a run there must say nothing at all about git
+	printf 'x\n' >"$_gc_d/loose"
+	_gc_out=$(git_commit_write "$_gc_d/loose" "why" 2>&1)
+	t_eq "outside a repository it is silent and succeeds" \
+		"[$_gc_out] $?" "[] 0"
+
+	_gc_r="$_gc_d/repo"
+	git init -q "$_gc_r" 2>/dev/null
+	git -C "$_gc_r" config user.email t@example.com
+	git -C "$_gc_r" config user.name tester
+	mkdir "$_gc_r/sbin"
+	printf 'first\n' >"$_gc_r/sbin/my-tm-launcher"
+	printf 'theirs\n' >"$_gc_r/other"
+	git -C "$_gc_r" add -A >/dev/null 2>&1
+	git -C "$_gc_r" commit -q -m base
+
+	## the launcher changes AND a neighbour's file is dirty at the same moment:
+	## the pathspec is what keeps their work out of my-tm's commit
+	printf 'rebuilt\n' >"$_gc_r/sbin/my-tm-launcher"
+	printf 'their edit\n' >"$_gc_r/other"
+	git_commit_write "$_gc_r/sbin/my-tm-launcher" "--install built it" >/dev/null 2>&1
+	t_eq "the launcher is committed" \
+		"$(git -C "$_gc_r" status --porcelain -- sbin/my-tm-launcher | wc -l | tr -d ' ')" "0"
+	t_match "and the message says what and why" \
+		"$(git -C "$_gc_r" log -n 1 --format=%s)" "--install built it"
+	t_eq "a neighbour's edit in the same tree is left alone" \
+		"$(git -C "$_gc_r" status --porcelain -- other)" " M other"
+
+	## nothing to commit: a second --install that rebuilt nothing is silent,
+	## and adds no empty commit on top
+	_gc_n=$(git -C "$_gc_r" rev-list --count HEAD)
+	_gc_out=$(git_commit_write "$_gc_r/sbin/my-tm-launcher" "--install built it" 2>&1)
+	t_eq "with nothing to commit it is silent and adds no commit" \
+		"[$_gc_out] $(git -C "$_gc_r" rev-list --count HEAD)" "[] $_gc_n"
+
+	## --uninstall's removal: the file is GONE, so the worktree state of that
+	## path IS the deletion and the pathspec commit records it
+	rm -f "$_gc_r/sbin/my-tm-launcher"
+	git_commit_write "$_gc_r/sbin/my-tm-launcher" "--uninstall removed it" >/dev/null 2>&1
+	t_eq "a removed launcher is committed as a deletion" \
+		"$(git -C "$_gc_r" status --porcelain -- sbin/my-tm-launcher | wc -l | tr -d ' ')" "0"
+	t_eq "and it is really gone from the tree, not merely unstaged" \
+		"$(git -C "$_gc_r" ls-files -- sbin/my-tm-launcher)" ""
+
+	## both writers go through the one helper -- a call site that bypasses it
+	## is exactly the uncommitted file this exists to prevent
+	# shellcheck disable=SC2016  # the literal source text is matched, not a variable
+	t_eq "launcher_install commits what it built" \
+		"$(sed -n '/^launcher_install() {$/,/^}$/p' "$T_MYTM" | count_match 'git_commit_write "$_li_path"')" "1"
+	# shellcheck disable=SC2016  # the literal source text is matched, not a variable
+	t_eq "and --uninstall commits what it removed" \
+		"$(sed -n '/^cmd_uninstall() {$/,/^}$/p' "$T_MYTM" | count_match 'git_commit_write "$JOBS_LAUNCHER"')" "1"
+	rm -rf "$_gc_d"
+}
+
 t_test_network_volume_of() {
 	printf '\nWhat counts as a network volume\n'
 	_ng_save="$MOUNT_TABLE_FILE"
@@ -15230,6 +15330,7 @@ _rt_list() {
 	_rt vol_device                           && t_test_vol_device
 	_rt launcher                             && t_test_launcher
 	_rt install_launcher                     && t_test_install_launcher
+	_rt git_commit_write                     && t_test_git_commit_write
 	_rt fda_add                              && t_test_fda_add
 	_rt little_snitch                        && t_test_little_snitch
 	_rt mount_failure_says_why               && t_test_mount_failure_says_why
