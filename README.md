@@ -1745,8 +1745,13 @@ for a single location in `set_location_parameters()`, which sees the handle in
 called first, the host's last, so the host wins where both name a location. At
 the top level a config sets only the `_DEFAULT`s. A config that still sets one of
 the old names (`THIN_POLICY_TO_KEEP`, `THIN_POLICY_PER_LOCATION`, `POST_BACKUP`,
-`POST_BACKUP_PER_LOCATION`, `HEALTH_MAX_AGE_H`) stops my-tm with one line naming
-what replaced it.
+`POST_BACKUP_PER_LOCATION`, `HEALTH_MAX_AGE_H`, `BACKUP_SCHEDULE`,
+`LOCAL_SNAP_INTERVAL`, `LOCAL_SNAP_KEEP_H`, `LOCAL_SNAP_MAX`) stops my-tm with
+one line naming what replaced it. `AUTODETECT_LOCAL_TM_BACKUPS`,
+`JOBS_ACCESS_NETWORK_VOLUMES` and `INDEX_REMOTE_COPY` are refused the same way.
+It is the TOP LEVEL that is checked, so a set function assigning
+`BACKUP_SCHEDULE` for one set -- which is how a set names its schedule -- is
+untouched.
 
 `my-tm add /Volumes/X backup` (root — the file is in the shared dir) probes
 the folder (§12), prints what it found — volumes, snapshot count, span — and

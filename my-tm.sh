@@ -34,8 +34,8 @@ US="${0##*/}"
 ## so the ROOT-OWNED COPY the daemons run -- which has no git beside it -- can
 ## still say which release it is and whether it is one.
 MY_TM_VERSION="0.9.1"
-SCRIPT_COMMIT="6160fe3"
-SCRIPT_RELEASE="v0.9.1-129-g6160fe3"
+SCRIPT_COMMIT="12b2e4b"
+SCRIPT_RELEASE="v0.9.1-130-g12b2e4b"
 
 ## The first 12 hex of this file's own SHA-256: the value that identifies the
 ## bytes. my-tm is COPIED to its installed path, so this is what tells the
@@ -873,9 +873,13 @@ backup_set_resolve() {          # [<set>] -> <set>
 	printf '%s\n' "$_bsr"
 }
 
-## Settings that became per-location parameters. A config still setting one is
+## Settings that were renamed or removed. A config still setting one is
 ## stopped, naming what replaced it: ignoring it silently would change what the
 ## backups keep, and when a disk is ejected.
+##
+## A key arrives here once every machine's config has been migrated. Before
+## that it is read under its new name with a warning instead, so one release
+## does not fail every machine ahead of the rollout step that renames it.
 config_refuse_old_names() {
 	for _on in \
 		THIN_POLICY_TO_KEEP:THIN_POLICY_TO_KEEP_DEFAULT \
@@ -885,7 +889,11 @@ config_refuse_old_names() {
 		HEALTH_MAX_AGE_H:HEALTH_MAX_AGE_DEFAULT \
 		AUTODETECT_LOCAL_TM_BACKUPS:REMOVED \
 		JOBS_ACCESS_NETWORK_VOLUMES:REMOVED \
-		INDEX_REMOTE_COPY:SHADOW_SSH_INDEX_FILES; do
+		INDEX_REMOTE_COPY:SHADOW_SSH_INDEX_FILES \
+		BACKUP_SCHEDULE:BACKUP_SCHEDULE_DEFAULT \
+		LOCAL_SNAP_INTERVAL:FS_SNAP_INTERVAL \
+		LOCAL_SNAP_KEEP_H:FS_SNAP_KEEP_H \
+		LOCAL_SNAP_MAX:FS_SNAP_MAX; do
 		_on_old=${_on%%:*}
 		eval "_on_set=\${$_on_old+set}"
 		[ -n "$_on_set" ] || continue
@@ -900,52 +908,6 @@ config_refuse_old_names() {
 		esac
 	done
 	return 0
-}
-
-## DEFAULT_CMD held a --flag until the commands became verbs, and every
-## machine's config still does until its rollout step has run. Read the verb
-## out of it rather than failing a bare `my-tm`, and say so once per run --
-## the file is root's, so nobody can fix it from here.
-## Keys that were RENAMED, as <old>:<new>:<why>. Unlike config_refuse_old_names
-## above -- which stops the run, because ignoring those would change what the
-## backups keep -- these are read under their new name with one line saying so:
-## a key whose meaning did not change must not fail every machine between the
-## release and the rollout step that renames it.
-CONFIG_RENAMED_KEYS="\
-BACKUP_SCHEDULE:BACKUP_SCHEDULE_DEFAULT:a set sets BACKUP_SCHEDULE for itself now
-LOCAL_SNAP_INTERVAL:FS_SNAP_INTERVAL:the command is fs-snap
-LOCAL_SNAP_KEEP_H:FS_SNAP_KEEP_H:the command is fs-snap
-LOCAL_SNAP_MAX:FS_SNAP_MAX:the command is fs-snap"
-
-config_rename_old_keys() {
-	## one LINE per key: the reason field has spaces in it, so a word loop
-	## would split it -- and then read the fragments as key names
-	while IFS= read -r _ro; do
-		[ -n "$_ro" ] || continue
-		_ro_old=${_ro%%:*}; _ro_rest=${_ro#*:}
-		_ro_new=${_ro_rest%%:*}; _ro_why=${_ro_rest#*:}
-		eval "_ro_set=\${$_ro_old+set}"
-		[ -n "$_ro_set" ] || continue
-		eval "_ro_val=\$$_ro_old"
-		warn "$_ro_old is the old name (config:$CONFIG_SOURCED) -- read as $_ro_new; $_ro_why"
-		## UNSET, not emptied: an emptied name is still "set", so a second
-		## call would fire again and overwrite the new value with nothing
-		eval "$_ro_new=\$_ro_val; unset $_ro_old"
-	done <<_EOF
-$CONFIG_RENAMED_KEYS
-_EOF
-	return 0
-}
-
-config_default_cmd_verb() {
-	case "${DEFAULT_CMD:-}" in
-		--*) ;;
-		*) return 0 ;;
-	esac
-	_dcv=${DEFAULT_CMD#--}
-	is_command "${_dcv%% *}" || return 0
-	warn "DEFAULT_CMD=\"$DEFAULT_CMD\" is the old spelling (config:$CONFIG_SOURCED) -- read as \`$_dcv\`; commands are verbs now"
-	DEFAULT_CMD="$_dcv"
 }
 
 cmd_create_config() {
@@ -9034,7 +8996,6 @@ main() {
 	[ "$DEEPDBG" = "1" ] && { PS4='+ '; set -x; }
 
 	load_config || true
-	config_rename_old_keys
 	case "${CMD:-}" in
 		--run-tests|--create-config|--help|--version) : ;;
 		*) config_refuse_old_names ;;
@@ -9075,7 +9036,6 @@ main() {
 	esac
 
 	if [ -z "$CMD" ] && [ "$#" -eq 0 ]; then
-		config_default_cmd_verb
 		# shellcheck disable=SC2086  # DEFAULT_CMD may carry parameters on purpose
 		set -- $DEFAULT_CMD
 		CMD="$1"; shift
@@ -9581,18 +9541,20 @@ t_test_config() {
 	t_eq "the default config spells DEFAULT_CMD as a verb" \
 		"$(count_match 'DEFAULT_CMD="status"' < "$_f")" "1"
 
-	## A config still on the old spelling must not break a bare `my-tm`: the
-	## verb is read out of it and the line is named. Adversarial: a value that
-	## is NOT a command keeps its dashes, so a real typo is still reported.
-	## the call cannot go in $( ), which would lose the assignment it makes
-	_c_save="$DEFAULT_CMD"; _c_err="$T_ROOT/defcmd.err"
-	DEFAULT_CMD="--status"; config_default_cmd_verb 2>"$_c_err"
-	t_eq "an old DEFAULT_CMD is read as its verb" "$DEFAULT_CMD" "status"
-	t_match "and the line is named" "$(cat "$_c_err")" "old spelling"
-	DEFAULT_CMD="--nonsense"; config_default_cmd_verb 2>"$_c_err"
-	t_eq "a value that is no command is left alone" "$DEFAULT_CMD" "--nonsense"
-	t_eq "(and nothing is said about it)" "$(count_lines < "$_c_err")" "0"
-	rm -f "$_c_err"; DEFAULT_CMD="$_c_save"
+	## The old DEFAULT_CMD spelling is no longer translated (2026-11-04: every
+	## machine's config spells it as a verb). It must still be ANSWERED rather
+	## than silently wrong, and it is -- by the dispatcher's dashed-verb hint,
+	## which names the verb meant. Run as a real process: the hint ends in err,
+	## which exits, so calling it in-process would end the suite.
+	_c_conf="$T_ROOT/defcmd.conf"
+	printf 'DEFAULT_CMD="--status"\n' >"$_c_conf"
+	_c_out=$(MY_TM_CONFIG="$_c_conf" "$T_MYTM" 2>&1; echo "rc=$?")
+	t_match "a DEFAULT_CMD still spelled --status is answered, not obeyed quietly" \
+		"$_c_out" "no such option: --status"
+	t_match "and the answer names the verb meant" "$_c_out" "status"
+	t_eq "and it fails rather than running something else" \
+		"$(printf '%s\n' "$_c_out" | awk -F= '/^rc=/ { print ($2 == 0 ? "0" : "non-zero") }')" "non-zero"
+	rm -f "$_c_conf"
 }
 
 ## One shared location list. Adversarial: a per-user copy used to be written
@@ -14917,32 +14879,51 @@ _EOF
 	t_match "a hook that fails is reported" "$( ( backup_run_cmd PRE 'exit 7' ) 2>&1 )" "exited 7"
 	t_eq "(and the backup goes on)" "$( ( backup_run_cmd PRE 'exit 7' ) >/dev/null 2>&1; echo $?)" "0"
 
-	## A RENAMED config key is read under its new name with one line saying
-	## so -- a key whose meaning did not change must not fail every machine
-	## between the release and the rollout step. Adversarial: the reason
-	## field has spaces in it, and a word loop would split it and then read
-	## the fragments as key names, which is exactly what the first version
-	## did. So check a key whose reason has several words, and that nothing
-	## of the old name is left to shadow the new.
-	## drain whatever THIS machine's config happens to set, so the count
-	## below is this test's doing and not the host's
-	config_rename_old_keys 2>/dev/null
-	_bs_err="$T_ROOT/sched.err"
-	_bs_save_d="$BACKUP_SCHEDULE_DEFAULT"; _bs_save_i="${FS_SNAP_INTERVAL:-}"
-	BACKUP_SCHEDULE="weekly-ish"
-	# shellcheck disable=SC2034  # the point of the test: read under its NEW name
-	LOCAL_SNAP_INTERVAL="3h"
-	config_rename_old_keys 2>"$_bs_err"
-	t_eq "the old BACKUP_SCHEDULE becomes the default" "$BACKUP_SCHEDULE_DEFAULT" "weekly-ish"
-	t_eq "and LOCAL_SNAP_INTERVAL becomes FS_SNAP_INTERVAL" "$FS_SNAP_INTERVAL" "3h"
-	t_eq "one line per key, and no fragment read as a key" \
-		"$(count_lines < "$_bs_err")" "2"
-	t_match "each says it is the old name" "$(cat "$_bs_err")" "is the old name"
-	t_match "and the whole reason survives, spaces and all" \
-		"$(cat "$_bs_err")" "the command is fs-snap"
-	t_eq "(and the old name is not left to shadow the new)" "${BACKUP_SCHEDULE:-}" ""
-	BACKUP_SCHEDULE_DEFAULT="$_bs_save_d"; FS_SNAP_INTERVAL="$_bs_save_i"
-	unset LOCAL_SNAP_INTERVAL; rm -f "$_bs_err" "$_bs_conf"
+	## The four renamed keys were read under their new name with a warning
+	## while the machines were migrated; since 2026-11-04 they are REFUSED
+	## like every other old name, because the alternative to translating is
+	## not silence -- a config key this tool does not read would change what
+	## the backups keep without saying so. Adversarial: the refusal must name
+	## the key AND what to use instead, or it sends the reader looking.
+	## Run as a real process: config_refuse_old_names ends in err, which exits.
+	for _bs_k in BACKUP_SCHEDULE:BACKUP_SCHEDULE_DEFAULT LOCAL_SNAP_INTERVAL:FS_SNAP_INTERVAL \
+	             LOCAL_SNAP_KEEP_H:FS_SNAP_KEEP_H LOCAL_SNAP_MAX:FS_SNAP_MAX; do
+		_bs_old=${_bs_k%%:*}; _bs_new=${_bs_k#*:}
+		_bs_conf="$T_ROOT/old-$_bs_old.conf"
+		printf '%s="x"\n' "$_bs_old" >"$_bs_conf"
+		_bs_out=$(MY_TM_CONFIG="$_bs_conf" "$T_MYTM" status 2>&1; echo "rc=$?")
+		t_match "$_bs_old is refused, not ignored" "$_bs_out" "$_bs_old is no longer read"
+		t_match "(and $_bs_new is named as the one to use)" "$_bs_out" "$_bs_new"
+		t_eq "(and the run stops)" \
+			"$(printf '%s\n' "$_bs_out" | awk -F= '/^rc=/ { print ($2 == 0 ? "0" : "non-zero") }')" "non-zero"
+		rm -f "$_bs_conf"
+	done
+
+	## ...and the case that would make the refusal confidently WRONG: a set
+	## function is DOCUMENTED to assign BACKUP_SCHEDULE for one set, and that
+	## assignment happens when the function is CALLED -- long after the
+	## refusal, which only ever sees what the config set at the top level.
+	## Refusing it would stop every machine that configures a second set.
+	_bs_conf="$T_ROOT/set-fn.conf"
+	cat >"$_bs_conf" <<'_BSFN'
+BACKUP_SETS="nightly"
+set_backup_parameters() {
+	case "$1" in
+		nightly) BACKUP_SCHEDULE="03:00" ;;
+	esac
+}
+_BSFN
+	_bs_out=$(MY_TM_CONFIG="$_bs_conf" "$T_MYTM" status 2>&1; echo "rc=$?")
+	t_eq "a set function assigning BACKUP_SCHEDULE is NOT refused" \
+		"$(printf '%s\n' "$_bs_out" | count_match 'BACKUP_SCHEDULE is no longer read')" "0"
+	## ...and that this file is really being read: the SAME config, with the
+	## name set at the top level too, is refused. Without this the check above
+	## would pass just as well on a config nobody loaded.
+	printf 'BACKUP_SCHEDULE="x"\n' >>"$_bs_conf"
+	t_eq "(and the same config IS refused once it sets the name at top level)" \
+		"$(MY_TM_CONFIG="$_bs_conf" "$T_MYTM" status 2>&1 | count_match 'BACKUP_SCHEDULE is no longer read')" "1"
+	rm -f "$_bs_conf"
+
 	CONFIG_SOURCED="$_bs_save_c"; BACKUP_SETS="$_bs_save_s"
 	return 0
 }
