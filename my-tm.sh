@@ -34,8 +34,8 @@ US="${0##*/}"
 ## so the ROOT-OWNED COPY the daemons run -- which has no git beside it -- can
 ## still say which release it is and whether it is one.
 MY_TM_VERSION="0.9.1"
-SCRIPT_COMMIT="f92215d"
-SCRIPT_RELEASE="v0.9.1-131-gf92215d"
+SCRIPT_COMMIT="56dff94"
+SCRIPT_RELEASE="v0.9.1-132-g56dff94"
 
 ## The first 12 hex of this file's own SHA-256: the value that identifies the
 ## bytes. my-tm is COPIED to its installed path, so this is what tells the
@@ -14886,12 +14886,17 @@ _EOF
 	## the backups keep without saying so. Adversarial: the refusal must name
 	## the key AND what to use instead, or it sends the reader looking.
 	## Run as a real process: config_refuse_old_names ends in err, which exits.
+	## The command is --completion, not status: status auto-discovers this Mac's
+	## real backup disks -- detection is always on by design -- so on a machine
+	## with one attached it scans it, and mounts or attaches it first when the
+	## eject policy has put it away. That is minutes inside a test suite. Both
+	## commands reach the refusal; only one of them touches a disk.
 	for _bs_k in BACKUP_SCHEDULE:BACKUP_SCHEDULE_DEFAULT LOCAL_SNAP_INTERVAL:FS_SNAP_INTERVAL \
 	             LOCAL_SNAP_KEEP_H:FS_SNAP_KEEP_H LOCAL_SNAP_MAX:FS_SNAP_MAX; do
 		_bs_old=${_bs_k%%:*}; _bs_new=${_bs_k#*:}
 		_bs_conf="$T_ROOT/old-$_bs_old.conf"
 		printf '%s="x"\n' "$_bs_old" >"$_bs_conf"
-		_bs_out=$(MY_TM_CONFIG="$_bs_conf" "$T_MYTM" status 2>&1; echo "rc=$?")
+		_bs_out=$(MY_TM_CONFIG="$_bs_conf" "$T_MYTM" --completion 2>&1; echo "rc=$?")
 		t_match "$_bs_old is refused, not ignored" "$_bs_out" "$_bs_old is no longer read"
 		t_match "(and $_bs_new is named as the one to use)" "$_bs_out" "$_bs_new"
 		t_eq "(and the run stops)" \
@@ -14913,7 +14918,7 @@ set_backup_parameters() {
 	esac
 }
 _BSFN
-	_bs_out=$(MY_TM_CONFIG="$_bs_conf" "$T_MYTM" status 2>&1; echo "rc=$?")
+	_bs_out=$(MY_TM_CONFIG="$_bs_conf" "$T_MYTM" --completion 2>&1; echo "rc=$?")
 	t_eq "a set function assigning BACKUP_SCHEDULE is NOT refused" \
 		"$(printf '%s\n' "$_bs_out" | count_match 'BACKUP_SCHEDULE is no longer read')" "0"
 	## ...and that this file is really being read: the SAME config, with the
@@ -14921,7 +14926,7 @@ _BSFN
 	## would pass just as well on a config nobody loaded.
 	printf 'BACKUP_SCHEDULE="x"\n' >>"$_bs_conf"
 	t_eq "(and the same config IS refused once it sets the name at top level)" \
-		"$(MY_TM_CONFIG="$_bs_conf" "$T_MYTM" status 2>&1 | count_match 'BACKUP_SCHEDULE is no longer read')" "1"
+		"$(MY_TM_CONFIG="$_bs_conf" "$T_MYTM" --completion 2>&1 | count_match 'BACKUP_SCHEDULE is no longer read')" "1"
 	rm -f "$_bs_conf"
 
 	CONFIG_SOURCED="$_bs_save_c"; BACKUP_SETS="$_bs_save_s"
