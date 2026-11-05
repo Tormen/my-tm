@@ -7611,6 +7611,15 @@ launcher_source() {
 #ifndef LAUNCHER_SOURCE_HASH
 #define LAUNCHER_SOURCE_HASH "unknown"
 #endif
+/*
+ * The uid allowed to run my-tm through this launcher, compiled in like the
+ * path -- 0 everywhere it is installed. my-tm's suite builds a launcher with
+ * its own uid here, so it can still exercise the argument pass-through that
+ * the guard protects; `my-tm --install` never passes it.
+ */
+#ifndef MY_TM_RUN_UID
+#define MY_TM_RUN_UID 0
+#endif
 
 static void explain(FILE *out)
 {
@@ -7621,6 +7630,9 @@ static void explain(FILE *out)
 	    "It holds Full Disk Access for the my-tm LaunchDaemons, so the jobs can\n"
 	    "look inside network volumes and verify backups. That access is granted in\n"
 	    "System Settings > Privacy & Security > Full Disk Access.\n"
+	    "Runs ONLY as root, started by launchd: it passes every argument on, and\n"
+	    "my-tm reads the file named by --config as shell, so running it as anyone\n"
+	    "else would hand that access to them. --help and --version are open to all.\n"
 	    "Built and installed by `my-tm --install` (JOBS_RUN_WITH_FULL_DISK_ACCESS=1).\n",
 	    MY_TM_PATH);
 }
@@ -7638,6 +7650,25 @@ int main(int argc, char *argv[])
 	if (argc == 2 && strcmp(argv[1], "--version") == 0) {
 		printf("my-tm-launcher (runs %s, source %s)\n", MY_TM_PATH, LAUNCHER_SOURCE_HASH);
 		return 0;
+	}
+	/*
+	 * ROOT ONLY, past this point. The two answers above run no my-tm and use
+	 * no grant, so anyone who can read this file may ask them -- comparing a
+	 * deployed --version against a source is the documented way to spot a
+	 * stale launcher. Running my-tm is different: every argument and the
+	 * whole environment go through, my-tm reads the file named by --config
+	 * (and $MY_TM_CONFIG) AS SHELL, and a launchd-started launcher is the one
+	 * case where this program's Full Disk Access counts. Without this check,
+	 * anyone who may execute the file can have launchd run their own shell
+	 * code with that access. The file is root:<group> 0750, so that is its
+	 * group -- a capability the group does not otherwise hold.
+	 */
+	if (getuid() != (uid_t)MY_TM_RUN_UID) {
+		fprintf(stderr,
+		    " !!! my-tm-launcher: runs only as uid %d, started by launchd -- not as uid %d\n"
+		    "     (it holds Full Disk Access, which --help explains cannot be shared)\n",
+		    (int)MY_TM_RUN_UID, (int)getuid());
+		return 77;
 	}
 	argv[0] = (char *)MY_TM_PATH;
 	execv(MY_TM_PATH, argv);
@@ -7678,6 +7709,7 @@ launcher_build() {
 	_lb_hash=$(md5_file "$_lb_dir/my-tm-launcher.c")
 	if ! run clang -Wall -Wextra -Werror -O2 \
 			-DMY_TM_PATH="\"$_lb_bin\"" -DLAUNCHER_SOURCE_HASH="\"$_lb_hash\"" \
+			-DMY_TM_RUN_UID="${LAUNCHER_RUN_UID:-0}" \
 			-o "$_lb_dir/my-tm-launcher" "$_lb_dir/my-tm-launcher.c" >"$_lb_dir/build.log" 2>&1; then
 		warn "the launcher did not compile:"
 		sed 's/^/     /' "$_lb_dir/build.log" >&2
@@ -7706,12 +7738,18 @@ launcher_is_current() {
 ## Is PATH -rwxr-x--- and owned OWNER:GROUP? The launcher's shape: the
 ## screen's user, in the group, must READ it -- System Settings runs as that
 ## user and cannot add to Full Disk Access a file it cannot read.
-## The group gets READ and NOT EXECUTE. Read is what the grant needs -- the
-## screen's user must read the launcher to add it in System Settings -- and
-## execute is what would hand the group the grant itself: the launcher runs
-## whatever my-tm is told to read as its config, and a member could have
-## launchd start it, which is the case where the Full Disk Access counts. So
-## 0740, and an existing 0750 is a mode this puts right rather than accepts.
+## 0740, root:<the cache's group>: the group READS the launcher, which System
+## Settings needs to add it to Full Disk Access, and does not run it. Both
+## halves of that matter, and neither is the whole protection:
+##   - the MODE is the narrow one, and it is not my-tm's alone to hold --
+##     /LINKS/local/sbin is under a recursive 750 (my-fix-permissions 00117),
+##     which claimed this file until that tool added a path rule mirroring
+##     0740 (00116, 2026-11-05). A path rule beats a recursive one there, so
+##     the two agree now; before that each run of either undid the other.
+##   - the GUARD is the durable one: the launcher refuses any uid but the one
+##     compiled into it, which is 0 wherever it is installed. That holds
+##     whatever the mode says and whatever a future recursive rule claims,
+##     and it is what my-fda's launchers have always done.
 launcher_perms_ok() { # <path> <owner:group>
 	# shellcheck disable=SC2012  # the mode, owner and group columns only
 	[ "$(ls -ld "$1" | cut -c1-10) $(ls -ld "$1" | awk '{ print $3 ":" $4 }')" = "-rwxr----- $2" ]
@@ -13988,14 +14026,11 @@ t_test_install_launcher() {
 	chmod 0700 "$_il_f"
 	t_eq "...0700 (an older install's) does not: the screen's user cannot read it" \
 		"$(launcher_perms_ok "$_il_f" "$_il_og" && echo ok || echo fix)" "fix"
-	## The one that matters: GROUP EXECUTE is what hands the grant away. The
-	## launcher runs my-tm with whatever arguments it is given, my-tm reads
-	## the file named by --config as shell, and a group member can have
-	## launchd start the launcher -- which is the case where its Full Disk
-	## Access counts. 0750 must therefore be a mode --install PUTS RIGHT, not
-	## one it accepts, and this is the assertion that says so.
+	## my-fix-permissions mirrors 0740 with a path rule (00116) that beats its
+	## recursive 750 (00117), so 0750 is a mode --install puts right and the
+	## two tools no longer undo each other.
 	chmod 0750 "$_il_f"
-	t_eq "...and 0750 does NOT: group execute would hand the grant to the group" \
+	t_eq "...and 0750 does not either: group execute is not the group's to have" \
 		"$(launcher_perms_ok "$_il_f" "$_il_og" && echo ok || echo fix)" "fix"
 	chmod 0740 "$_il_f"
 	t_eq "...nor another group" \
@@ -14005,8 +14040,16 @@ t_test_install_launcher() {
 	# shellcheck disable=SC2016  # the literal source text is matched, not a variable
 	t_eq "the launcher is built root:<the cache's group> 0740, and an existing one put right" \
 		"$(printf '%s\n' "$_il_li" | count_match 'run chown "root:$_li_grp"') $(printf '%s\n' "$_il_li" | count_match 'run chmod 0740')" "2 2"
-	t_eq "...and no 0750 is left anywhere in it" \
-		"$(printf '%s\n' "$_il_li" | count_match '0750')" "0"
+	## Group execute is only safe because the launcher refuses a non-root uid.
+	## That guard is what the mode leans on, so it is asserted HERE too: a
+	## copy without it must fail this test, not just the launcher's own.
+	t_eq "...and the source it builds refuses any uid but the one compiled in" \
+		"$(launcher_source | count_match 'getuid() != (uid_t)MY_TM_RUN_UID')" "1"
+	t_eq "...which is 0 unless a build says otherwise, and it exits 77" \
+		"$(launcher_source | count_match '#define MY_TM_RUN_UID 0') $(launcher_source | count_match 'return 77;')" "1 1"
+	# shellcheck disable=SC2016  # the literal source text is matched, not a variable
+	t_eq "...and --install never overrides it: only the suite passes that" \
+		"$(printf '%s\n' "$_il_li" | count_match 'LAUNCHER_RUN_UID')" "0"
 	# shellcheck disable=SC2016  # the literal source text is matched, not a variable
 	t_eq "...the group being the one --install gives the cache" \
 		"$(printf '%s\n' "$_il_body" | count_match 'launcher_install "$JOBS_LAUNCHER" "$MY_TM_BIN" "$_group"')" "1"
@@ -14169,7 +14212,11 @@ t_test_launcher() {
 	chmod 755 "$_ln_d/fake-my-tm"
 	_ln_b="$_ln_d/my-tm-launcher"
 
-	launcher_build "$_ln_d/fake-my-tm" "$_ln_b" >/dev/null 2>&1
+	## The installed launcher runs for uid 0 only. The suite is refused as
+	## root, so the pass-through below is exercised on a launcher built for
+	## THIS uid -- the one thing LAUNCHER_RUN_UID exists for -- and the
+	## refusal itself is checked on a second build that wants root.
+	LAUNCHER_RUN_UID=$(id -u) launcher_build "$_ln_d/fake-my-tm" "$_ln_b" >/dev/null 2>&1
 	t_eq "it builds" "$([ -x "$_ln_b" ] && echo built)" "built"
 
 	"$_ln_b" >"$_ln_d/o" 2>"$_ln_d/e"; _ln_rc=$?
@@ -14191,6 +14238,20 @@ t_test_launcher() {
 	t_eq "--help with more arguments is passed through" \
 		"$(tr '\n' '|' <"$_ln_d/ran.args" 2>/dev/null)" "--help|extra|"
 	t_match "it is ad-hoc signed as my-tm-launcher" "$(codesign -dv "$_ln_b" 2>&1)" "Identifier=my-tm-launcher"
+
+	## THE GUARD, on a launcher built the way --install builds it: anyone but
+	## root is refused, and nothing is run. Without it a member of the
+	## launcher's group could have launchd start it with a --config of their
+	## own, which my-tm reads as shell, and so borrow its Full Disk Access.
+	_ln_r="$_ln_d/root-only"
+	launcher_build "$_ln_d/fake-my-tm" "$_ln_r" >/dev/null 2>&1
+	rm -f "$_ln_d/ran.args"
+	_ln_rrc=$("$_ln_r" --maintenance >/dev/null 2>"$_ln_d/re"; echo $?)
+	t_eq "built for root, it refuses this uid with 77 and runs nothing" \
+		"$_ln_rrc $([ -f "$_ln_d/ran.args" ] && echo ran || echo idle)" "77 idle"
+	t_match "...and says which uid it wants" "$(cat "$_ln_d/re")" "runs only as uid 0"
+	t_eq "...while --help and --version stay open: they run no my-tm" \
+		"$("$_ln_r" --help >/dev/null 2>&1; echo $?) $("$_ln_r" --version >/dev/null 2>&1; echo $?)" "0 0"
 
 	## a payload that still COMPILES: C joins adjacent string literals, so
 	## '.../a" "b' would build cleanly and quietly run '.../ab' instead

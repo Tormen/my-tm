@@ -1070,15 +1070,23 @@ The launcher, `my-tm-launcher.c` (carried inside my-tm, byte for byte):
 * with no arguments, or exactly `--help`, explains itself and runs nothing;
   `--version` prints the my-tm path and the hash of the source it was built from;
 * is built with `clang`, ad-hoc signed (`codesign -s -`) and installed at
-  `JOBS_LAUNCHER`, `0740 root:TM_GROUP` -- the cache's group gets READ, so the
-  screen's user can read the launcher, which System Settings needs to add it to
-  Full Disk Access, and NOT execute. Execute would hand the group the grant
-  itself: the launcher runs my-tm with whatever arguments it is given, my-tm
-  reads the file named by `--config` as shell, and a group member can have
-  launchd start the launcher -- which is the one case where its Full Disk
-  Access counts. So `0750` is a mode the next `--install` puts right rather
-  than one it accepts (as is an older install's `0700`, which the screen's
-  user cannot read). `--install`
+  `JOBS_LAUNCHER`, `0740 root:TM_GROUP` -- the cache's group READS it, which
+  System Settings needs to add it to Full Disk Access, and does not run it. An
+  existing launcher is put right by the next `--install`, `0750` and an older
+  install's `0700` alike. `/LINKS/local/sbin` is under a recursive `750`
+  (my-fix-permissions 00117), which claimed this file until that tool added a
+  path rule mirroring `0740` (00116); a path rule beats a recursive one there,
+  so the two agree rather than undoing each other every run;
+* RUNS ONLY AS ROOT. `--help` and `--version` are open to anyone who can read
+  the file -- they run no my-tm and use no grant -- but anything else exits 77
+  unless uid 0. Group execute would otherwise hand the grant to the group: the
+  launcher passes every argument and the whole environment to my-tm, my-tm
+  reads the file named by `--config` (and `$MY_TM_CONFIG`) as shell, and a
+  launchd-started launcher is the one case where its Full Disk Access counts,
+  so a group member could have launchd run their own shell code with it. The
+  mode alone should not have to carry this: it depends on two tools' configs
+  agreeing about one path, and a future recursive rule could claim the file
+  again. The guard holds whatever the mode says; `--install`
   rebuilds it only when it is missing or its `--version` no longer matches,
   and refuses a `JOBS_LAUNCHER`
   inside a group- or world-writable tree. Without `clang` or `codesign` the
