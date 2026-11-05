@@ -3132,8 +3132,15 @@ snap_mount() {
 	## is named once and 3 tells the caller to stop instead of hearing it 57
 	## times. Anything else below belongs to this snapshot alone.
 	case "$_sm_err" in
+		## What is KNOWN is the refusal: every snapshot here will answer the
+		## same, which is why this returns 3 and the walk stops. What is NOT
+		## known is which grant macOS withheld -- Full Disk Access is the
+		## usual one, and an external disk has its own Removable Volumes
+		## class -- so the line names the refusal and the likely causes
+		## rather than asserting one. It said "Full Disk Access is missing"
+		## until 2026-11-05, which is a diagnosis in the voice of a finding.
 		*"Operation not permitted"*)
-			warn "$_loc: Full Disk Access is missing -- macOS refuses every snapshot mount here. The jobs run through a launcher that holds the grant; run this the same way ($US --install builds it, my-fda list shows it)."
+			warn "$_loc: macOS refused the snapshot mount (Operation not permitted) -- every snapshot here will answer the same. Usually Full Disk Access, which the jobs hold through their launcher ($US --install builds it, my-fda list shows it); on an external disk it can be Removable Volumes instead."
 			return 3 ;;
 	esac
 	if ! loc_reachable "$_loc"; then
@@ -11803,8 +11810,14 @@ t_test_location_failures_stop_the_walk() {
 		mount_apfs() { printf '%s\n' "$_fa_err" >&2; return 1; }
 		snap_mount store 2026-08-20-155805 60 "indexer" "$T_ROOT/fa.mp"
 		printf 'rc=%s\n' "$?" ) 2>&1 )
-	t_eq "snap_mount names Full Disk Access, not the mount" \
-		"$(printf '%s\n' "$_fa_out" | count_match 'Full Disk Access is missing')" "1"
+	t_eq "snap_mount names the refusal, not this one snapshot" \
+		"$(printf '%s\n' "$_fa_out" | count_match 'macOS refused the snapshot mount')" "1"
+	## it may not claim WHICH grant: an EPERM from mount_apfs does not say,
+	## and on an external disk Removable Volumes is the other candidate
+	t_eq "...and names Full Disk Access as the usual cause, not as the finding" \
+		"$(printf '%s\n' "$_fa_out" | count_match 'Usually Full Disk Access')" "1"
+	t_eq "...so it never states it as fact" \
+		"$(printf '%s\n' "$_fa_out" | count_match 'Full Disk Access is missing')" "0"
 	t_eq "...and answers 3, which belongs to the location" \
 		"$(printf '%s\n' "$_fa_out" | count_match 'rc=3')" "1"
 
