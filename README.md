@@ -1103,14 +1103,22 @@ The launcher, `my-tm-launcher.c` (carried inside my-tm, byte for byte):
   install.
 
 **One manual step:** System Settings > Privacy & Security > Full Disk Access >
-add the launcher. macOS ties the grant to that exact build: a rebuild needs
-granting again, editing my-tm does not. With `FDA_CMD` (default `my-fda`,
-looked up in PATH) and someone at the terminal, `--install` does the rest
-after a rebuild: the previous build's grant goes, `my-fda add` opens the pane
-and shows the launcher to drag in, then checks it. Otherwise -- no `my-fda`,
-or a remote install over ssh -- it prints the step. Only the launcher's fixed my-tm gains
-the access, and only root can change that file; run from Terminal, the
-launcher is covered by Terminal's grant, not its own.
+add the launcher. macOS ties the grant to that exact build, so a rebuild needs
+granting again. Editing my-tm itself does not -- but editing the LAUNCHER's own
+source does, because `--install` then finds the installed one stale and builds
+it afresh; that is what the uid guard of 2026-11-05 costs, once per machine.
+With `FDA_CMD` (default `my-fda`, looked up in PATH) and someone at the
+terminal, `--install` does the rest after a rebuild: the previous build's grant
+goes, `my-fda add` opens the pane and shows the launcher to drag in, then
+checks it. Otherwise -- no `my-fda`, or a remote install over ssh -- it prints
+the step.
+
+Only the launcher's fixed my-tm gains the access, and only root can change that
+file. From a Terminal the launcher runs **only as root** -- any other uid is
+refused with 77 before my-tm is reached -- and a root run there is covered by
+Terminal's own grant, not the launcher's. `--help` and `--version` answer for
+anyone who can read the file, which is how a deployed build is compared against
+its source.
 
 **Hints.** A command mentions this value only where it changed what it did in
 that run, in one line naming the value to flip:
