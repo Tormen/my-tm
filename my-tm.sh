@@ -608,7 +608,7 @@ JOBS_RUN_WITH_FULL_DISK_ACCESS=0 # 1: the jobs run my-tm through JOBS_LAUNCHER,
                                 # codesign) and prints that step. The jobs need the
                                 # access to look inside network volumes and for
                                 # HEALTH_VERIFY checksums.
-JOBS_LAUNCHER="/usr/local/sbin/my-tm-launcher"  # where --install puts it; root:TM_GROUP 0750
+JOBS_LAUNCHER="/usr/local/sbin/my-tm-launcher"  # where --install puts it; root:TM_GROUP 0740
 FDA_CMD="my-fda"                # grants a new launcher Full Disk Access: --install
                                 # runs `<FDA_CMD> add` when someone is at the
                                 # terminal; "" or not found = it prints the step
@@ -7699,9 +7699,15 @@ launcher_is_current() {
 ## Is PATH -rwxr-x--- and owned OWNER:GROUP? The launcher's shape: the
 ## screen's user, in the group, must READ it -- System Settings runs as that
 ## user and cannot add to Full Disk Access a file it cannot read.
+## The group gets READ and NOT EXECUTE. Read is what the grant needs -- the
+## screen's user must read the launcher to add it in System Settings -- and
+## execute is what would hand the group the grant itself: the launcher runs
+## whatever my-tm is told to read as its config, and a member could have
+## launchd start it, which is the case where the Full Disk Access counts. So
+## 0740, and an existing 0750 is a mode this puts right rather than accepts.
 launcher_perms_ok() { # <path> <owner:group>
 	# shellcheck disable=SC2012  # the mode, owner and group columns only
-	[ "$(ls -ld "$1" | cut -c1-10) $(ls -ld "$1" | awk '{ print $3 ":" $4 }')" = "-rwxr-x--- $2" ]
+	[ "$(ls -ld "$1" | cut -c1-10) $(ls -ld "$1" | awk '{ print $3 ":" $4 }')" = "-rwxr----- $2" ]
 }
 
 ## Is someone at this terminal? (a remote --install over ssh is not; a
@@ -7724,7 +7730,7 @@ fda_add() { # <launcher>
 	run "$_fa_c" add "$1"
 }
 
-## Put a launcher for MY-TM-PATH at LAUNCHER, owned root:GROUP 0750, unless
+## Put a launcher for MY-TM-PATH at LAUNCHER, owned root:GROUP 0740, unless
 ## the one there is current -- then only its owner and mode are put right
 ## (an older install made it root:wheel 0700). Built beside its destination,
 ## then moved into place, so a failed build never leaves a half-made launcher
@@ -7735,11 +7741,11 @@ launcher_install() {
 		if ! launcher_perms_ok "$_li_path" "root:$_li_grp"; then
 			# shellcheck disable=SC2012  # the mode, owner and group columns only
 			_li_was=$(ls -ld "$_li_path" | awk '{ print substr($1, 1, 10) " " $3 ":" $4 }')
-			if ! run chown "root:$_li_grp" "$_li_path" || ! run chmod 0750 "$_li_path"; then
-				warn "could not make the launcher $_li_path root:$_li_grp 0750"
+			if ! run chown "root:$_li_grp" "$_li_path" || ! run chmod 0740 "$_li_path"; then
+				warn "could not make the launcher $_li_path root:$_li_grp 0740"
 				return 1
 			fi
-			msg "launcher:   $_li_path made root:$_li_grp 0750 (was $_li_was) -- the screen's user must read it to add it to Full Disk Access"
+			msg "launcher:   $_li_path made root:$_li_grp 0740 (was $_li_was) -- the group reads it to add it to Full Disk Access, and does not run it"
 		fi
 		minor "launcher:   $_li_path is current"
 		return 0
@@ -7747,7 +7753,7 @@ launcher_install() {
 	need_dir "$(dirname "$_li_path")" || { warn "cannot create $(dirname "$_li_path")"; return 1; }
 	_li_new="$(dirname "$_li_path")/.my-tm-launcher.new.$$"
 	launcher_build "$_li_bin" "$_li_new" || return 1
-	if ! run chown "root:$_li_grp" "$_li_new" || ! run chmod 0750 "$_li_new" ||
+	if ! run chown "root:$_li_grp" "$_li_new" || ! run chmod 0740 "$_li_new" ||
 	   ! run mv -f "$_li_new" "$_li_path"; then
 		rm -f "$_li_new"
 		warn "could not install the launcher at $_li_path"
@@ -13963,20 +13969,31 @@ t_test_install_launcher() {
 	_il_f="$T_ROOT/perms"; : >"$_il_f"
 	# shellcheck disable=SC2012  # owner and group columns only
 	_il_og=$(ls -ld "$_il_f" | awk '{ print $3 ":" $4 }')   # a new file takes its DIRECTORY's group (BSD)
-	chmod 0750 "$_il_f"
-	t_eq "a launcher -rwxr-x--- of its owner and group has the launcher's shape" \
+	chmod 0740 "$_il_f"
+	t_eq "a launcher -rwxr----- of its owner and group has the launcher's shape" \
 		"$(launcher_perms_ok "$_il_f" "$_il_og" && echo ok || echo fix)" "ok"
 	chmod 0700 "$_il_f"
 	t_eq "...0700 (an older install's) does not: the screen's user cannot read it" \
 		"$(launcher_perms_ok "$_il_f" "$_il_og" && echo ok || echo fix)" "fix"
+	## The one that matters: GROUP EXECUTE is what hands the grant away. The
+	## launcher runs my-tm with whatever arguments it is given, my-tm reads
+	## the file named by --config as shell, and a group member can have
+	## launchd start the launcher -- which is the case where its Full Disk
+	## Access counts. 0750 must therefore be a mode --install PUTS RIGHT, not
+	## one it accepts, and this is the assertion that says so.
 	chmod 0750 "$_il_f"
+	t_eq "...and 0750 does NOT: group execute would hand the grant to the group" \
+		"$(launcher_perms_ok "$_il_f" "$_il_og" && echo ok || echo fix)" "fix"
+	chmod 0740 "$_il_f"
 	t_eq "...nor another group" \
 		"$(launcher_perms_ok "$_il_f" "$(id -un):nosuchgroup" && echo ok || echo fix)" "fix"
 	rm -f "$_il_f"
 	_il_li=$(sed -n '/^launcher_install() {$/,/^}$/p' "$T_MYTM")
 	# shellcheck disable=SC2016  # the literal source text is matched, not a variable
-	t_eq "the launcher is built root:<the cache's group> 0750, and an existing one put right" \
-		"$(printf '%s\n' "$_il_li" | count_match 'run chown "root:$_li_grp"') $(printf '%s\n' "$_il_li" | count_match 'run chmod 0750')" "2 2"
+	t_eq "the launcher is built root:<the cache's group> 0740, and an existing one put right" \
+		"$(printf '%s\n' "$_il_li" | count_match 'run chown "root:$_li_grp"') $(printf '%s\n' "$_il_li" | count_match 'run chmod 0740')" "2 2"
+	t_eq "...and no 0750 is left anywhere in it" \
+		"$(printf '%s\n' "$_il_li" | count_match '0750')" "0"
 	# shellcheck disable=SC2016  # the literal source text is matched, not a variable
 	t_eq "...the group being the one --install gives the cache" \
 		"$(printf '%s\n' "$_il_body" | count_match 'launcher_install "$JOBS_LAUNCHER" "$MY_TM_BIN" "$_group"')" "1"

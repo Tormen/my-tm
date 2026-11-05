@@ -1070,9 +1070,15 @@ The launcher, `my-tm-launcher.c` (carried inside my-tm, byte for byte):
 * with no arguments, or exactly `--help`, explains itself and runs nothing;
   `--version` prints the my-tm path and the hash of the source it was built from;
 * is built with `clang`, ad-hoc signed (`codesign -s -`) and installed at
-  `JOBS_LAUNCHER`, `0750 root:TM_GROUP` -- the cache's group, so the screen's
-  user can read it, which System Settings needs to add it to Full Disk Access
-  (an existing launcher is put right by the next `--install`). `--install`
+  `JOBS_LAUNCHER`, `0740 root:TM_GROUP` -- the cache's group gets READ, so the
+  screen's user can read the launcher, which System Settings needs to add it to
+  Full Disk Access, and NOT execute. Execute would hand the group the grant
+  itself: the launcher runs my-tm with whatever arguments it is given, my-tm
+  reads the file named by `--config` as shell, and a group member can have
+  launchd start the launcher -- which is the one case where its Full Disk
+  Access counts. So `0750` is a mode the next `--install` puts right rather
+  than one it accepts (as is an older install's `0700`, which the screen's
+  user cannot read). `--install`
   rebuilds it only when it is missing or its `--version` no longer matches,
   and refuses a `JOBS_LAUNCHER`
   inside a group- or world-writable tree. Without `clang` or `codesign` the
@@ -1719,7 +1725,7 @@ BACKUP_SCHEDULE="on-boot"       # space-separated, combinable. Examples:
                                 #   on-boot 03:30 15:30 -> RunAtLoad + both times
                                 #   Mon 03:30          -> weekly
 JOBS_RUN_WITH_FULL_DISK_ACCESS=0 # 1: the jobs run my-tm through JOBS_LAUNCHER (§9)
-JOBS_LAUNCHER="/usr/local/sbin/my-tm-launcher"  # built by --install; root:TM_GROUP 0750
+JOBS_LAUNCHER="/usr/local/sbin/my-tm-launcher"  # built by --install; root:TM_GROUP 0740
 # --- backup control (from the old my-tm.sh) ---
 BACKUP_VOLUME=""                # "" = ask tmutil. Resolved ONCE at startup
 POST_BACKUP_DEFAULT="eject"     # none | unmount | eject, when a backup ends
