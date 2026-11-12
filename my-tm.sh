@@ -34,8 +34,8 @@ US="${0##*/}"
 ## so the ROOT-OWNED COPY the daemons run -- which has no git beside it -- can
 ## still say which release it is and whether it is one.
 MY_TM_VERSION="0.9.1"
-SCRIPT_COMMIT="210aa0e"
-SCRIPT_RELEASE="v0.9.1-138-g210aa0e"
+SCRIPT_COMMIT="39ee82a"
+SCRIPT_RELEASE="v0.9.1-140-g39ee82a"
 
 ## The first 12 hex of this file's own SHA-256: the value that identifies the
 ## bytes. my-tm is COPIED to its installed path, so this is what tells the
@@ -327,32 +327,13 @@ JOBS_DIR="/Library/LaunchDaemons"
 ## until it meets the same path with the // collapsed, and the two no longer
 ## compare equal.
 RUN_TMPDIR=${TMPDIR:-/tmp}; RUN_TMPDIR=${RUN_TMPDIR%/}
-RUN_DIR=$(mktemp -d "$RUN_TMPDIR/my-tm.run.XXXXXX" 2>/dev/null) || {
-	printf ' !!! cannot create a private directory for this run under %s\n' "$RUN_TMPDIR" >&2
-	exit 1
-}
+## RUN_DIR itself is made further down, right AFTER the exit traps are armed:
+## a directory created before its cleanup handler exists is one an interrupt
+## leaves behind, and the whole file is sourced in between.
 ## per-run caches of answers that do not change during a run (the location
 ## list, whether a host answers). The suite turns them off, because its tests
 ## rewrite locations.tsv directly between calls; one test turns them back on.
 RUN_CACHE=1
-## The process that made RUN_DIR, and the only one allowed to remove it. $$ is
-## the same in every subshell, so it cannot tell them apart: a subshell that
-## sets its own EXIT trap -- cmd_backup does -- would delete the directory out
-## from under the run that is still using it. This yields the pid of the shell
-## actually running, subshell or not.
-RUN_DIR_OWNER=$(exec sh -c 'echo $PPID')
-TRANSIENT_LIST="$RUN_DIR/transient"
-## Volumes WE mounted, to be put back exactly as they were. A file for the
-## same reason as above: every caller reaches this through a subshell.
-TRANSIENT_VOLUMES="$RUN_DIR/volumes"
-## Disk images WE attached, to be detached again on the way out.
-TRANSIENT_IMAGES="$RUN_DIR/images"
-## The attach running right now, if any. A file, because image_attach is
-## called inside $(...) and the pid would die with that subshell.
-ATTACH_PIDFILE="$RUN_DIR/attach.pid"
-## ...and the attach lock this run holds, so an interrupted run hands it back
-## instead of leaving the next one to wait for a dead owner and then break it
-ATTACH_LOCKFILE="$RUN_DIR/attach.lock"
 
 ## This run's temp files and directories: INSIDE RUN_DIR, so the one cleanup
 ## that removes it takes every one of them along. Each call used to name /tmp
@@ -2714,7 +2695,7 @@ image_touch() {
 ## period and released by the sweep, so a series of commands against a network
 ## store pays the attach once instead of once each.
 cleanup_images() {
-	rm -f "$TRANSIENT_IMAGES"
+	rm -f "${TRANSIENT_IMAGES:-}"
 	return 0
 }
 
@@ -2934,7 +2915,7 @@ loc_ready() {
 ## Runs AFTER the snapshot mounts are released -- a volume with a snapshot
 ## still mounted inside it is busy.
 cleanup_volumes() {
-	[ -f "$TRANSIENT_VOLUMES" ] || return 0
+	[ -f "${TRANSIENT_VOLUMES:-}" ] || return 0
 	while IFS= read -r _v; do
 		[ -n "$_v" ] || continue
 		if run diskutil unmount "$_v" >/dev/null 2>&1; then
@@ -3205,7 +3186,7 @@ snap_umount() {
 
 cleanup_transient() {
 	_rc=$?
-	[ -f "$TRANSIENT_LIST" ] || return $_rc
+	[ -f "${TRANSIENT_LIST:-}" ] || return $_rc
 	while IFS= read -r _m; do
 		[ -n "$_m" ] || continue
 		snap_umount "$_m" 0 >/dev/null 2>&1
@@ -3265,6 +3246,35 @@ trap 'cleanup_all; exit 143' TERM
 ## HUP is how a dropped ssh session ends a remote run -- without it the run
 ## died with its attach still going.
 trap 'cleanup_all; exit 129' HUP
+
+## ...and ONLY NOW the private run directory, because a resource made before
+## its handler is armed is a resource an interrupt leaks: RUN_DIR used to be
+## created at the top of the file and the traps installed ~2900 lines later,
+## so a signal arriving in between killed the shell with the directory already
+## on disk and nothing to remove it. The owner comes first for the same
+## reason -- cleanup_run_dir removes nothing when RUN_DIR_OWNER is unset.
+## The process that made RUN_DIR, and the only one allowed to remove it. $$ is
+## the same in every subshell, so it cannot tell them apart: a subshell that
+## sets its own EXIT trap -- cmd_backup does -- would delete the directory out
+## from under the run that is still using it. This yields the pid of the shell
+## actually running, subshell or not.
+RUN_DIR_OWNER=$(exec sh -c 'echo $PPID')
+RUN_DIR=$(mktemp -d "$RUN_TMPDIR/my-tm.run.XXXXXX" 2>/dev/null) || {
+	printf ' !!! cannot create a private directory for this run under %s\n' "$RUN_TMPDIR" >&2
+	exit 1
+}
+TRANSIENT_LIST="$RUN_DIR/transient"
+## Volumes WE mounted, to be put back exactly as they were. A file for the
+## same reason as above: every caller reaches this through a subshell.
+TRANSIENT_VOLUMES="$RUN_DIR/volumes"
+## Disk images WE attached, to be detached again on the way out.
+TRANSIENT_IMAGES="$RUN_DIR/images"
+## The attach running right now, if any. A file, because image_attach is
+## called inside $(...) and the pid would die with that subshell.
+ATTACH_PIDFILE="$RUN_DIR/attach.pid"
+## ...and the attach lock this run holds, so an interrupted run hands it back
+## instead of leaving the next one to wait for a dead owner and then break it
+ATTACH_LOCKFILE="$RUN_DIR/attach.lock"
 
 ## transient_snapshot <loc> <ts> -- echo the mountpoint, release it at exit.
 ## Safe to call from inside $(...): the list it appends to is a file.
@@ -11491,7 +11501,13 @@ t_test_interrupted_run_leaves_nothing() {
 	## marker rather than for ever: the cleanup the trap runs calls commands
 	## too, and a stub that never answers would hang that instead.
 	_ir_mark="$_ir_d/block"; : >"$_ir_mark"
-	printf '#!/bin/sh\nwhile [ -e "%s" ]; do sleep 0.1; done\nexit 0\n' "$_ir_mark" >"$_ir_d/stub/shasum"
+	## The stub also REPORTS that it was reached. Waiting for the run directory
+	## is not enough: that is made right after the traps are armed, but on a
+	## loaded machine the signal could still land in the startup sourcing, and
+	## then the test measured the window instead of the handler. shasum runs in
+	## the command itself, so "reached" means the run is past all of that.
+	printf '#!/bin/sh\n: >"%s"\nwhile [ -e "%s" ]; do sleep 0.1; done\nexit 0\n' \
+		"$_ir_d/reached" "$_ir_mark" >"$_ir_d/stub/shasum"
 	chmod 0755 "$_ir_d/stub/shasum"
 	## perl does two things dash cannot here: `set -m` needs a tty, so this is
 	## the only way to give the run a process group of its own to signal; and a
@@ -11504,10 +11520,12 @@ t_test_interrupted_run_leaves_nothing() {
 	_ir_pid=$!
 	_ir_i=0; _ir_saw=0
 	while [ "$_ir_i" -lt 100 ]; do
-		[ -n "$(find "$_ir_d/tmp" -name 'my-tm.run.*' 2>/dev/null)" ] && { _ir_saw=1; break; }
+		[ -e "$_ir_d/reached" ] && { _ir_saw=1; break; }
 		_ir_i=$(( _ir_i + 1 )); sleep 0.1
 	done
-	t_eq "the run's private directory is there while it runs" "$_ir_saw" "1"
+	t_eq "the run reaches its command, so the traps are armed" "$_ir_saw" "1"
+	t_eq "the run's private directory is there while it runs" \
+		"$( [ -n "$(find "$_ir_d/tmp" -name 'my-tm.run.*' 2>/dev/null)" ] && echo 1 || echo 0 )" "1"
 	kill -INT -"$_ir_pid" 2>/dev/null
 	rm -f "$_ir_mark"
 	wait "$_ir_pid"; _ir_rc=$?
@@ -11515,6 +11533,20 @@ t_test_interrupted_run_leaves_nothing() {
 	t_eq "and leaves nothing of itself behind" \
 		"$(find "$_ir_d/tmp" -mindepth 1 2>/dev/null | count_lines)" "0"
 	rm -rf "$_ir_d"
+
+	## ...and the ORDER that makes the above possible at every instant, not only
+	## once the run is going: the handler is armed BEFORE the directory exists.
+	## It used to be the other way round -- the directory at the top of the file,
+	## the traps ~2900 lines of sourcing later -- so a signal in between killed
+	## the shell with the directory already on disk and nothing to remove it.
+	## That is not reachable from a test (the window is the sourcing itself), and
+	## the exit code cannot see it either: a shell KILLED by SIGINT reports 130
+	## just as the handler does. Horse's loaded auto run hit it on 2026-11-12.
+	_ir_trap=$(awk '/^trap .cleanup_all; exit 130. INT$/ { print NR; exit }' "$T_MYTM")
+	_ir_made=$(awk '/^RUN_DIR=/ { print NR; exit }' "$T_MYTM")
+	t_eq "the interrupt handler is armed before the run directory is made" \
+		"$( [ -n "$_ir_trap" ] && [ -n "$_ir_made" ] && [ "$_ir_trap" -lt "$_ir_made" ] \
+			&& echo yes || echo "no (trap ${_ir_trap:-none}, dir ${_ir_made:-none})" )" "yes"
 }
 
 ## Naming a location by its path. Adversarial, from horse@ada: ada's my-tm was
