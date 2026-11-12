@@ -34,8 +34,8 @@ US="${0##*/}"
 ## so the ROOT-OWNED COPY the daemons run -- which has no git beside it -- can
 ## still say which release it is and whether it is one.
 MY_TM_VERSION="0.9.1"
-SCRIPT_COMMIT="e6a45d3"
-SCRIPT_RELEASE="v0.9.1-137-ge6a45d3"
+SCRIPT_COMMIT="210aa0e"
+SCRIPT_RELEASE="v0.9.1-138-g210aa0e"
 
 ## The first 12 hex of this file's own SHA-256: the value that identifies the
 ## bytes. my-tm is COPIED to its installed path, so this is what tells the
@@ -15474,7 +15474,7 @@ _rt_list() {
 	_rt status_says_waiting_not_idle         && t_test_status_says_waiting_not_idle
 	_rt location_failures_stop_the_walk      && t_test_location_failures_stop_the_walk
 	_rt index_walk_reports_its_result        && t_test_index_walk_reports_its_result
-	_rt site_conf                            && t_test_site_conf_gives_the_bases_the_search_and_the_offer
+	_rt site_conf_gives_the_bases_the_search_and_the_offer && t_test_site_conf_gives_the_bases_the_search_and_the_offer
 	_rt detached_store_still_answers         && t_test_detached_store_still_answers
 	_rt rm_needs_the_store                   && t_test_rm_needs_the_store
 	_rt volume_paths                         && t_test_volume_paths
