@@ -34,8 +34,8 @@ US="${0##*/}"
 ## so the ROOT-OWNED COPY the daemons run -- which has no git beside it -- can
 ## still say which release it is and whether it is one.
 MY_TM_VERSION="0.9.1"
-SCRIPT_COMMIT="56dff94"
-SCRIPT_RELEASE="v0.9.1-132-g56dff94"
+SCRIPT_COMMIT="e6a45d3"
+SCRIPT_RELEASE="v0.9.1-137-ge6a45d3"
 
 ## The first 12 hex of this file's own SHA-256: the value that identifies the
 ## bytes. my-tm is COPIED to its installed path, so this is what tells the
@@ -139,35 +139,50 @@ cmd_stamp_version() {
 	printf '  > the stamped sha lags HEAD by one: amending changes it. Tag AFTER this.\n'
 }
 
+err() {
+	printf ' !!! %s\n' "$1" >&2
+	exit "${2:-1}"
+}
+
+## The site's values for every tool, from SITE_CONF -- the one site path my-tm
+## knows -- read before the defaults below, which build on its bases, and before
+## any config: DATA_BASE_DIR and LOG_BASE_DIR, the directory a config is
+## searched in (CONFIG_SEARCH_DIR) and the one a config is offered in
+## (CONFIG_OFFER_DIR, with CONFIG_OFFER_NOTE beside it). The neutral values
+## first, so an exported variable never takes their place; then the file, plain
+## KEY="value" lines, when it is there. A variable only so the suite can point
+## it at a scratch file.
+SITE_CONF="/LINKS/default/site.conf"
+read_site() {
+	DATA_BASE_DIR="/var/db"; LOG_BASE_DIR="/var/log"
+	CONFIG_SEARCH_DIR=""; CONFIG_OFFER_DIR=""; CONFIG_OFFER_NOTE=""
+	[ -e "$SITE_CONF" ] || return 0
+	## there but unreadable: an error, never the neutral values -- they would
+	## keep this user's state apart from everyone else's
+	[ -r "$SITE_CONF" ] || err "cannot read $SITE_CONF -- the site's directories for every tool; its group must include $(id -un)"
+	# shellcheck source=/dev/null
+	. "$SITE_CONF" || err "$SITE_CONF failed to load"
+}
+read_site
+
 #############################################################################
 ## DEFAULTS -- all neutral.  Site values belong in the config file, never here.
+## The directories hang off the site's bases (read_site): the shared state at
+## $DATA_BASE_DIR/my-tm, each user's under $DATA_BASE_DIR/<user>/my-tm.
 #############################################################################
 
 AUTO_MOUNT_DESTINATIONS=1
 DEFAULT_CMD="status"
 TM_GROUP=""
-CACHE_DIR="/var/lib/my-tm"
+CACHE_DIR="$DATA_BASE_DIR/my-tm"
 CACHE_MODE=0750
-CACHE_DIR_USER="$HOME/Library/Caches/my-tm"
-LOG_DIR="$HOME/Library/Logs/my-tm"
+CACHE_DIR_USER="$DATA_BASE_DIR/$(id -un)/my-tm"
+LOG_DIR="$LOG_BASE_DIR/$(id -un)/my-tm"
 FIRMLINK="/tm"
-MOUNT_ROOT="/var/lib/my-tm/mount"
-## Where the site keeps its config. Honoured from the ENVIRONMENT too: the
-## search below needs this value before any config has been read, so a value
-## set inside a config file can only ever say where --install WRITES, never
-## where my-tm looks.
-## Set in the ENVIRONMENT it is an explicit override and outranks the site
-## search, exactly like $MY_TM_CONFIG and --config; set anywhere else it only
-## says where --install WRITES.
-if [ -n "${SITE_CONF_DIR:-}" ]; then SITE_CONF_DIR_FROM_ENV=1; else SITE_CONF_DIR_FROM_ENV=0; fi
-SITE_CONF_DIR="${SITE_CONF_DIR:-/usr/local/etc}"
-## The value the SEARCH uses, frozen before any config is read: a config may move
-## SITE_CONF_DIR (where --install writes), never where a plain run looks.
-SITE_CONF_DIR_SEARCH="$SITE_CONF_DIR"
-## The site's primary config directory, spelled out: it cannot come from a
-## config, because it is where the config is found. A variable only so the suite
-## can point it at a scratch directory.
-CONFIG_SITE_DIR="/LINKS/default"
+MOUNT_ROOT="$DATA_BASE_DIR/my-tm/mount"
+## Where --install copies the config it was given, when a plain run would find
+## none. Only that: where a plain run LOOKS is config_search_paths.
+SITE_CONF_DIR="/usr/local/etc"
 NOTIFY_MOUNT_WARN=1
 CACHE_TTL=3600
 USAGE_SAMPLE_INTERVAL=21600
@@ -228,8 +243,8 @@ BACKUP_VOLUME=""
 CCC_CLI="/Applications/Carbon Copy Cloner.app/Contents/MacOS/ccc"
 POST_BACKUP_DEFAULT="eject"
 NOTIFY_CMD=""
-NO_EJECT_FLAGFILE="/var/lib/my-tm/no-eject"
-LOCKFILE="/var/lib/my-tm/backup.lock"
+NO_EJECT_FLAGFILE="$DATA_BASE_DIR/my-tm/no-eject"
+LOCKFILE="$DATA_BASE_DIR/my-tm/backup.lock"
 NOTIFY_BEGIN=0
 NOTIFY_END=1
 EJECT_RETRIES=10
@@ -396,11 +411,6 @@ dbg2() {
 	return 0
 }
 
-err() {
-	printf ' !!! %s\n' "$1" >&2
-	exit "${2:-1}"
-}
-
 ## run CMD...  -- echo it under -V, then execute it.  The echoed line and the
 ## executed line come from the same argv, so they can never drift.
 run() {
@@ -431,13 +441,13 @@ _default_config_content() {
 # my-tm configuration.  Plain shell, sourced at startup.
 #
 # Search order (first existing wins):
-#   $MY_TM_CONFIG · --config <FILE> · $SITE_CONF_DIR when it came from the
-#   ENVIRONMENT · /LINKS/default/my-tm.conf (or the bare /LINKS/default/my-tm)
-#   · $SITE_CONF_DIR/my-tm.conf
-#   · ~/.my-tm.conf · /etc/my-tm.conf · /usr/local/etc/my-tm.conf
-# /LINKS/default is spelled out on purpose: a search keyed on a value that
-# lives INSIDE a config file cannot find that file.
-# When both a shared and a host-specific file sit at the site location, the
+#   $MY_TM_CONFIG · --config <FILE> · $CONFIG_SEARCH_DIR/my-tm.conf (or the
+#   bare $CONFIG_SEARCH_DIR/my-tm) · ~/.my-tm.conf · /etc/my-tm.conf
+#   · /usr/local/etc/my-tm.conf
+# CONFIG_SEARCH_DIR, DATA_BASE_DIR and LOG_BASE_DIR come from the site file,
+# /LINKS/default/site.conf, read before this one; without it there is no
+# search directory, and the bases are /var/db and /var/log.
+# When both a shared and a host-specific file sit in the search directory, the
 # host-specific one is my-tm.conf and the shared one is my-tm.conf.GLOBAL;
 # my-tm sources .GLOBAL first, then my-tm.conf on top.
 
@@ -449,12 +459,13 @@ AUTO_MOUNT_DESTINATIONS=1       # a destination that is attached but not
 DEFAULT_CMD="status"            # what a bare `my-tm` runs; params allowed
 TM_GROUP=""                     # group with read access to the shared cache;
                                 # "" = the invoking user's primary group
-CACHE_DIR="/var/lib/my-tm"; CACHE_MODE=0750
-CACHE_DIR_USER="$HOME/Library/Caches/my-tm"
-LOG_DIR="$HOME/Library/Logs/my-tm"
+CACHE_DIR="$DATA_BASE_DIR/my-tm"; CACHE_MODE=0750   # shared: root writes
+CACHE_DIR_USER="$DATA_BASE_DIR/$(id -un)/my-tm"     # this user's own
+LOG_DIR="$LOG_BASE_DIR/$(id -un)/my-tm"
 FIRMLINK="/tm"                  # /etc/synthetic.conf entry made by --install
-MOUNT_ROOT="/var/lib/my-tm/mount"
-SITE_CONF_DIR="/usr/local/etc"  # where --install puts my-tm.conf
+MOUNT_ROOT="$DATA_BASE_DIR/my-tm/mount"
+SITE_CONF_DIR="/usr/local/etc"  # where --install copies my-tm.conf when a
+                                # plain run would find none
 NOTIFY_MOUNT_WARN=1             # also notify when a mount TTL looks unsafe
 CACHE_TTL=3600                  # s; older -> rescan mounted locations
 USAGE_SAMPLE_INTERVAL=21600     # s; a slow heartbeat for store-size drift that
@@ -648,8 +659,8 @@ POST_BACKUP_DEFAULT="eject"     # what happens when a backup finishes:
 CCC_CLI="/Applications/Carbon Copy Cloner.app/Contents/MacOS/ccc"
                                 # the ccc engine's command line tool
 NOTIFY_CMD=""                   # optional external notifier; empty = osascript
-NO_EJECT_FLAGFILE="/var/lib/my-tm/no-eject"
-LOCKFILE="/var/lib/my-tm/backup.lock"
+NO_EJECT_FLAGFILE="$DATA_BASE_DIR/my-tm/no-eject"
+LOCKFILE="$DATA_BASE_DIR/my-tm/backup.lock"
 NOTIFY_BEGIN=0; NOTIFY_END=1
 EJECT_RETRIES=10; EJECT_WAIT=5
 LSOF_TIMEOUT=10                 # s the mount sweep waits for lsof. lsof walks
@@ -660,39 +671,28 @@ LSOF_TIMEOUT=10                 # s the mount sweep waits for lsof. lsof walks
 _CFG_EOF
 }
 
-## echo every config file to source, in order (base first, override last)
-## Where a config is looked for, in order.  /LINKS/default comes first and is
-## SPELLED OUT: a search that depended on $SITE_CONF_DIR could only find the
-## value inside the config file it has not found yet, and one gated on $LINKS
-## being exported skips the location silently in a root shell.
-config_search_dirs() {
-	[ "$SITE_CONF_DIR_FROM_ENV" = "1" ] && printf '%s\n' "$SITE_CONF_DIR_SEARCH"
-	printf '%s\n' "$CONFIG_SITE_DIR" "$SITE_CONF_DIR_SEARCH" "$HOME" /etc /usr/local/etc
-}
-
-## The same list as PATHS, for telling the user where we looked.  One source
-## for the search and for the message, so they cannot drift.
+## Where a plain run looks for a config, in order: the site's search directory
+## (CONFIG_SEARCH_DIR, from read_site) when there is one, then ~, /etc and
+## /usr/local/etc. In the search directory BOTH spellings count: a site's
+## config directory may hold some names with a .conf suffix and some without,
+## so knowing only one of them ignores a file sitting right there.
 config_search_paths() {
-	for _cs_d in $(config_search_dirs); do
-		case "$_cs_d" in
-			"$HOME") printf '%s/.my-tm.conf\n' "$_cs_d" ;;
-			## Under /LINKS/default BOTH spellings count: the site's config
-			## farm holds some names with a .conf suffix and some without, so
-			## knowing only one of them ignores a file sitting right there.
-			"$CONFIG_SITE_DIR") printf '%s/my-tm.conf\n%s/my-tm\n' "$_cs_d" "$_cs_d" ;;
-			*)       printf '%s/my-tm.conf\n' "$_cs_d" ;;
-		esac
-	done
+	[ -z "$CONFIG_SEARCH_DIR" ] || printf '%s\n' "$CONFIG_SEARCH_DIR/my-tm.conf" "$CONFIG_SEARCH_DIR/my-tm"
+	printf '%s\n' "$HOME/.my-tm.conf" /etc/my-tm.conf /usr/local/etc/my-tm.conf
 }
 
-## Where to OFFER writing one when none was found: the site location first,
-## then the system one, then the user's -- ordered by how often each is the
-## right answer, which is NOT the search order ($HOME is searched before
-## /etc). Each is checked against the real search list, so this can never
-## point at a file my-tm would not read.
+## Where to OFFER writing one, most common place first: the site's offer
+## directory -- only where the site's search directory is searched, which a
+## file there reaches as CONFIG_OFFER_NOTE says; never the search directory
+## itself -- then the system one, then the user's. That is NOT the search
+## order ($HOME is searched before /etc). The last two are checked against the
+## real search list, so the offer can never point at a file my-tm would not read.
 config_offer_paths() {
+	if [ -n "$CONFIG_OFFER_DIR" ] && [ -n "$CONFIG_SEARCH_DIR" ]; then
+		printf '%s\n' "$CONFIG_OFFER_DIR/my-tm.conf"
+	fi
 	_co_all=$(config_search_paths)
-	for _co_p in "$CONFIG_SITE_DIR/my-tm.conf" /etc/my-tm.conf "$HOME/.my-tm.conf"; do
+	for _co_p in /etc/my-tm.conf "$HOME/.my-tm.conf"; do
 		printf '%s\n' "$_co_all" | grep -qxF "$_co_p" && printf '%s\n' "$_co_p"
 	done
 	return 0
@@ -701,7 +701,7 @@ config_offer_paths() {
 ## The first config a plain run finds. It iterates config_search_paths -- the
 ## very list the missing-config offer is filtered through -- so what my-tm
 ## offers and what it loads cannot drift. A private directory walk here once
-## offered /LINKS/default/my-tm while only ever loading my-tm.conf.
+## offered the bare name my-tm while only ever loading my-tm.conf.
 config_search_first() {
 	for _f in $(config_search_paths); do
 		if [ -f "$_f" ]; then
@@ -7997,15 +7997,37 @@ install_config() {
 		warn "$SITE_CONF_DIR does not exist -- the config was not copied"
 		return 0
 	fi
-	## a copy a plain run will not read is no help: offer where it does look
-	if ! config_search_paths | grep -qxF "$_ic_dst"; then
+	## a copy a plain run will not read is no help: offer where it does look.
+	## The site's offer directory is reached too, the way its note says.
+	if [ "$_ic_dst" = "$CONFIG_OFFER_DIR/my-tm.conf" ] && config_offer_paths | grep -qxF "$_ic_dst"; then
+		[ -z "$CONFIG_OFFER_NOTE" ] || minor "$_ic_dst: $CONFIG_OFFER_NOTE"
+	elif ! config_search_paths | grep -qxF "$_ic_dst"; then
 		warn "a plain '$US' will not look at $_ic_dst"
 		note "put it where it does look, most common place first:"
 		config_offer_paths | while IFS= read -r _ic_p; do
-			if [ -f "$_ic_p" ]; then minor "vimdiff $_ic_dst $_ic_p"; else minor "cp $_ic_dst $_ic_p"; fi
+			if [ -f "$_ic_p" ]; then _ic_how="vimdiff"; else _ic_how="cp"; fi
+			if [ "$_ic_p" = "$CONFIG_OFFER_DIR/my-tm.conf" ] && [ -n "$CONFIG_OFFER_NOTE" ]; then
+				minor "$_ic_how $_ic_dst $_ic_p   ($CONFIG_OFFER_NOTE)"
+			else
+				minor "$_ic_how $_ic_dst $_ic_p"
+			fi
 		done
 	fi
 	return 0
+}
+
+## Where --install writes the defaults on a host with no config at all: the
+## first offered place a plain run SEARCHES. Never the site's offer directory:
+## a file there is read only once another tool links it (CONFIG_OFFER_NOTE),
+## and every machine shares it -- one host's neutral defaults do not belong there.
+config_bootstrap_path() {
+	_cb_all=$(config_search_paths)
+	while IFS= read -r _cb_p; do
+		printf '%s\n' "$_cb_all" | grep -qxF -- "$_cb_p" && { printf '%s\n' "$_cb_p"; return 0; }
+	done <<_EOF
+$(config_offer_paths)
+_EOF
+	printf '%s/my-tm.conf\n' "$SITE_CONF_DIR"
 }
 
 cmd_install() {
@@ -8029,8 +8051,7 @@ cmd_install() {
 		## meant to set a machine up demanded that the machine be set up. Write
 		## the defaults and carry on -- they are neutral, which is why the run
 		## ends by telling someone to look at them.
-		_ic_new=$(config_offer_paths | awk 'NR == 1 { p = $0 } END { print p }')
-		[ -n "$_ic_new" ] || _ic_new="$SITE_CONF_DIR/my-tm.conf"
+		_ic_new=$(config_bootstrap_path)
 		need_dir "$(dirname "$_ic_new")" || err "cannot create $(dirname "$_ic_new") for the config"
 		_default_config_content >"$_ic_new" || err "cannot write $_ic_new"
 		msg "no config found -- wrote the defaults to $_ic_new"
@@ -8235,7 +8256,7 @@ install_remote() {
 	run ssh_attended "$_h" "$_ir_cmd" || {
 		## The remote's output has streamed straight through, so anything it
 		## printed reads as though it came from HERE -- and a path like
-		## /LINKS/default/my-tm.conf exists on both machines, so there is nothing
+		## the site's config path exists on both machines, so there is nothing
 		## in it to say otherwise. Name the host that spoke.
 		warn "$_h: remote --install failed -- any message above it is ${_h}'s my-tm, about ${_h}'s configuration"
 		_ir_ok=0
@@ -9358,6 +9379,9 @@ t_setup() {
 	CACHE_TTL=3600
 	## hermetic: loc_param re-reads the loaded config files
 	CONFIG_SOURCED=""
+	## hermetic: a site file of the suite's own, absent until a test writes it,
+	## so no search reaches the real site's config directory
+	SITE_CONF="$T_ROOT/site.conf"; read_site
 	HOME="$T_ROOT/home"
 	PATH="$(t_stub_dir):$PATH"
 	export PATH HOME
@@ -10091,7 +10115,7 @@ t_test_volume_paths() {
 	fi
 }
 
-## REGRESSION: without --install an ordinary user cannot create /var/lib/my-tm,
+## REGRESSION: without --install an ordinary user cannot create the shared root,
 ## so every mount failed and lookup answered "0 versions" -- indistinguishable
 ## from "your file was never backed up".
 t_test_mount_root_fallback() {
@@ -10917,10 +10941,9 @@ t_test_every_default_is_offered() {
 	t_ne "the defaults block was found at all" "$_ed_d" ""
 	_ed_c=$(cmd_create_config | awk "$_ed_names" | sort -u)
 	## Deliberately not settings, each for a reason that is in the source next
-	## to it: the first two are HOW the config is found, so they cannot come
-	## from one; the last three are mechanism, not policy -- a leak reaper, a
-	## mount bound, and a cache generation that only a code change may bump.
-	_ed_skip=" CONFIG_SITE_DIR SITE_CONF_DIR_SEARCH TRANSIENT_TTL LOOKUP_CHUNK VS_GENERATION "
+	## to it: mechanism, not policy -- a leak reaper, a mount bound, and a cache
+	## generation that only a code change may bump.
+	_ed_skip=" TRANSIENT_TTL LOOKUP_CHUNK VS_GENERATION "
 	_ed_miss=""
 	for _ed_v in $_ed_d; do
 		case "$_ed_skip" in *" $_ed_v "*) continue ;; esac
@@ -13051,23 +13074,54 @@ t_test_no_exclusive_size_claims() {
 		"$(count_match 'tmutil uniquesize' < "$(t_calls)")" "0"
 }
 
-## REGRESSION: SITE_CONF_DIR is used to FIND the config, but was only settable
-## INSIDE a config -- which is circular, so a site that keeps its config outside
-## /etc or /usr/local/etc could never be found, including the one --install had
-## just written there.
-t_test_site_conf_dir_from_env() {
-	printf '\nConfig search honours SITE_CONF_DIR from the environment\n'
-	_d="$T_ROOT/site"; mkdir -p "$_d"
-	printf 'CACHE_TTL=4242\n' >"$_d/my-tm.conf"
-	printf 'CACHE_TTL=1111\nID_LEN=7\n' >"$_d/my-tm.conf.GLOBAL"
-	_out=$(SITE_CONF_DIR="$_d" MY_TM_CONFIG='' "$T_MYTM" -D --version 2>&1)
-	t_match "the site config is found" "$_out" "$_d/my-tm.conf"
-	t_match "and the shared base is sourced first" "$_out" "my-tm.conf.GLOBAL"
-	_order=$(printf '%s\n' "$_out" | grep -c "GLOBAL")
-	t_eq "both files are sourced" "$_order" "1"
-	## base first, override on top: the local value must win
-	_ttl=$(SITE_CONF_DIR="$_d" MY_TM_CONFIG='' "$T_MYTM" -D --version 2>&1 | count_match "my-tm.conf")
-	t_ne "the search really ran" "$_ttl" "0"
+## The site file: its values when it is there, the neutral ones when it is
+## not -- an exported variable never in their place -- an error when it is
+## there but unreadable. Adversarial: the directories are asserted from the
+## DEFAULTS block and the --create-config text as they really run, after the
+## site file, so a default left on a literal path fails here; the search reads
+## the site's directory first, the shared .GLOBAL before the host's file; and
+## the defaults --install writes never land in the offer directory every
+## machine shares.
+t_test_site_conf_gives_the_bases_the_search_and_the_offer() {
+	printf '\nThe site file gives the bases, the search and the offer\n'
+	_sc_save="$SITE_CONF"; _sc_home="$HOME"
+	SITE_CONF="$T_ROOT/sc-site.conf"; rm -f "$SITE_CONF"
+	t_eq "without the file: the neutral values, an exported one ignored" \
+		"$( (DATA_BASE_DIR=/elsewhere; export DATA_BASE_DIR; read_site
+		    printf '%s|%s|%s|%s' "$DATA_BASE_DIR" "$LOG_BASE_DIR" "$CONFIG_SEARCH_DIR" "$CONFIG_OFFER_DIR") 2>&1)" \
+		"/var/db|/var/log||"
+
+	_sc_f="$T_ROOT/sc-farm"; _sc_g="$T_ROOT/sc-global"; HOME="$T_ROOT/sc-home"
+	mkdir "$_sc_f" "$HOME"
+	printf '%s\n' 'DATA_BASE_DIR="/srv/data"' 'LOG_BASE_DIR="/srv/log"' "CONFIG_SEARCH_DIR=\"$_sc_f\"" \
+		"CONFIG_OFFER_DIR=\"$_sc_g\"" 'CONFIG_OFFER_NOTE="linked there by a run"' >"$SITE_CONF"
+	_sc_u=$(id -un)
+	_sc_want="/srv/data/my-tm|/srv/data/$_sc_u/my-tm|/srv/log/$_sc_u/my-tm|/srv/data/my-tm/mount|/srv/data/my-tm/no-eject|/srv/data/my-tm/backup.lock"
+	# shellcheck disable=SC2016  # evaluated later, in the subshell that sets them
+	_sc_dirs='printf "%s|%s|%s|%s|%s|%s" "$CACHE_DIR" "$CACHE_DIR_USER" "$LOG_DIR" "$MOUNT_ROOT" "$NO_EJECT_FLAGFILE" "$LOCKFILE"'
+	t_eq "the built-in directories hang off the site's bases" \
+		"$( (read_site; eval "$(awk '/^## DEFAULTS -- all neutral/ {d = 1; next}
+		                              /^## RUNTIME STATE \(never in the config\)/ {d = 0} d' "$T_MYTM")"
+		     eval "$_sc_dirs") 2>&1)" "$_sc_want"
+	t_eq "and so do the ones --create-config writes" \
+		"$( (read_site; eval "$(cmd_create_config)"; eval "$_sc_dirs") 2>&1)" "$_sc_want"
+
+	read_site
+	printf 'CACHE_TTL=1111\nID_LEN=7\n' >"$_sc_f/my-tm.conf.GLOBAL"
+	printf 'CACHE_TTL=4242\n' >"$_sc_f/my-tm.conf"
+	t_eq "the site's search directory is read: the shared file first, then the host's" \
+		"$(config_search_first | tr '\n' ' ')" "$_sc_f/my-tm.conf.GLOBAL $_sc_f/my-tm.conf "
+	t_eq "--install's defaults go where a plain run looks, not to the shared offer directory" \
+		"$(config_bootstrap_path)" "/etc/my-tm.conf"
+
+	chmod 000 "$SITE_CONF"
+	_sc_o=$( (read_site) 2>&1); _sc_rc=$?
+	chmod 600 "$SITE_CONF"
+	t_eq "there but unreadable: an error, not the neutral values" \
+		"$_sc_rc $(printf '%s\n' "$_sc_o" | count_match "cannot read $SITE_CONF")" "1 1"
+
+	rm -rf "$_sc_f" "$HOME" "$SITE_CONF"
+	SITE_CONF="$_sc_save"; HOME="$_sc_home"; read_site
 }
 
 ## REGRESSION: a store that is not attached answered -J with an empty array and
@@ -13647,7 +13701,7 @@ t_test_user_on_a_root_cache() {
 		printf 'MOUNT_ROOT="%s"\nLOG_DIR="%s"\nFIRMLINK="%s"\n' "$_ur/mount" "$_ur/log" "$_ur/mount"
 	} >"$_ur/conf"
 	# shellcheck disable=SC2069  # stderr ONLY: that is what is being judged
-	_ur_run() { MY_TM_CONFIG="$_ur/conf" SITE_CONF_DIR="$_ur/nosite" dash "$T_MYTM" "$@" 2>&1 >/dev/null; }
+	_ur_run() { MY_TM_CONFIG="$_ur/conf" dash "$T_MYTM" "$@" 2>&1 >/dev/null; }
 	## anything but my-tm's own prefixes is a leak: a shell error, a tool's
 	_ur_leaks() { printf '%s\n' "$1" | grep -v -e '^ !!! ' -e '^ --> ' -e '^ >>> ' -e '^    > ' \
 		-e '^ ~~~ ' -e '^ERROR ' -e '^$' -e '^  *[^ ]' || true; }
@@ -13781,9 +13835,6 @@ t_test_previous_is_not_a_state() {
 ## reporting the right one -- ejecting a disk whose policy says unmount, or
 ## touching a disk the flag file says to leave alone.  Every case asserts the
 ## diskutil call that reached the stub, never what my-tm said it did.
-## REGRESSION: the search was keyed on $SITE_CONF_DIR, whose site value lives
-## INSIDE the config file -- so /LINKS/default, the primary location, was never
-## looked at and a config sitting right there was silently ignored.
 ## A sparsebundle on a share takes minutes to attach and hdiutil says nothing
 ## while it does, so my-tm now reports elapsed time. The danger in adding ANY
 ## output here is the bug the stderr rule exists for: image_attach is called
@@ -13852,15 +13903,15 @@ t_test_install_config() {
 	## running the suite must take no part. Saved and restored explicitly, so
 	## nothing leaks into the tests that run after this one.
 	_ic_run() {
-		_ic_v1="$CONFIG_SITE_DIR"; _ic_v2="$SITE_CONF_DIR_SEARCH"
-		_ic_v3="$SITE_CONF_DIR_FROM_ENV"; _ic_v4="$HOME"
+		_ic_v1="$CONFIG_SEARCH_DIR"; _ic_v2="$CONFIG_OFFER_DIR"
+		_ic_v4="$HOME"
 		_ic_v5="${MY_TM_CONFIG:-}"; _ic_v6="$CONFIG_FILE"; _ic_v7="$SITE_CONF_DIR"
-		CONFIG_SITE_DIR="$_ic_root/site"; SITE_CONF_DIR_SEARCH="$_ic_root/nowhere"
-		SITE_CONF_DIR_FROM_ENV=0; HOME="$_ic_root/home"
+		CONFIG_SEARCH_DIR="$_ic_root/site"; CONFIG_OFFER_DIR=""
+		HOME="$_ic_root/home"
 		MY_TM_CONFIG=''; CONFIG_FILE="$_ic_s"; SITE_CONF_DIR="$_ic_root/write"
 		install_config "$_ic_s" >"$_ic_root/out" 2>&1
-		CONFIG_SITE_DIR="$_ic_v1"; SITE_CONF_DIR_SEARCH="$_ic_v2"
-		SITE_CONF_DIR_FROM_ENV="$_ic_v3"; HOME="$_ic_v4"
+		CONFIG_SEARCH_DIR="$_ic_v1"; CONFIG_OFFER_DIR="$_ic_v2"
+		HOME="$_ic_v4"
 		MY_TM_CONFIG="$_ic_v5"; CONFIG_FILE="$_ic_v6"; SITE_CONF_DIR="$_ic_v7"
 		cat "$_ic_root/out"
 	}
@@ -14629,80 +14680,58 @@ t_test_attach_progress() {
 
 t_test_config_search_order() {
 	printf '\nConfig search order\n'
-	_cso_save="$SITE_CONF_DIR_FROM_ENV"
-
-	SITE_CONF_DIR_FROM_ENV=0
-	t_eq "the primary location is searched FIRST" \
-		"$(config_search_dirs | sed -n '1p')" "/LINKS/default"
-	t_eq "and it is spelled out, not derived from a config value" \
-		"$(config_search_dirs | count_match '$')" "0"
-
-	## the escape hatch keeps its rank: an env var is an explicit override,
-	## the same class as $MY_TM_CONFIG and --config
-	## Simulated the way a real run gets it: the ENVIRONMENT's value, frozen
-	## before any config loads. Adversarial: SITE_CONF_DIR itself still holds
-	## whatever the loaded config set, so a search that used it would fail here.
-	_se_v="$SITE_CONF_DIR_SEARCH"; SITE_CONF_DIR_SEARCH="$T_ROOT/from-env"
-	SITE_CONF_DIR_FROM_ENV=1
-	t_eq "SITE_CONF_DIR from the environment still wins" \
-		"$(config_search_dirs | sed -n '1p')" "$T_ROOT/from-env"
-	t_eq "with the primary location right behind it" \
-		"$(config_search_dirs | sed -n '2p')" "/LINKS/default"
-	SITE_CONF_DIR_FROM_ENV=0; SITE_CONF_DIR_SEARCH="$_se_v"
+	_cso_s="$SITE_CONF"; _cso_h="$HOME"
+	_cso_f="$T_ROOT/cso-farm"; _cso_g="$T_ROOT/cso-global"
+	SITE_CONF="$T_ROOT/cso-site.conf"; HOME="$T_ROOT/cso-home"
+	mkdir "$_cso_f" "$HOME"
+	printf 'CONFIG_SEARCH_DIR="%s"\nCONFIG_OFFER_DIR="%s"\n' "$_cso_f" "$_cso_g" >"$SITE_CONF"
+	read_site
 
 	## the paths the user is TOLD about are the paths that were searched --
 	## naming one hand-picked location is what sent people to the wrong file
-	t_eq "every searched dir yields a path (the site one yields both spellings)" \
-		"$(config_search_paths | count_lines)" \
-		"$(( $(config_search_dirs | count_lines) + 1 ))"
-	t_eq "the site location is searched under its .conf name" \
-		"$(config_search_paths | count_match '/LINKS/default/my-tm.conf')" "1"
-	t_eq "and under the bare name the farm also uses" \
-		"$(config_search_paths | grep -cxF '/LINKS/default/my-tm')" "1"
-	t_match "the primary one is offered first" \
-		"$(config_search_paths | sed -n '1p')" "/LINKS/default/my-tm.conf"
-	t_match "and \$HOME renders as a dotfile" \
-		"$(config_search_paths)" "$HOME/.my-tm.conf"
+	t_eq "the site's search directory first, both spellings, then ~, /etc, /usr/local/etc" \
+		"$(config_search_paths | tr '\n' ' ')" \
+		"$_cso_f/my-tm.conf $_cso_f/my-tm $HOME/.my-tm.conf /etc/my-tm.conf /usr/local/etc/my-tm.conf "
 
-	## REGRESSION: the list offered the bare /LINKS/default/my-tm, but the
-	## loader walked its own directory list and only ever tried my-tm.conf.
+	## REGRESSION: the list offered the bare name, but the loader walked its
+	## own directory list and only ever tried my-tm.conf.
 	## Adversarial: the bare name is the ONLY config there is.
-	_cf_v1="$CONFIG_SITE_DIR"; _cf_v2="$HOME"
-	_cf_v3="$SITE_CONF_DIR_SEARCH"; _cf_v4="$SITE_CONF_DIR_FROM_ENV"
-	_cf_d="$T_ROOT/site-bare"; mkdir -p "$_cf_d" "$T_ROOT/home-bare"
-	printf 'ID_LEN=6\n' >"$_cf_d/my-tm"
-	CONFIG_SITE_DIR="$_cf_d"; HOME="$T_ROOT/home-bare"
-	SITE_CONF_DIR_SEARCH="$T_ROOT/nowhere-bare"; SITE_CONF_DIR_FROM_ENV=0
-	_cf_found=$(config_search_first | tail -n 1)
-	CONFIG_SITE_DIR="$_cf_v1"; HOME="$_cf_v2"
-	SITE_CONF_DIR_SEARCH="$_cf_v3"; SITE_CONF_DIR_FROM_ENV="$_cf_v4"
-	t_eq "a config under the bare name is actually loaded" "$_cf_found" "$_cf_d/my-tm"
-	rm -rf "$_cf_d" "$T_ROOT/home-bare"
+	printf 'ID_LEN=6\n' >"$_cso_f/my-tm"
+	t_eq "a config under the bare name is actually loaded" \
+		"$(config_search_first | tail -n 1)" "$_cso_f/my-tm"
+	rm -f "$_cso_f/my-tm"
 
 	## What a user with no config is TOLD to do. Ordered by how often each
 	## place is the right answer -- site, then system, then user -- which is
 	## deliberately NOT the search order, so it is never described as one.
-	t_eq "the site location is offered first" \
-		"$(config_offer_paths | sed -n '1p')" "/LINKS/default/my-tm.conf"
-	t_eq "then the system one" \
-		"$(config_offer_paths | sed -n '2p')" "/etc/my-tm.conf"
-	t_eq "then the user's" \
-		"$(config_offer_paths | sed -n '3p')" "$HOME/.my-tm.conf"
+	t_eq "the site's offer directory first, then the system one, then the user's" \
+		"$(config_offer_paths | tr '\n' ' ')" "$_cso_g/my-tm.conf /etc/my-tm.conf $HOME/.my-tm.conf "
 
-	## REGRESSION-GUARD: the offer must never name a file my-tm would not
-	## read. Every offered path has to be in the real search list -- so a
-	## later edit to the search cannot leave the message pointing at a
-	## location that is no longer consulted.
-	_cso_orphans=0
-	config_offer_paths | while IFS= read -r _cso_p; do
-		config_search_paths | grep -qxF "$_cso_p" || _cso_orphans=1
-		[ "$_cso_orphans" = "1" ] && printf 'ORPHAN %s\n' "$_cso_p"
-	done >"$T_ROOT/offer.check"
-	t_eq "every offered path is one that is actually searched" \
-		"$(count_lines < "$T_ROOT/offer.check")" "0"
-	rm -f "$T_ROOT/offer.check"
+	## REGRESSION-GUARD: the offer must never name a file my-tm would not read:
+	## each offered path is searched, or is the site's offer directory while its
+	## search directory is searched. The search directory itself, a directory
+	## another tool builds, is never offered. With the site file, with an offer
+	## directory alone, and with none.
+	_cso_bad=""
+	for _cso_with in site offer-only none; do
+		[ "$_cso_with" = offer-only ] && printf 'CONFIG_OFFER_DIR="%s"\n' "$_cso_g" >"$SITE_CONF"
+		[ "$_cso_with" = none ] && rm -f "$SITE_CONF"
+		read_site
+		while IFS= read -r _cso_p; do
+			case "$_cso_p" in
+				"$_cso_f/"*) _cso_bad="$_cso_bad $_cso_with:$_cso_p(the search directory)" ;;
+				"$_cso_g/my-tm.conf")
+					config_search_paths | grep -qxF "$_cso_f/my-tm.conf" || _cso_bad="$_cso_bad $_cso_with:$_cso_p" ;;
+				*)	config_search_paths | grep -qxF -- "$_cso_p" || _cso_bad="$_cso_bad $_cso_with:$_cso_p" ;;
+			esac
+		done <<_EOF
+$(config_offer_paths)
+_EOF
+	done
+	t_eq "every offered path is one a plain run reaches" "${_cso_bad:-none}" "none"
 
-	SITE_CONF_DIR_FROM_ENV="$_cso_save"
+	rm -rf "$_cso_f" "$HOME" "$SITE_CONF"
+	SITE_CONF="$_cso_s"; HOME="$_cso_h"; read_site
 }
 
 ## What happens to the disk when the backup was NOT ours. Adversarial: on horse
@@ -15226,7 +15255,7 @@ t_test_post_backup() {
 
 t_test_version_output() {
 	printf '\n--version\n'
-	## a config of its own: the machine's (/LINKS/default/my-tm.conf) is not the
+	## a config of its own: the machine's (in the site's search directory) is not the
 	## test's -- an old key name in it made this fail on one machine only
 	: >"$T_ROOT/version.conf"
 	_err=$( MY_TM_CONFIG="$T_ROOT/version.conf" "$T_MYTM" --version 2>&1 >/dev/null )
@@ -15445,7 +15474,7 @@ _rt_list() {
 	_rt status_says_waiting_not_idle         && t_test_status_says_waiting_not_idle
 	_rt location_failures_stop_the_walk      && t_test_location_failures_stop_the_walk
 	_rt index_walk_reports_its_result        && t_test_index_walk_reports_its_result
-	_rt site_conf_dir_from_env               && t_test_site_conf_dir_from_env
+	_rt site_conf                            && t_test_site_conf_gives_the_bases_the_search_and_the_offer
 	_rt detached_store_still_answers         && t_test_detached_store_still_answers
 	_rt rm_needs_the_store                   && t_test_rm_needs_the_store
 	_rt volume_paths                         && t_test_volume_paths

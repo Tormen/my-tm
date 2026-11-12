@@ -1006,7 +1006,7 @@ change before making it.
 
    ```text
    # my-tm: browse Time Machine snapshots as directories, see `my-tm --help`
-   tm	private/var/lib/my-tm/mount
+   tm	private/var/db/my-tm/mount
    ```
 
    Name from `$FIRMLINK` (default `/tm`), added uncommented — it is
@@ -1583,7 +1583,7 @@ A `PATH` is *covered* by a location when the volume UUID of `PATH`
 ## 13. Caches, logs, config *(spec)*
 
 ```text
-/var/lib/my-tm/            SHARED — root:$TM_GROUP, mode 0750: root writes,
+$DATA_BASE_DIR/my-tm/      SHARED ($CACHE_DIR) — root:$TM_GROUP, mode 0750: root writes,
                             the group reads, others see nothing
     locations.tsv           HANDLE, TARGET, remote install dir — maintained by
                             add / forget (root), never hand-merged config
@@ -1594,10 +1594,15 @@ A `PATH` is *covered* by a location when the volume UUID of `PATH`
     mounts.cache            root's own mount records (§8)
     index/                  the name index (§7) -- here only, root writes it
     mount/                  the /tm tree (§8)
-~/Library/Caches/my-tm/    this user's own cache ($CACHE_DIR_USER): snapshot
+$DATA_BASE_DIR/<user>/my-tm/
+                            this user's own cache ($CACHE_DIR_USER): snapshot
                             table, answers of live lookups, mount records
-~/Library/Logs/my-tm/      $LOG_DIR: my-tm.log (+ -D/-DD targets)
+$LOG_BASE_DIR/<user>/my-tm/
+                            $LOG_DIR: my-tm.log (+ -D/-DD targets)
 ```
+
+`DATA_BASE_DIR` and `LOG_BASE_DIR` come from the site file (below); without it
+they are `/var/db` and `/var/log`. `<user>` is the user my-tm runs as.
 
 **The snapshot cache carries its own checksum**, on its first line rather than
 in a file beside it, so it is swapped atomically with the content it describes —
@@ -1615,7 +1620,7 @@ what that user may read. A non-root run that would have to write it builds
 nothing and names the command instead (the location list likewise):
 
 ```text
-!!! /var/lib/mine/my-tm/index is the shared name index: needs root -- rerun as root: my-tm index horse
+!!! /var/db/my-tm/index is the shared name index: needs root -- rerun as root: my-tm index horse
 ```
 
 Deterministic IDs (§5) mean concurrent writers can never disagree. Writes are atomic (tmpfile + `mv`), and a written file takes its mode from its
@@ -1625,31 +1630,36 @@ Caches are line-oriented TSV: greppable, human-readable, rebuilt by `refresh`.
 `status`'s footer reports their size, so they never grow unnoticed.
 
 **Neutral defaults, site values in the config.** Every default built into
-my-tm is generic — `/var/lib/my-tm`, `~/Library/Logs/my-tm` (`$LOG_DIR`, which the daemons use too: each job's stdout goes to `<label>.log`, its stderr to `<label>.err`), job labels under
+my-tm is generic — the directories above, under `/var/db` and `/var/log`
+without a site file (`$LOG_DIR` is the daemons' too: each job's stdout goes to
+`<label>.log`, its stderr to `<label>.err`), job labels under
 `local.my-tm.*`, no group, no notifier. Anything that reflects one site's
 conventions (a private reverse-domain for launchd labels, a shared admin group,
-a site-wide config directory, a preferred notifier) is set in the config file,
-which stays local. Nothing that ships carries a hostname, a user name, a private
-path or a real document name — not in the code, not in the defaults, not in the
-examples in this README. The single exception is the `/LINKS/default` config
-location below, and it is deliberate.
+a preferred notifier) is set in the config file, which stays local. Nothing
+that ships carries a hostname, a user name, a private path or a real document
+name — not in the code, not in the defaults, not in the examples in this
+README. The single exception is the site file below, and it is deliberate.
+
+**The site file, `/LINKS/default/site.conf`,** is read when it exists, before
+the defaults and before any config: plain `KEY="value"` lines shared by every
+tool of a site. my-tm takes `DATA_BASE_DIR` and `LOG_BASE_DIR` (the bases of
+its directories), `CONFIG_SEARCH_DIR` (searched for a config, below), and
+`CONFIG_OFFER_DIR` with `CONFIG_OFFER_NOTE` (where a config is offered, and how
+a file there reaches the search directory). Without it: `/var/db`, `/var/log`,
+no search directory, no site offer. There but unreadable: an error, never the
+fallback. Never the environment: launchd, sudo and other tools' runs do not
+read a shell's rc file, so an exported value would make one machine keep its
+state in two places depending on who started my-tm. A key my-tm's own config
+sets still wins.
 
 Config search order (first wins): `$MY_TM_CONFIG` · `--config FILE` ·
-`$SITE_CONF_DIR` **when it was set in the environment** ·
-`/LINKS/default/my-tm.conf` (or the bare `/LINKS/default/my-tm`) ·
-`$SITE_CONF_DIR/my-tm.conf` · `~/.my-tm.conf` ·
-`/etc/my-tm.conf` · `/usr/local/etc/my-tm.conf`. Plain shell, `.`-sourced.
-`--create-config` prints it (or writes `FILE`, never overwriting); with no
-config anywhere, my-tm names every path it searched, one ready-to-run
-`--create-config` line each.
+`$CONFIG_SEARCH_DIR/my-tm.conf` (or the bare `$CONFIG_SEARCH_DIR/my-tm`) ·
+`~/.my-tm.conf` · `/etc/my-tm.conf` · `/usr/local/etc/my-tm.conf`. Plain
+shell, `.`-sourced. `--create-config` prints it (or writes `FILE`, never
+overwriting); with no config anywhere, my-tm runs on these defaults (`-D` says
+so).
 
-`/LINKS/default` is the one site path written into the code. A search keyed on
-a value that lives *inside* a config file cannot find that file, and one gated
-on `$LINKS` being exported skips the location silently in a root shell — so the
-primary location is spelled out. It is a directory name and reveals nothing;
-everything else site-specific stays in the config.
-
-**Two files at the site location.** Where `$SITE_CONF_DIR` is a merged
+**Two files at the site location.** Where `$CONFIG_SEARCH_DIR` is a merged
 directory whose entries can come from a shared tree or a host-specific one, the
 host-specific file wins and the shared one remains visible beside it as
 `my-tm.conf.GLOBAL`. my-tm therefore sources **`my-tm.conf.GLOBAL` first when it
@@ -1659,10 +1669,11 @@ machines in the shared file and only the per-host deltas in the local one — an
 degenerates to plain "the local one wins" whenever the local file is complete.
 `-D` prints which files were sourced, in order.
 
-`--install` needs a config to exist (`$MY_TM_CONFIG`, `--config`, or one already
-in the search order) and refuses with a one-line pointer to `--create-config`
-otherwise: it installs job labels, directories and a group that are all
-site-specific, and guessing them is worse than asking.
+`--install` on a host with no config at all writes the defaults to the first
+offered place a plain run searches (`/etc/my-tm.conf`) and ends with a red
+TODO to review them: job labels, directories and the group are site-specific.
+Never to `$CONFIG_OFFER_DIR`: every machine shares it, and a file there is read
+only once it reaches the search directory.
 
 When a plain run would already find a config, `--install` copies **nothing** —
 a second copy would only drift — and if that config differs from the one you
@@ -1670,7 +1681,8 @@ pointed it at, it prints the `vimdiff` that merges them. Only when a plain run
 would find none does it copy the file to `$SITE_CONF_DIR/my-tm.conf` —
 **renamed**, so a `my-tm.local.conf` you keep out of version control lands as
 the plain `my-tm.conf`. It never overwrites a different file there (it offers
-`vimdiff` instead), and says so when a plain run would not look there either.
+`vimdiff` instead), and when a plain run would not look there either, it offers
+the places it does: `$CONFIG_OFFER_DIR` (with `$CONFIG_OFFER_NOTE`), `/etc`, `~`.
 
 ```sh
 # Locations live in $CACHE_DIR/locations.tsv, maintained by add / forget —
@@ -1682,13 +1694,13 @@ the plain `my-tm.conf`. It never overwrites a different file there (it offers
 DEFAULT_CMD="status"          # what a bare `my-tm` runs; params allowed
 TM_GROUP=""                     # group with read access to the shared cache;
                                 # "" = the invoking user's primary group
-CACHE_DIR="/var/lib/my-tm"; CACHE_MODE=0750
-CACHE_DIR_USER="$HOME/Library/Caches/my-tm"
-LOG_DIR="$HOME/Library/Logs/my-tm"
+CACHE_DIR="$DATA_BASE_DIR/my-tm"; CACHE_MODE=0750   # shared: root writes
+CACHE_DIR_USER="$DATA_BASE_DIR/$(id -un)/my-tm"     # this user's own
+LOG_DIR="$LOG_BASE_DIR/$(id -un)/my-tm"
 FIRMLINK="/tm"                  # /etc/synthetic.conf entry made by --install
-MOUNT_ROOT="/var/lib/my-tm/mount"
-SITE_CONF_DIR="/usr/local/etc"  # where --install puts my-tm.conf; see the
-                                # search order above for every place my-tm looks
+MOUNT_ROOT="$DATA_BASE_DIR/my-tm/mount"
+SITE_CONF_DIR="/usr/local/etc"  # where --install copies my-tm.conf when a
+                                # plain run would find none
 NOTIFY_MOUNT_WARN=1             # also notify when a mount TTL looks unsafe
 CACHE_TTL=3600                  # s; older -> rescan mounted locations
 INDEX_BASELINES="newest oldest" # snapshots index walks when none are named
@@ -1746,8 +1758,8 @@ JOBS_LAUNCHER="/usr/local/sbin/my-tm-launcher"  # built by --install; root:TM_GR
 BACKUP_VOLUME=""                # "" = ask tmutil. Resolved ONCE at startup
 POST_BACKUP_DEFAULT="eject"     # none | unmount | eject, when a backup ends
 NOTIFY_CMD=""                   # optional external notifier; empty = osascript
-NO_EJECT_FLAGFILE="/var/lib/my-tm/no-eject"
-LOCKFILE="/var/lib/my-tm/backup.lock"
+NO_EJECT_FLAGFILE="$DATA_BASE_DIR/my-tm/no-eject"
+LOCKFILE="$DATA_BASE_DIR/my-tm/backup.lock"
 NOTIFY_BEGIN=0; NOTIFY_END=1    # via $NOTIFY_CMD (§14)
 EJECT_RETRIES=10; EJECT_WAIT=5
 
