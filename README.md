@@ -1646,8 +1646,9 @@ tool of a site. my-tm takes `DATA_BASE_DIR` and `LOG_BASE_DIR` (the bases of
 its directories), `CONFIG_SEARCH_DIR` (searched for a config, below), and
 `CONFIG_OFFER_DIR` with `CONFIG_OFFER_NOTE` (where a config is offered, and how
 a file there reaches the search directory). Without it: `/var/db`, `/var/log`,
-no search directory, no site offer. There but unreadable: an error, never the
-fallback. Never the environment: launchd, sudo and other tools' runs do not
+no search directory, no site offer. There but unreadable -- or a link to
+nothing, or behind a folder my-tm cannot search, so it cannot tell -- an
+error, never the fallback. Never the environment: launchd, sudo and other tools' runs do not
 read a shell's rc file, so an exported value would make one machine keep its
 state in two places depending on who started my-tm. A key my-tm's own config
 sets still wins.

@@ -144,6 +144,22 @@ err() {
 	exit "${2:-1}"
 }
 
+# sh: 0 not there, 1 there ([ -r ] it: unreadable is the error), 2 cannot tell
+site_absent() {
+	_sa_p=$1
+	[ -e "$_sa_p" ] && return 1
+	[ -L "$_sa_p" ] && return 2
+	while :; do
+		_sa_d=$(dirname -- "$_sa_p")
+		[ "$_sa_d" = "$_sa_p" ] && return 0
+		if [ -e "$_sa_d" ] || [ -L "$_sa_d" ]; then
+			[ -d "$_sa_d" ] && [ -x "$_sa_d" ] && return 0
+			return 2
+		fi
+		_sa_p=$_sa_d
+	done
+}
+
 ## The site's values for every tool, from SITE_CONF -- the one site path my-tm
 ## knows -- read before the defaults below, which build on its bases, and before
 ## any config: DATA_BASE_DIR and LOG_BASE_DIR, the directory a config is
@@ -156,9 +172,11 @@ SITE_CONF="/LINKS/default/site.conf"
 read_site() {
 	DATA_BASE_DIR="/var/db"; LOG_BASE_DIR="/var/log"
 	CONFIG_SEARCH_DIR=""; CONFIG_OFFER_DIR=""; CONFIG_OFFER_NOTE=""
-	[ -e "$SITE_CONF" ] || return 0
+	_rs_rc=0; site_absent "$SITE_CONF" || _rs_rc=$?
+	[ "$_rs_rc" = 0 ] && return 0
 	## there but unreadable: an error, never the neutral values -- they would
 	## keep this user's state apart from everyone else's
+	[ "$_rs_rc" = 2 ] && err "cannot tell whether $SITE_CONF is there -- a link to nothing, or a folder on the way $(id -un) cannot search"
 	[ -r "$SITE_CONF" ] || err "cannot read $SITE_CONF -- the site's directories for every tool; its group must include $(id -un)"
 	# shellcheck source=/dev/null
 	. "$SITE_CONF" || err "$SITE_CONF failed to load"
@@ -13124,6 +13142,30 @@ t_test_site_conf_gives_the_bases_the_search_and_the_offer() {
 	SITE_CONF="$_sc_save"; HOME="$_sc_home"; read_site
 }
 
+## The site file behind a folder this user cannot search, or a link to
+## nothing: read_site cannot tell whether it is there -- an error, never the
+## neutral values ([ -e ] says "no" for both); plainly absent, the neutral ones.
+t_test_site_conf_unsearchable_is_an_error() {
+	printf '\nThe site file behind a closed folder, or a link to nothing, is an error\n'
+	_su_save="$SITE_CONF"
+	mkdir "$T_ROOT/su-closed"
+	printf 'DATA_BASE_DIR="/srv/data"\n' >"$T_ROOT/su-closed/site.conf"
+	chmod 000 "$T_ROOT/su-closed"
+	ln -s "$T_ROOT/su-nowhere.conf" "$T_ROOT/su-dangling.conf"
+	for _su_c in "$T_ROOT/su-closed/site.conf" "$T_ROOT/su-dangling.conf"; do
+		SITE_CONF="$_su_c"
+		_su_o=$( (read_site) 2>&1); _su_rc=$?
+		t_eq "${_su_c##*/su-}: an error naming the file, not the neutral values" \
+			"$_su_rc $(printf '%s\n' "$_su_o" | count_match "cannot tell whether $_su_c is there")" "1 1"
+	done
+	chmod 700 "$T_ROOT/su-closed"
+	SITE_CONF="$T_ROOT/su-absent.conf"
+	t_eq "plainly absent: the neutral values" \
+		"$( (read_site; printf '%s|%s' "$LOG_BASE_DIR" "$CONFIG_SEARCH_DIR") 2>&1)" "/var/log|"
+	rm -rf "$T_ROOT/su-closed" "$T_ROOT/su-dangling.conf"
+	SITE_CONF="$_su_save"; read_site
+}
+
 ## REGRESSION: a store that is not attached answered -J with an empty array and
 ## made every <ID> in it unresolvable, so rm/show/mount all said "no such
 ## snapshot" about backups my-tm had listed a moment earlier. The last known
@@ -15475,6 +15517,7 @@ _rt_list() {
 	_rt location_failures_stop_the_walk      && t_test_location_failures_stop_the_walk
 	_rt index_walk_reports_its_result        && t_test_index_walk_reports_its_result
 	_rt site_conf_gives_the_bases_the_search_and_the_offer && t_test_site_conf_gives_the_bases_the_search_and_the_offer
+	_rt site_conf_unsearchable_is_an_error   && t_test_site_conf_unsearchable_is_an_error
 	_rt detached_store_still_answers         && t_test_detached_store_still_answers
 	_rt rm_needs_the_store                   && t_test_rm_needs_the_store
 	_rt volume_paths                         && t_test_volume_paths
