@@ -658,6 +658,13 @@ $CACHE_DIR/index/<loc>.versions/ -> the version store: a baseline plus one
 * **Sensible default**: `INDEX_BASELINES="newest oldest"` — two walks catch
   everything that exists now plus everything that existed at the start.
   `index <ID>...` adds specific snapshots; `index --all` does the lot.
+  Run BY HAND it is refused wherever the grant is the launcher's: the Full
+  Disk Access that counts belongs to a launchd-started launcher (above), and
+  none of my-tm's three jobs -- health-check, maintenance, backup -- does a
+  full walk. So a one-off sweep has no route, and a back catalogue fills in
+  only as new backups arrive. Building a route for it was declined (the user,
+  2026-11-12): thinning reaches those old snapshots sooner than a walk would,
+  so it would buy depth of catalogue and nothing else.
 * **Size — measured, not guessed.** A measured system `locate` database holds
   3.5 M filenames in 35 MB: **10.5 bytes per path**,
   7 % of the raw text. So one fully-walked 4.5 M-file snapshot is about
