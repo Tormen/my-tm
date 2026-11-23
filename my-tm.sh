@@ -34,8 +34,8 @@ US="${0##*/}"
 ## so the ROOT-OWNED COPY the daemons run -- which has no git beside it -- can
 ## still say which release it is and whether it is one.
 MY_TM_VERSION="0.9.1"
-SCRIPT_COMMIT="00821bd"
-SCRIPT_RELEASE="v0.9.1-142-g00821bd"
+SCRIPT_COMMIT="69e857c"
+SCRIPT_RELEASE="v0.9.1-143-g69e857c"
 
 ## The first 12 hex of this file's own SHA-256: the value that identifies the
 ## bytes. my-tm is COPIED to its installed path, so this is what tells the
@@ -410,9 +410,9 @@ dbg2() {
 	return 0
 }
 
-## run CMD...  -- echo it under -V, then execute it.  The echoed line and the
+## run_traced CMD...  -- echo it under -V, then execute it.  The echoed line and the
 ## executed line come from the same argv, so they can never drift.
-run() {
+run_traced() {
 	[ "$VRB" = "1" ] && printf ' >>> %s\n' "$*" >&2
 	"$@"
 }
@@ -1049,8 +1049,8 @@ git_commit_write() {    # <path> <why>
 	[ -n "$_gcw_top" ] || return 0
 	[ -n "$(git -C "$_gcw_top" status --porcelain -- "$_gcw_p" 2>/dev/null)" ] || return 0
 
-	if run git -C "$_gcw_top" add -- "$_gcw_p" &&
-	   run git -C "$_gcw_top" commit -q -m "$US: $_gcw_why" -- "$_gcw_p"; then
+	if run_traced git -C "$_gcw_top" add -- "$_gcw_p" &&
+	   run_traced git -C "$_gcw_top" commit -q -m "$US: $_gcw_why" -- "$_gcw_p"; then
 		msg "committed $_gcw_p in $_gcw_top -- $_gcw_why"
 		return 0
 	fi
@@ -2897,7 +2897,7 @@ loc_open() {
 	[ "$(volume_state "$_name")" = "unmounted" ] || return 1
 	msg "'$_name' is attached but not mounted -- mounting it"
 	why "and unmounting it again when this command is done, so it is left as it was found"
-	if ! run diskutil mount "$_name" >/dev/null 2>&1; then
+	if ! run_traced diskutil mount "$_name" >/dev/null 2>&1; then
 		warn "could not mount $_name -- it will not be searched"
 		return 1
 	fi
@@ -2918,7 +2918,7 @@ cleanup_volumes() {
 	[ -f "${TRANSIENT_VOLUMES:-}" ] || return 0
 	while IFS= read -r _v; do
 		[ -n "$_v" ] || continue
-		if run diskutil unmount "$_v" >/dev/null 2>&1; then
+		if run_traced diskutil unmount "$_v" >/dev/null 2>&1; then
 			dbg "unmounted $_v again, as it was found"
 		else
 			warn "could not unmount $_v again -- it was not mounted before this ran"
@@ -3114,7 +3114,7 @@ snap_mount() {
 		return 0
 	fi
 	need_dir "$_mp" || { warn "cannot create mountpoint: $_mp"; return 1; }
-	## echo the command, then silence only ITS output: "run cmd >/dev/null 2>&1"
+	## echo the command, then silence only ITS output: "run_traced cmd >/dev/null 2>&1"
 	## swallows the echo too, which made -V hide the very calls it exists to show
 	run_echo mount_apfs -o nobrowse -s "$_apfs" "$_vol_src" "$_mp"
 	## its error is KEPT for the warning below: without it a failure cannot
@@ -5336,7 +5336,7 @@ cmd_find_in_snapshot() {
 	_mp=$(transient_snapshot "$_loc" "$_ts") || err "could not mount $_ts"
 	_base=$(mnt_volume_path "$_loc" "$_ts" "$_vol")
 	msg "walking $(ts_display "$_ts") live (no index needed, and slow)"
-	run find "$_base" -name "$_glob" 2>/dev/null | sed "s|^$_base||"
+	run_traced find "$_base" -name "$_glob" 2>/dev/null | sed "s|^$_base||"
 	cleanup_transient
 	return 0
 }
@@ -5647,7 +5647,7 @@ cmd_cat() {
 		err "remote cat failed"
 	fi
 	[ -f "$_full" ] || err "$_rel: not in that snapshot"
-	run cat "$_full"
+	run_traced cat "$_full"
 	return 0
 }
 
@@ -5663,7 +5663,7 @@ cmd_open() {
 		_tmpf="$_od/$(basename "$_rel")"
 		cmd_cat "$1" "$2" >"$_tmpf" || err "could not fetch the remote file"
 		msg "fetched to $_tmpf -- it stays there, nothing cleans it up"
-		run open "$_tmpf"
+		run_traced open "$_tmpf"
 		return 0
 	fi
 	[ -e "$_full" ] || err "$_rel: not in that snapshot"
@@ -5673,7 +5673,7 @@ cmd_open() {
 	rm -f "$TRANSIENT_LIST"
 	snap_mount "$_loc2" "$_ts2" 1800 "" >/dev/null
 	why "kept for 30 minutes so the application can still read it"
-	run open "$_full"
+	run_traced open "$_full"
 	return 0
 }
 
@@ -5694,7 +5694,7 @@ cmd_cp() {
 		return 0
 	fi
 	[ -e "$_full" ] || err "$_rel: not in that snapshot"
-	run cp -p "$_full" "$_dest" || err "copy failed"
+	run_traced cp -p "$_full" "$_dest" || err "copy failed"
 	msg "wrote $_dest"
 	return 0
 }
@@ -5711,7 +5711,7 @@ cmd_diff() {
 
 	if [ -n "${2:-}" ]; then
 		_rel=$(path_in_volume "$(abs_path "$2")")
-		run diff -r "$_base$_rel" "$(abs_path "$2")"
+		run_traced diff -r "$_base$_rel" "$(abs_path "$2")"
 		return 0
 	fi
 	if [ "${_files:--}" != "-" ]; then
@@ -5720,7 +5720,7 @@ cmd_diff() {
 			printf "roughly %d-%d min", (lo < 1 ? 1 : lo), (hi < 2 ? 2 : hi) }')
 		note "$(human_count "$_files") files, $_eta. Ctrl-C is safe."
 	fi
-	run tmutil compare "$_base" "/System/Volumes/Data"
+	run_traced tmutil compare "$_base" "/System/Volumes/Data"
 	return 0
 }
 
@@ -6069,7 +6069,7 @@ index_remote() {
 	remote_job "$_h" index "$(remote_path "$_t")" || return 1
 	if [ "${SHADOW_SSH_INDEX_FILES:-1}" = "1" ]; then
 		_dir=$(index_dir); need_dir "$_dir"
-		run scp_batch "$_rhost:$CACHE_DIR/index/*.db" "$_dir/" 2>/dev/null ||
+		run_traced scp_batch "$_rhost:$CACHE_DIR/index/*.db" "$_dir/" 2>/dev/null ||
 			dbg "no index database on $_rhost to shadow yet"
 	fi
 	return 0
@@ -6271,7 +6271,7 @@ cmd_verify() {
 #############################################################################
 
 cmd_fs_snap() {
-	run tmutil localsnapshot || err "could not take a local snapshot"
+	run_traced tmutil localsnapshot || err "could not take a local snapshot"
 	why "an APFS snapshot: metadata only, and PURGEABLE -- macOS deletes it under pressure"
 	return 0
 }
@@ -6299,7 +6299,7 @@ _EOF
 	fi
 	for _ts in $_drop; do
 		msg "thinning local snapshot $_ts (oldest first, mine and macOS's alike)"
-		run tmutil deletelocalsnapshots "$_ts" >/dev/null 2>&1
+		run_traced tmutil deletelocalsnapshots "$_ts" >/dev/null 2>&1
 	done
 	return 0
 }
@@ -6659,9 +6659,9 @@ cmd_rm() {
 	while IFS="$(printf '\t')" read -r _loc _ts _id _u; do
 		_rm_locs="$_rm_locs $_loc"
 		if [ "$(loc_target "$_loc")" = "local" ]; then
-			run tmutil deletelocalsnapshots "$_ts" || warn "$_id: delete failed"
+			run_traced tmutil deletelocalsnapshots "$_ts" || warn "$_id: delete failed"
 		else
-			run tmutil delete -d "$(loc_store_path "$_loc")" -t "$_ts" || warn "$_id: delete failed"
+			run_traced tmutil delete -d "$(loc_store_path "$_loc")" -t "$_ts" || warn "$_id: delete failed"
 		fi
 	done <"$_plan"
 	rm -f "$_plan"
@@ -6818,9 +6818,9 @@ cmd_thin() {
 		while IFS= read -r _ts; do
 			[ -n "$_ts" ] || continue
 			if [ "$(loc_target "$_h")" = "local" ]; then
-				run tmutil deletelocalsnapshots "$_ts" || warn "$_ts: delete failed"
+				run_traced tmutil deletelocalsnapshots "$_ts" || warn "$_ts: delete failed"
 			else
-				run tmutil delete -d "$(loc_store_path "$_h")" -t "$_ts" || warn "$_ts: delete failed"
+				run_traced tmutil delete -d "$(loc_store_path "$_h")" -t "$_ts" || warn "$_ts: delete failed"
 			fi
 		done
 		snapshots_cache_drop "$_thin_h"
@@ -7052,7 +7052,7 @@ do_post_backup() {
 	_i=1
 	while [ "$_i" -le "$EJECT_RETRIES" ]; do
 		sync
-		if run "$@" >/dev/null 2>&1; then
+		if run_traced "$@" >/dev/null 2>&1; then
 			msg "$_pol done on $_pv (attempt $_i)"
 			[ "$_pol" = "eject" ] &&
 				why "the drive parks now; the next backup brings it back"
@@ -7083,7 +7083,7 @@ cmd_trigger() {
 	[ -n "$_tr_job" ] || err "no backup job is configured (BACKUP_JOB)"
 	[ -f "$JOBS_DIR/$_tr_job.plist" ] ||
 		err "$_tr_job is not installed, so there is nothing to ask -- $US --install writes it"
-	run launchctl kickstart "system/$_tr_job" ||
+	run_traced launchctl kickstart "system/$_tr_job" ||
 		err "could not ask $_tr_job to run a backup (launchctl kickstart)"
 	msg "asked $_tr_job to run a backup now"
 	why "it runs as its own launchd job, so this returns at once and the backup outlives this process"
@@ -7109,14 +7109,14 @@ backup_ccc() {                  # start|stop
 	_cc_vol=$(printf '%s' "$_cc" | cut -f 2)
 
 	if [ "$1" = "stop" ]; then
-		run "$CCC_CLI" --stop="$_cc_task"
+		run_traced "$CCC_CLI" --stop="$_cc_task"
 		return 0
 	fi
 
-	[ -d "/Volumes/$_cc_vol" ] || run diskutil mount "$_cc_vol" ||
+	[ -d "/Volumes/$_cc_vol" ] || run_traced diskutil mount "$_cc_vol" ||
 		err "could not mount $_cc_vol for the ccc task '$_cc_task'"
 	[ "$NOTIFY_BEGIN" = "1" ] && notify "CCC backup '$_cc_task' starting"
-	run "$CCC_CLI" --start="$_cc_task" --watch
+	run_traced "$CCC_CLI" --start="$_cc_task" --watch
 	_cc_rc=$?
 	if [ "$_cc_rc" = "0" ]; then
 		msg "ccc task '$_cc_task' finished [rc $_cc_rc]"
@@ -7188,7 +7188,7 @@ cmd_backup() {
 	if [ "$_action" = "stop" ]; then
 		case "$BACKUP_ENGINE" in
 			ccc) backup_ccc stop ;;
-			*)   run tmutil stopbackup ;;
+			*)   run_traced tmutil stopbackup ;;
 		esac
 		backup_run_cmd "POST_BACKUP_CMD" "$POST_BACKUP_CMD"
 		do_post_backup
@@ -7211,10 +7211,10 @@ cmd_backup() {
 
 	_bv=$(backup_volume)
 	if [ -n "$_bv" ] && [ ! -d "/Volumes/$_bv" ]; then
-		run diskutil mount "$_bv" || err "could not mount $_bv"
+		run_traced diskutil mount "$_bv" || err "could not mount $_bv"
 	fi
 	[ "$NOTIFY_BEGIN" = "1" ] && notify "Time Machine backup starting"
-	run tmutil startbackup --block
+	run_traced tmutil startbackup --block
 	## its own name: the cache writers below set _rc
 	_bk_rc=$?
 	## tmutil's exit code alone is not the truth: ask Time Machine what it
@@ -7537,20 +7537,20 @@ _EOF
 			return 0
 			;;
 		--add-destination) shift; require_root "--setup --add-destination"
-			run tmutil setdestination -a "$1"; return $? ;;
+			run_traced tmutil setdestination -a "$1"; return $? ;;
 		--rm-destination) shift; require_root "--setup --rm-destination"
-			run tmutil removedestination "$1"; return $? ;;
-		--enable)  require_root "--setup --enable";  run tmutil enable;  return $? ;;
-		--disable) require_root "--setup --disable"; run tmutil disable; return $? ;;
+			run_traced tmutil removedestination "$1"; return $? ;;
+		--enable)  require_root "--setup --enable";  run_traced tmutil enable;  return $? ;;
+		--disable) require_root "--setup --disable"; run_traced tmutil disable; return $? ;;
 		--exclude) shift
 			_p="$1"; _sticky=""
 			[ "${2:-}" = "-p" ] && _sticky="-p"
-			if [ -n "$_sticky" ]; then run tmutil addexclusion -p "$_p"; else run tmutil addexclusion "$_p"; fi
+			if [ -n "$_sticky" ]; then run_traced tmutil addexclusion -p "$_p"; else run_traced tmutil addexclusion "$_p"; fi
 			return $? ;;
-		--unexclude) shift; run tmutil removeexclusion "$1"; return $? ;;
-		--is-excluded) shift; run tmutil isexcluded "$1"; return $? ;;
+		--unexclude) shift; run_traced tmutil removeexclusion "$1"; return $? ;;
+		--is-excluded) shift; run_traced tmutil isexcluded "$1"; return $? ;;
 		--quota) shift; require_root "--setup --quota"
-			run tmutil setquota "$1"; return $? ;;
+			run_traced tmutil setquota "$1"; return $? ;;
 	esac
 
 	msg "Time Machine setup -- nothing is written without your confirmation"
@@ -7735,7 +7735,7 @@ launcher_build() {
 	_lb_dir=$(tmp_dir launcher) || return 1
 	launcher_source >"$_lb_dir/my-tm-launcher.c"
 	_lb_hash=$(md5_file "$_lb_dir/my-tm-launcher.c")
-	if ! run clang -Wall -Wextra -Werror -O2 \
+	if ! run_traced clang -Wall -Wextra -Werror -O2 \
 			-DMY_TM_PATH="\"$_lb_bin\"" -DLAUNCHER_SOURCE_HASH="\"$_lb_hash\"" \
 			-DMY_TM_RUN_UID="${LAUNCHER_RUN_UID:-0}" \
 			-o "$_lb_dir/my-tm-launcher" "$_lb_dir/my-tm-launcher.c" >"$_lb_dir/build.log" 2>&1; then
@@ -7744,7 +7744,7 @@ launcher_build() {
 		rm -rf "$_lb_dir"
 		return 1
 	fi
-	if ! run codesign -s - -f -i my-tm-launcher "$_lb_dir/my-tm-launcher" >"$_lb_dir/sign.log" 2>&1; then
+	if ! run_traced codesign -s - -f -i my-tm-launcher "$_lb_dir/my-tm-launcher" >"$_lb_dir/sign.log" 2>&1; then
 		warn "the launcher could not be signed:"
 		sed 's/^/     /' "$_lb_dir/sign.log" >&2
 		rm -rf "$_lb_dir"
@@ -7798,9 +7798,9 @@ fda_add() { # <launcher>
 	_fa_r="$(cd -P "$(dirname "$1")" 2>/dev/null && pwd)/$(basename "$1")"
 	_fa_ids=$("$_fa_c" list 2>/dev/null | grep -F "$_fa_r" | cut -f 1)
 	if [ -n "$_fa_ids" ]; then
-		printf '%s\n' "$_fa_ids" | run "$_fa_c" remove go || return 1
+		printf '%s\n' "$_fa_ids" | run_traced "$_fa_c" remove go || return 1
 	fi
-	run "$_fa_c" add "$1"
+	run_traced "$_fa_c" add "$1"
 }
 
 ## Put a launcher for MY-TM-PATH at LAUNCHER, owned root:GROUP 0740, unless
@@ -7814,7 +7814,7 @@ launcher_install() {
 		if ! launcher_perms_ok "$_li_path" "root:$_li_grp"; then
 			# shellcheck disable=SC2012  # the mode, owner and group columns only
 			_li_was=$(ls -ld "$_li_path" | awk '{ print substr($1, 1, 10) " " $3 ":" $4 }')
-			if ! run chown "root:$_li_grp" "$_li_path" || ! run chmod 0740 "$_li_path"; then
+			if ! run_traced chown "root:$_li_grp" "$_li_path" || ! run_traced chmod 0740 "$_li_path"; then
 				warn "could not make the launcher $_li_path root:$_li_grp 0740"
 				return 1
 			fi
@@ -7826,8 +7826,8 @@ launcher_install() {
 	need_dir "$(dirname "$_li_path")" || { warn "cannot create $(dirname "$_li_path")"; return 1; }
 	_li_new="$(dirname "$_li_path")/.my-tm-launcher.new.$$"
 	launcher_build "$_li_bin" "$_li_new" || return 1
-	if ! run chown "root:$_li_grp" "$_li_new" || ! run chmod 0740 "$_li_new" ||
-	   ! run mv -f "$_li_new" "$_li_path"; then
+	if ! run_traced chown "root:$_li_grp" "$_li_new" || ! run_traced chmod 0740 "$_li_new" ||
+	   ! run_traced mv -f "$_li_new" "$_li_path"; then
 		rm -f "$_li_new"
 		warn "could not install the launcher at $_li_path"
 		return 1
@@ -7986,8 +7986,8 @@ write_job() {
 	chmod 0644 "$_pl" 2>/dev/null
 	msg "installed job $_label"
 	minor "$_pl -> $_prog $*"
-	run launchctl unload "$_pl" >/dev/null 2>&1
-	run launchctl load "$_pl" >/dev/null 2>&1 || warn "could not load $_label"
+	run_traced launchctl unload "$_pl" >/dev/null 2>&1
+	run_traced launchctl load "$_pl" >/dev/null 2>&1 || warn "could not load $_label"
 	return 0
 }
 
@@ -8020,7 +8020,7 @@ install_config() {
 			minor "merge them: vimdiff $_ic_src $_ic_dst"
 		fi
 	elif [ -d "$SITE_CONF_DIR" ]; then
-		run cp "$_ic_src" "$_ic_dst" && minor "copied $_ic_src -> $_ic_dst"
+		run_traced cp "$_ic_src" "$_ic_dst" && minor "copied $_ic_src -> $_ic_dst"
 	else
 		warn "$SITE_CONF_DIR does not exist -- the config was not copied"
 		return 0
@@ -8141,10 +8141,10 @@ cmd_install() {
 	## once per file, and it walks a whole backup to do it. The directory is
 	## the boundary -- own what my-tm WRITES, never descend into what it
 	## MOUNTS. $MOUNT_ROOT is a plain directory itself, so it is named here.
-	run find "$CACHE_DIR" -path "$MOUNT_ROOT" -prune -o \
+	run_traced find "$CACHE_DIR" -path "$MOUNT_ROOT" -prune -o \
 		-exec chown "root:$_group" {} + || warn "chown failed under $CACHE_DIR"
-	run chown "root:$_group" "$MOUNT_ROOT" || warn "chown failed on $MOUNT_ROOT"
-	run chmod "$CACHE_MODE" "$CACHE_DIR" "$MOUNT_ROOT" || warn "chmod failed"
+	run_traced chown "root:$_group" "$MOUNT_ROOT" || warn "chown failed on $MOUNT_ROOT"
+	run_traced chmod "$CACHE_MODE" "$CACHE_DIR" "$MOUNT_ROOT" || warn "chmod failed"
 	why "root writes, the group reads, others see nothing -- the daemons act on what is in here"
 
 	## Time Machine must not back up my-tm's own tree: $MOUNT_ROOT holds mounted
@@ -8152,7 +8152,7 @@ cmd_install() {
 	## rewrites every MAINT_INTERVAL, while the rest is derived data my-tm
 	## rebuilds. Seen on horse: backupd walking mount/local/... while the entries
 	## vanished under it ("Failed to read sticky exclusion extended attribute").
-	if run tmutil addexclusion -p "$CACHE_DIR"; then
+	if run_traced tmutil addexclusion -p "$CACHE_DIR"; then
 		msg "excluded $CACHE_DIR from Time Machine backups"
 	else
 		warn "could not exclude $CACHE_DIR from Time Machine -- run: tmutil addexclusion -p $CACHE_DIR"
@@ -8274,14 +8274,14 @@ install_remote() {
 		return 0
 	fi
 	if [ -z "$_ir_found" ]; then
-		run scp_attended "$(abs_path "$0")" "$_h:$_idir/my-tm" || { warn "$_h: copy failed"; return 1; }
+		run_traced scp_attended "$(abs_path "$0")" "$_h:$_idir/my-tm" || { warn "$_h: copy failed"; return 1; }
 	fi
 	_ir_ok=1
 	# shellcheck disable=SC2029  # building the remote command line here is the point
 	## chmod only a copy we just put there; a found one keeps the host's modes
 	if [ -n "$_ir_found" ]; then _ir_cmd="$_idir/my-tm --install go"
 	else _ir_cmd="chmod 0755 $_idir/my-tm && $_idir/my-tm --install go"; fi
-	run ssh_attended "$_h" "$_ir_cmd" || {
+	run_traced ssh_attended "$_h" "$_ir_cmd" || {
 		## The remote's output has streamed straight through, so anything it
 		## printed reads as though it came from HERE -- and a path like
 		## the site's config path exists on both machines, so there is nothing
@@ -8333,7 +8333,7 @@ uninstall_remote() {
 		_ur_cmd="$_ur_dir/my-tm --uninstall go"
 		minor "leaving $_ur_dir/my-tm in place -- it is $_ur_h's own, not one --install copied"
 	fi
-	run ssh_attended "$_ur_h" "$_ur_cmd" ||
+	run_traced ssh_attended "$_ur_h" "$_ur_cmd" ||
 		warn "$_ur_h: remote --uninstall failed -- any message above it is ${_ur_h}'s my-tm"
 	if [ -n "${_ur_loc:-}" ] && [ -n "$(loc_install_dir "$_ur_loc")" ]; then
 		locations_writable "--uninstall $_ur_h"
@@ -8371,7 +8371,7 @@ cmd_uninstall() {
 	[ "$_go" = "1" ] || return 0
 
 	if [ -e "$JOBS_LAUNCHER" ]; then
-		if run rm -f "$JOBS_LAUNCHER"; then
+		if run_traced rm -f "$JOBS_LAUNCHER"; then
 			msg "removed the launcher $JOBS_LAUNCHER"
 			git_commit_write "$JOBS_LAUNCHER" "--uninstall removed the launcher"
 		fi
@@ -8380,8 +8380,8 @@ cmd_uninstall() {
 	for _j in "$MAINT_JOB" "$HEALTH_JOB" $(backup_jobs_all); do
 		_pl="$JOBS_DIR/$_j.plist"
 		[ -f "$_pl" ] || continue
-		run launchctl unload "$_pl" >/dev/null 2>&1
-		run rm -f "$_pl"
+		run_traced launchctl unload "$_pl" >/dev/null 2>&1
+		run_traced rm -f "$_pl"
 		msg "removed job $_j"
 	done
 
@@ -8403,13 +8403,13 @@ cmd_uninstall() {
 		minor "$FIRMLINK itself disappears at the next reboot"
 	fi
 
-	run tmutil removeexclusion -p "$CACHE_DIR" >/dev/null 2>&1 &&
+	run_traced tmutil removeexclusion -p "$CACHE_DIR" >/dev/null 2>&1 &&
 		msg "removed the Time Machine exclusion for $CACHE_DIR"
 
 	printf 'delete %s too? the index is expensive to rebuild [y/N] ' "$CACHE_DIR"
 	read -r _ans
 	case "$_ans" in
-		y|Y) run rm -rf "$CACHE_DIR"; msg "removed $CACHE_DIR" ;;
+		y|Y) run_traced rm -rf "$CACHE_DIR"; msg "removed $CACHE_DIR" ;;
 		*) minor "kept $CACHE_DIR" ;;
 	esac
 	return 0
@@ -12296,8 +12296,8 @@ t_test_ssh_never_becomes_a_master() {
 	_sm_bad=$(awk -v t="$_sm_t" '
 		NR >= t { exit }
 		/^[[:space:]]*#/ { next }
-		/(^|[{;&|(]|if |run |! )[[:space:]]*ssh -G[[:space:]]/ { next }   # prints the config, connects nowhere
-		/(^|[{;&|(]|if |run |! )[[:space:]]*(ssh|scp)[[:space:]]/ {
+		/(^|[{;&|(]|if |run_traced |! )[[:space:]]*ssh -G[[:space:]]/ { next }   # prints the config, connects nowhere
+		/(^|[{;&|(]|if |run_traced |! )[[:space:]]*(ssh|scp)[[:space:]]/ {
 			line = $0; n = NR
 			while (line ~ /\\$/ && (getline nx) > 0) line = line nx
 			if (line !~ /ControlMaster=no/ || line !~ /ClearAllForwardings=yes/) print n ": " line
@@ -13250,14 +13250,14 @@ t_test_rm_needs_the_store() {
 t_test_progress_goes_to_stderr() {
 	printf '\nProgress never contaminates a captured value\n'
 	_old="$VRB"; VRB=1
-	_v=$( { run true one two; printf 'THEVALUE\n'; } 2>/dev/null )
-	t_eq "run's echo stays out of the value" "$_v" "THEVALUE"
+	_v=$( { run_traced true one two; printf 'THEVALUE\n'; } 2>/dev/null )
+	t_eq "run_traced's echo stays out of the value" "$_v" "THEVALUE"
 	_v=$( { why "an explanation"; printf 'THEVALUE\n'; } 2>/dev/null )
 	t_eq "why stays out of the value" "$_v" "THEVALUE"
 	_v=$( { msg "a milestone"; printf 'THEVALUE\n'; } 2>/dev/null )
 	t_eq "msg stays out of the value" "$_v" "THEVALUE"
 	## and they are still visible on stderr
-	_e=$( { run true marker; } 2>&1 >/dev/null )
+	_e=$( { run_traced true marker; } 2>&1 >/dev/null )
 	t_match "but they are still shown" "$_e" "marker"
 	VRB="$_old"
 }
@@ -14169,7 +14169,7 @@ t_test_install_launcher() {
 	_il_li=$(sed -n '/^launcher_install() {$/,/^}$/p' "$T_MYTM")
 	# shellcheck disable=SC2016  # the literal source text is matched, not a variable
 	t_eq "the launcher is built root:<the cache's group> 0740, and an existing one put right" \
-		"$(printf '%s\n' "$_il_li" | count_match 'run chown "root:$_li_grp"') $(printf '%s\n' "$_il_li" | count_match 'run chmod 0740')" "2 2"
+		"$(printf '%s\n' "$_il_li" | count_match 'run_traced chown "root:$_li_grp"') $(printf '%s\n' "$_il_li" | count_match 'run_traced chmod 0740')" "2 2"
 	## Group execute is only safe because the launcher refuses a non-root uid.
 	## That guard is what the mode leans on, so it is asserted HERE too: a
 	## copy without it must fail this test, not just the launcher's own.
@@ -14291,13 +14291,13 @@ d4d4d4\tany via com.apple.curl  allow  any  tcp/2222  system
 	LITTLE_SNITCH="$_ls_d/lsn"
 	t_eq "no ccc set, nothing said about ccc" \
 		"$(snitch_plan 2>&1 | count_match 'ccc')" "0"
-	cat >"$_ls_d/ccc.conf" <<'_EOF'
-set_backup_parameters() {
-	case "$1" in
-		nightly) BACKUP_ENGINE="ccc" ;;
-	esac
-}
-_EOF
+	cat >"$_ls_d/ccc.conf" <<-'_EOF'
+	set_backup_parameters() {
+		case "$1" in
+			nightly) BACKUP_ENGINE="ccc" ;;
+		esac
+	}
+	_EOF
 	BACKUP_SETS="nightly"; CONFIG_SOURCED=" $_ls_d/ccc.conf"
 	t_match "a ccc set with no rule is named" \
 		"$(snitch_plan 2>&1)" "runs ccc, and ccc has no rule yet"
@@ -15025,15 +15025,15 @@ t_test_backup_sets() {
 	printf '\nBackup sets: the scope chain, the names, the jobs\n'
 	_bs_save_c="$CONFIG_SOURCED"; _bs_save_s="$BACKUP_SETS"
 	_bs_conf="$T_ROOT/sets.conf"
-	cat >"$_bs_conf" <<'_EOF'
-set_backup_parameters() {
-	case "$1" in
-		timemachine) PRE_BACKUP_CMD="engine-pre" ;;
-		nightly)     BACKUP_SCHEDULE="03:00"; POST_BACKUP_CMD="set-post" ;;
-		weekly)      BACKUP_SCHEDULE="" ;;
-	esac
-}
-_EOF
+	cat >"$_bs_conf" <<-'_EOF'
+	set_backup_parameters() {
+		case "$1" in
+			timemachine) PRE_BACKUP_CMD="engine-pre" ;;
+			nightly)     BACKUP_SCHEDULE="03:00"; POST_BACKUP_CMD="set-post" ;;
+			weekly)      BACKUP_SCHEDULE="" ;;
+		esac
+	}
+	_EOF
 	CONFIG_SOURCED=" $_bs_conf"; BACKUP_SETS="nightly weekly"
 
 	t_eq "timemachine is always a set" \
@@ -15061,13 +15061,13 @@ _EOF
 	t_match "and a set nobody configured is refused" \
 		"$( ( backup_set_resolve nosuchset ) 2>&1 )" "no backup set 'nosuchset'"
 	t_eq "no set named means the Time Machine one" "$(backup_set_resolve)" "timemachine"
-	cat >"$_bs_conf" <<'_EOF'
-set_backup_parameters() {
-	case "$1" in
-		nightly) BACKUP_ENGINE="rsync" ;;
-	esac
-}
-_EOF
+	cat >"$_bs_conf" <<-'_EOF'
+	set_backup_parameters() {
+		case "$1" in
+			nightly) BACKUP_ENGINE="rsync" ;;
+		esac
+	}
+	_EOF
 	t_match "an engine my-tm cannot run is refused" \
 		"$( ( backup_engine_of nightly ) 2>&1 )" "my-tm runs:"
 
@@ -15109,14 +15109,14 @@ _EOF
 	## refusal, which only ever sees what the config set at the top level.
 	## Refusing it would stop every machine that configures a second set.
 	_bs_conf="$T_ROOT/set-fn.conf"
-	cat >"$_bs_conf" <<'_BSFN'
-BACKUP_SETS="nightly"
-set_backup_parameters() {
-	case "$1" in
-		nightly) BACKUP_SCHEDULE="03:00" ;;
-	esac
-}
-_BSFN
+	cat >"$_bs_conf" <<-'_BSFN'
+	BACKUP_SETS="nightly"
+	set_backup_parameters() {
+		case "$1" in
+			nightly) BACKUP_SCHEDULE="03:00" ;;
+		esac
+	}
+	_BSFN
 	_bs_out=$(MY_TM_CONFIG="$_bs_conf" "$T_MYTM" --completion 2>&1; echo "rc=$?")
 	t_eq "a set function assigning BACKUP_SCHEDULE is NOT refused" \
 		"$(printf '%s\n' "$_bs_out" | count_match 'BACKUP_SCHEDULE is no longer read')" "0"

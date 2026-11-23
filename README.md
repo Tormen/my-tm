@@ -2015,7 +2015,7 @@ With that rule in place the remaining arguments all point one way:
 * completion callbacks fire on every TAB, where 4 ms beats 15 ms;
 * everything expensive is an external tool (`tmutil`, `mount_apfs`, `diskutil`,
   `find`, `locate.mklocatedb`) that both languages merely orchestrate;
-* it matches the sibling tools it will sit beside, and their `run()` / `dbg()` /
+* it matches the sibling tools it will sit beside, and their `dbg()` /
   `err()` helpers and `--run-tests` precedent.
 
 **Conclusion: POSIX `sh`, one self-contained file.** Structured data is read
@@ -2048,7 +2048,11 @@ suite:`, which read the source only), and hands their titles back by
 holds the run list to the test functions and `--list` to the run list. The
 links file is what opts the folder in; it waits as
 `my-tm.sh.tests.links.local` until the gate can take a tool folder that is
-its own git repository (py/my-rollout's TODO D).
+its own git repository (py/my-rollout's TODO D). A test picks a definition by
+naming it as a word, so a helper has a specific name (`run_traced`, not `run`,
+which most tests say), and no line inside a function starts at column 0 -- a
+heredoc there is `<<-` with its lines tab-indented -- since the gate reads a
+function as `name() {` down to the first line starting with `}`.
 
 `my-tm --run-tests` is part of the one file and must run **with no network, no
 real backup disk, and no root**, against a fixture tree built in a temp dir:
