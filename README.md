@@ -203,6 +203,11 @@ INSTALL & SET UP
                                  (3m17s -> 34s); MY_TM_TESTS_JOBS sets how many,
                                  1 runs them one after another.
                                  Add --with-snapshots to take a real local snapshot
+                                 --list prints the run list, '<title> TAB
+                                 <function>' per test, and runs nothing;
+                                 --titles <FILE> runs exactly the tests FILE
+                                 names, one title per line (my-rollout's commit
+                                 gate), and a title no test has fails the run
   --version | --help
 
   ADDED is what a backup WROTE, not what deleting it would free: macOS exposes
@@ -2032,6 +2037,18 @@ it sets small instead (`ATTACH_QUIET`, `ATTACH_POLL`, `ATTACH_LOCK_MAX_WAIT`):
 the floor is work, not sleep. `MY_TM_TESTS_JOBS=1` runs them serially, which is
 what a confusing failure wants. A place lost between blocks would be tests that
 silently never run, so the union of the blocks is asserted against `1..N`.
+
+**my-rollout's commit gate picks the tests a change needs**
+(`/LINKS/src/py/my-rollout/README.md`, "A tool adopts the commit gate").
+`--run-tests --list` gives it the run list, `<title> TAB <function>` per test;
+it picks the tests whose function names a definition the change touched, those
+`my-tm.sh.tests.links` ties to one, and the static ones (titles starting `the
+suite:`, which read the source only), and hands their titles back by
+`--run-tests --titles <FILE>`. The guard (`the suite: run_list_is_complete`)
+holds the run list to the test functions and `--list` to the run list. The
+links file is what opts the folder in; it waits as
+`my-tm.sh.tests.links.local` until the gate can take a tool folder that is
+its own git repository (py/my-rollout's TODO D).
 
 `my-tm --run-tests` is part of the one file and must run **with no network, no
 real backup disk, and no root**, against a fixture tree built in a temp dir:

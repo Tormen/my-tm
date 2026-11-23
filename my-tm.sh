@@ -34,8 +34,8 @@ US="${0##*/}"
 ## so the ROOT-OWNED COPY the daemons run -- which has no git beside it -- can
 ## still say which release it is and whether it is one.
 MY_TM_VERSION="0.9.1"
-SCRIPT_COMMIT="39ee82a"
-SCRIPT_RELEASE="v0.9.1-140-g39ee82a"
+SCRIPT_COMMIT="00821bd"
+SCRIPT_RELEASE="v0.9.1-142-g00821bd"
 
 ## The first 12 hex of this file's own SHA-256: the value that identifies the
 ## bytes. my-tm is COPIED to its installed path, so this is what tells the
@@ -8783,6 +8783,11 @@ INSTALL & SET UP
                                  (3m17s -> 34s); MY_TM_TESTS_JOBS sets how many,
                                  1 runs them one after another.
                                  Add --with-snapshots to take a real local snapshot
+                                 --list prints the run list, '<title> TAB
+                                 <function>' per test, and runs nothing;
+                                 --titles <FILE> runs exactly the tests FILE
+                                 names, one title per line (my-rollout's commit
+                                 gate), and a title no test has fails the run
   --version | --help
 
   ADDED is what a backup WROTE, not what deleting it would free: macOS exposes
@@ -15378,8 +15383,8 @@ t_test_parallel_blocks_cover_every_test() {
 	## the probe: a subshell would do that by itself, but then shellcheck reads
 	## every later use of these in _rt as a lost change
 	_pb_sv_k=$_rt_k; _pb_sv_cur=$_rt_cur; _pb_sv_bad=$_rt_bad; _pb_sv_f=$_rt_filter
-	_pb_sv_pick=${_rt_pick:-}; _pb_sv_tap=${_rt_tap:-}
-	_rt_k=0; _rt_cur=""; _rt_bad=$T_FAIL; _rt_filter=""
+	_pb_sv_pick=${_rt_pick:-}; _pb_sv_tap=${_rt_tap:-}; _pb_sv_tf=$_rt_titles_file
+	_rt_k=0; _rt_cur=""; _rt_bad=$T_FAIL; _rt_filter=""; _rt_titles_file=""
 	_rt_pick="2 4"; _rt_tap="$T_ROOT/pick.tap"
 	{
 		for _pb_t in alpha beta gamma delta epsilon; do
@@ -15392,6 +15397,7 @@ t_test_parallel_blocks_cover_every_test() {
 	## twice: once in the block's own output, once by nobody
 	_rt_pick=$_pb_sv_pick; _rt_tap=$_pb_sv_tap
 	_rt_k=$_pb_sv_k; _rt_cur=$_pb_sv_cur; _rt_bad=$_pb_sv_bad; _rt_filter=$_pb_sv_f
+	_rt_titles_file=$_pb_sv_tf
 	t_eq "a block runs its own places, numbered by place" \
 		"$(tr '\n' ' ' <"$T_ROOT/pick.out")" "ran beta as 2 ran delta as 4 "
 	t_eq "and its TAP lines carry those same numbers" \
@@ -15400,26 +15406,83 @@ t_test_parallel_blocks_cover_every_test() {
 }
 
 ## the guard: a test function left out of the run list would never run, and
-## the suite would still end green -- so the list is held to the file
+## the suite would still end green -- so the list is held to the file. And
+## `--run-tests --list` is what my-rollout's commit gate chooses tests from: a
+## line naming another function than the one the list calls would make the
+## gate skip the tests a change needs, so --list is held to the source too.
 t_test_run_list_is_complete() {
 	printf '\nThe run list names every test\n'
-	_rl_def=$(sed -nE 's/^t_test_([a-z0-9_]+)\(\).*/\1/p' "$T_MYTM")
-	_rl_run=$(sed -nE 's/^[[:space:]]+_rt ([a-z0-9_]+)[[:space:]]+&& t_test_([a-z0-9_]+)$/\1 \2/p' "$T_MYTM" |
-		awk '$1 == $2 { print $1; next } { print "misnamed:" $1 "/" $2 }')
-	_rl_bad=$( { printf '%s\n' "$_rl_def" | sed 's/^/D /'; printf '%s\n' "$_rl_run" | sed 's/^/R /'; } |
-		awk '$1 == "D" { d[$2] = 1; next } { r[$2]++ }
-		     END { for (n in d) if (r[n] != 1) print n " (in the list " r[n] + 0 "x)"
-		           for (n in r) if (!(n in d)) print n " (no such test)" }' | LC_ALL=C sort | tr '\n' ' ' | sed 's/ $//')
+	_rl_def=$(sed -nE 's/^(t_test_[a-z0-9_]+)\(\).*/\1/p' "$T_MYTM")
+	## the run list as the source writes it: <title> TAB <the function it calls>
+	_rl_src=$(awk '
+		/^_rt_list\(\) \{$/ { inlist = 1; next }
+		inlist && /^\}$/   { exit }
+		!inlist || /^[[:space:]]*_rt '\'''\''[[:space:]]*$/ || /^[[:space:]]*$/ { next }
+		match($0, /^[[:space:]]+_rt ('\''the suite: [a-z0-9_]+'\''|[a-z0-9_]+)[[:space:]]+&& t_test_[a-z0-9_]+$/) {
+			t = $0; sub(/^[[:space:]]+_rt /, "", t); sub(/[[:space:]]+&&.*/, "", t); gsub(/'\''/, "", t)
+			f = $0; sub(/.*&& /, "", f)
+			printf "%s\t%s\n", t, f; next }
+		{ printf "unparsed\t%s\n", $0 }' "$T_MYTM")
+	_rl_list=$(_rt_list_all)
+	_rl_bad=$( { printf '%s\n' "$_rl_def" | sed 's/^/D	/'
+	             printf '%s\n' "$_rl_src" | sed 's/^/S	/'
+	             printf '%s\n' "$_rl_list" | sed 's/^/L	/'; } |
+		awk -F '\t' '
+		$1 == "D" { d[$2] = 1; next }
+		$1 == "S" { ns++; s[ns] = $2 "\t" $3; sf[$3]++; st[$2]++
+		            n = $2; sub(/^the suite: /, "", n)
+		            if ($2 == "unparsed" || "t_test_" n != $3) print "misnamed:" $2 "/" $3
+		            next }
+		$1 == "L" { nl++; l[nl] = $2 "\t" $3; next }
+		END {
+			for (f in d) if (sf[f] != 1) print f " (in the list " sf[f] + 0 "x)"
+			for (f in sf) if (!(f in d)) print f " (no such test)"
+			for (t in st) if (st[t] > 1) print "title " t " (" st[t] "x)"
+			if (ns != nl) print "--list gives " nl + 0 " line(s), the list has " ns + 0
+			else for (i = 1; i <= ns; i++) if (s[i] != l[i]) print "--list line " i ": " l[i]
+		}' | LC_ALL=C sort | tr '\n\t' '  ' | sed 's/ $//')
 	[ -n "$_rl_def" ] || _rl_bad="no t_test_ function found in $T_MYTM"
-	t_eq "the run list names each of the $(printf '%s\n' "$_rl_def" | t_count_re .) test functions once" \
+	t_eq "the run list names each of the $(printf '%s\n' "$_rl_def" | t_count_re .) test functions once, and --list says so" \
 		"$_rl_bad" ""
 }
 
-## The run list: the tests in the order they run, one t_test_<name> function
-## each. It is walked twice -- once to count the plan, once to run -- so the
-## plan always comes from this same list. The FILTER picks the names that
-## contain it. Some tests read state an earlier one left behind, so the order
-## is part of the suite.
+## my-rollout's commit gate runs exactly the tests a change needs, by title.
+## ADVERSARIAL: 'help' is a part of other titles too (completion_follows_help),
+## so a --titles that selected the way FILTER does would run more than the one
+## asked for -- and a title no test has must fail the run, never pass it by.
+## The nested run must not inherit this block's MY_TM_RT_* (it would act as a
+## block of this run and write into its TAP stream).
+t_test_titles_run_exactly_those() {
+	printf '\n--run-tests --titles runs exactly the tests it names\n'
+	printf 'help\n\nhelp\n' >"$T_ROOT/titles.one"
+	_tr_o=$(env -u MY_TM_RT_PICK -u MY_TM_RT_TAP MY_TM_TESTS_JOBS=1 \
+		dash "$T_MYTM" --run-tests --titles "$T_ROOT/titles.one" 2>&1); _tr_rc=$?
+	t_eq "one title, named twice: the plan is one test, and that one ran and passed" \
+		"$(printf '%s\n' "$_tr_o" | grep -E '^(1\.\.|ok |not ok )' | tr '\n' ' ')[$_tr_rc]" "1..1 ok 1 - help [0]"
+	printf 'help\nno_such_test\n' >"$T_ROOT/titles.unknown"
+	_tr_o=$(env -u MY_TM_RT_PICK -u MY_TM_RT_TAP MY_TM_TESTS_JOBS=1 \
+		dash "$T_MYTM" --run-tests --titles "$T_ROOT/titles.unknown" 2>&1); _tr_rc=$?
+	t_eq "a title no test has fails the run, and the known one still runs" \
+		"$(printf '%s\n' "$_tr_o" | grep -E '^(1\.\.|ok |not ok )' | tr '\n' ' ')[$_tr_rc]" "1..1 ok 1 - help [1]"
+	t_match "the summary, the last line, names it" "$(printf '%s\n' "$_tr_o" | tail -n 1)" \
+		"1 title(s) name no test of the run list: 'no_such_test'$"
+	## an empty FILE selects nothing -- asked of the selection itself, in this
+	## process: a nested run would be the WHOLE suite if it selected everything
+	_tr_sv_f=$_rt_titles_file; _tr_sv_t=$_rt_titles
+	_rt_titles_file="$T_ROOT/titles.none"; _rt_titles=""
+	_tr_sel=$(_rt_want help && echo selected || echo none)
+	_rt_titles_file=$_tr_sv_f; _rt_titles=$_tr_sv_t
+	t_eq "an empty FILE selects no test" "$_tr_sel" "none"
+	rm -f "$T_ROOT/titles.one" "$T_ROOT/titles.unknown"
+}
+
+## The run list: the tests in the order they run, one title and its function
+## each -- t_test_<title>, or for a static test (source only, seconds) the
+## title 'the suite: <name>' and t_test_<name>. It is walked to count the
+## plan, then to run, so the plan always comes from this same list; --list
+## walks it to print '<title> TAB <function>'. The FILTER picks the titles
+## that contain it, --titles <FILE> the titles FILE lists. Some tests read
+## state an earlier one left behind, so the order is part of the suite.
 _rt_list() {
 	_rt ids                                  && t_test_ids
 	_rt handles                              && t_test_handles
@@ -15560,13 +15623,19 @@ _rt_list() {
 	_rt commands_keep_other_tables           && t_test_commands_keep_other_tables
 	_rt fs_snapshots                         && t_test_fs_snapshots
 	_rt parallel_blocks_cover_every_test     && t_test_parallel_blocks_cover_every_test
-	_rt run_list_is_complete                 && t_test_run_list_is_complete
+	_rt titles_run_exactly_those             && t_test_titles_run_exactly_those
+	_rt 'the suite: run_list_is_complete'    && t_test_run_list_is_complete
 	_rt ''
 }
 
 ## Open test $1 (and close the one before it with its 'ok K - name' line).
-## Returns 0 only when $1 is to run now; in the counting pass it only counts.
+## Returns 0 only when $1 is to run now; in the counting pass it only counts,
+## and in the listing pass (--list) it prints '<title> TAB <its function>'.
 _rt() {
+	if [ "$_rt_listing" = 1 ]; then
+		[ -n "$1" ] && _rt_want "$1" && printf '%s\t%s\n' "$1" "$(_rt_function "$1")"
+		return 1
+	fi
 	if [ "$_rt_counting" = 1 ]; then
 		[ -n "$1" ] && _rt_want "$1" && _rt_n=$(( _rt_n + 1 ))
 		return 1
@@ -15594,7 +15663,33 @@ _rt() {
 	_rt_cur=$1; _rt_bad=$T_FAIL
 	return 0
 }
-_rt_want() { case "$1" in *"$_rt_filter"*) return 0 ;; esac; return 1; }
+## Whether test title $1 is selected: by --titles, the titles its FILE lists,
+## as whole lines; else the titles that contain the FILTER.
+_rt_want() {
+	if [ -n "$_rt_titles_file" ]; then
+		case "$_RT_NL$_rt_titles$_RT_NL" in *"$_RT_NL$1$_RT_NL"*) return 0 ;; esac
+		return 1
+	fi
+	case "$1" in *"$_rt_filter"*) return 0 ;; esac; return 1
+}
+_RT_NL='
+'
+
+## The function test title $1 runs: t_test_<title>, a static test's title
+## carrying 'the suite: ' in front (my-rollout's commit gate runs those in every
+## gated run). The run-list guard holds every line of _rt_list to this rule.
+_rt_function() { printf 't_test_%s' "${1#the suite: }"; }
+
+## The whole run list as --list prints it, whatever FILTER or --titles this
+## run was given -- and that selection back as it was. Saved and put back,
+## not left to a subshell: then shellcheck reads every later use of these in
+## _rt as a lost change.
+_rt_list_all() {
+	_ra_l=$_rt_listing; _ra_f=$_rt_filter; _ra_t=$_rt_titles_file
+	_rt_listing=1; _rt_filter=""; _rt_titles_file=""
+	_rt_list
+	_rt_listing=$_ra_l; _rt_filter=$_ra_f; _rt_titles_file=$_ra_t
+}
 
 ## The places block <b> of <jobs> runs, of <n> tests: every place in exactly
 ## one block, dealt out by stride so the slow tests do not pile up in one of
@@ -15604,17 +15699,40 @@ _rt_slice() {                   # <block> <jobs> <n>  -> "1,17,33,..."
 		s = ""; for (i = b + 1; i <= n; i += j) s = s (s == "" ? "" : ",") i; print s }'
 }
 
+## A wrong --run-tests call: the one error, its option named in front.
+_rt_usage_err() { err "--run-tests: $1"; }
+
 run_tests() {
 	T_WITH_SNAPSHOTS=0
-	_rt_filter=""
-	for _rt_a in "$@"; do
-		case "$_rt_a" in
+	_rt_filter=""; _rt_listing=0; _rt_titles_file=""; _rt_titles=""
+	while [ $# -gt 0 ]; do
+		case "$1" in
 			--with-snapshots) T_WITH_SNAPSHOTS=1 ;;
-			-*) err "--run-tests: unknown option '$_rt_a'  (see --help)" ;;
-			*)  [ -z "$_rt_filter" ] || err "--run-tests takes one <FILTER>, got '$_rt_filter' and '$_rt_a'"
-			    _rt_filter=$_rt_a ;;
+			--list) _rt_listing=1 ;;
+			--titles)
+				[ $# -ge 2 ] || _rt_usage_err "--titles needs a <FILE> of test titles, one per line"
+				_rt_titles_file=$2; shift ;;
+			-*) _rt_usage_err "unknown option '$1'  (see --help)" ;;
+			*)  [ -z "$_rt_filter" ] || _rt_usage_err "one <FILTER> only, got '$_rt_filter' and '$1'"
+			    _rt_filter=$1 ;;
 		esac
+		shift
 	done
+	[ -n "$_rt_filter" ] && [ -n "$_rt_titles_file" ] &&
+		_rt_usage_err "a <FILTER> or --titles <FILE>, not both"
+	if [ -n "$_rt_titles_file" ]; then
+		[ -f "$_rt_titles_file" ] && [ -r "$_rt_titles_file" ] ||
+			_rt_usage_err "--titles: '$_rt_titles_file' cannot be read -- name a file of test titles, one per line"
+		## absolute, for the blocks; blank lines name nothing
+		_rt_titles_file=$(abs_path "$_rt_titles_file")
+		_rt_titles=$(grep -v '^[[:space:]]*$' "$_rt_titles_file" || true)
+	fi
+	## the run list, nothing run: my-rollout's commit gate reads it to choose the
+	## tests a change needs, and hands their titles back by --titles
+	if [ "$_rt_listing" = 1 ]; then
+		_rt_list
+		return 0
+	fi
 	if is_root; then
 		printf ' !!! do not run the tests as root -- they must pass unprivileged.\n' >&2
 		exit 1
@@ -15639,6 +15757,21 @@ run_tests() {
 		return 0
 	fi
 
+	## a title --titles names that no test has: said on the summary line (the
+	## last, the one a watcher reads) and the run fails -- a gate must never
+	## pass on a test that did not run
+	_rt_unknown=""; _rt_unk_note=""
+	if [ -n "$_rt_titles" ]; then
+		_rt_all=$(_rt_list_all | cut -f 1)
+		_rt_unknown=$(printf '%s\n' "$_rt_titles" | while IFS= read -r _rt_t; do
+			case "$_RT_NL$_rt_all$_RT_NL" in
+				*"$_RT_NL$_rt_t$_RT_NL"*) : ;;
+				*) printf '%s\n' "$_rt_t" ;;
+			esac
+		done)
+		[ -n "$_rt_unknown" ] && _rt_unk_note=" -- and $(printf '%s\n' "$_rt_unknown" | count_lines) title(s) name no test of the run list: $(printf '%s\n' "$_rt_unknown" | sed "s/.*/'&'/" | tr '\n' ' ' | sed 's/ $//')"
+	fi
+
 	printf '1..%s\n' "$_rt_n"
 	printf '%s %s -- self test\n' "$US" "$MY_TM_VERSION"
 
@@ -15656,8 +15789,8 @@ run_tests() {
 		_rt_k=0
 		_rt_list
 		t_teardown
-		printf '\n%s passed, %s failed, %s skipped\n' "$T_PASS" "$T_FAIL" "$T_SKIP"
-		[ "$T_FAIL" -eq 0 ] || return 1
+		printf '\n%s passed, %s failed, %s skipped%s\n' "$T_PASS" "$T_FAIL" "$T_SKIP" "$_rt_unk_note"
+		[ "$T_FAIL" -eq 0 ] && [ -z "$_rt_unknown" ] || return 1
 		return 0
 	fi
 	_rt_self=$(abs_path "$0")
@@ -15672,7 +15805,8 @@ run_tests() {
 		if [ -n "$_rt_sel" ]; then
 			( MY_TM_RT_PICK="$_rt_sel" MY_TM_RT_TAP="$_rt_tapf" \
 			  "$_rt_self" --run-tests ${_rt_ws:+"$_rt_ws"} \
-			  ${_rt_filter:+"$_rt_filter"} >"$_rt_d/b$_rt_b.out" 2>&1
+			  ${_rt_filter:+"$_rt_filter"} \
+			  ${_rt_titles_file:+--titles} ${_rt_titles_file:+"$_rt_titles_file"} >"$_rt_d/b$_rt_b.out" 2>&1
 			  printf '%s\n' "$?" >"$_rt_d/b$_rt_b.rc" ) &
 		else
 			printf '0\n' >"$_rt_d/b$_rt_b.rc"; : >"$_rt_d/b$_rt_b.out"
@@ -15744,8 +15878,9 @@ run_tests() {
 		_rt_nfs=" -- and $(printf '%s' "$_rt_nf" | count_lines) word(s) the shell could not find"
 		_rt_rc=1
 	fi
-	printf '\n%s passed, %s failed, %s skipped  (in %s blocks)%s\n' \
-		"$_rt_p" "$_rt_f" "$_rt_s" "$_rt_jobs" "$_rt_nfs"
+	[ -n "$_rt_unknown" ] && _rt_rc=1
+	printf '\n%s passed, %s failed, %s skipped  (in %s blocks)%s%s\n' \
+		"$_rt_p" "$_rt_f" "$_rt_s" "$_rt_jobs" "$_rt_nfs" "$_rt_unk_note"
 	[ "$_rt_f" -eq 0 ] && [ "$_rt_rc" -eq 0 ] || return 1
 	return 0
 }
