@@ -1,0 +1,27 @@
+# my-tm.sh's commit-gate links: <definition> TAB <test title> TAB <the case>.
+# A link ties a test to a definition its function does not name (my-rollout's
+# README, "The commit gate"). `launcher` is every line outside a definition --
+# the config defaults, the run directory's setup -- and `main` the dispatch;
+# the tests below run my-tm as a program, so they reach both without naming them.
+launcher	config	run as a program: the config defaults and the dispatch
+launcher	atomic	run as a program: --create-config under a umask
+launcher	location_parameters	run as a program: status with an old config
+launcher	run_cache	run as a program: --version with its own TMPDIR
+launcher	interrupted_run_leaves_nothing	run as a program: the run directory and its trap
+launcher	bare_command_words	run as a program: every bare command word
+launcher	user_on_a_root_cache	run as a program: a user beside root's cache
+launcher	runs_without_home	run as a program: no HOME
+launcher	version_output	run as a program: --version
+launcher	titles_run_exactly_those	run as a program: the self test by titles
+main	config	run as a program: the dispatch
+main	location_parameters	run as a program: the dispatch
+main	bare_command_words	run as a program: the dispatch of every bare word
+main	user_on_a_root_cache	run as a program: the dispatch
+main	version_output	run as a program: the dispatch of --version
+main	titles_run_exactly_those	run as a program: the dispatch of the self test
+run_tests	titles_run_exactly_those	the self test by titles, through the program
+_rt_usage_err	titles_run_exactly_those	the self test by titles, through the program
+_rt_want	titles_run_exactly_those	a title selects only itself, whole line
+_rt_function	the suite: run_list_is_complete	the function --list gives per title, held to the source
+_rt_list_all	the suite: run_list_is_complete	the whole run list, for --list held to the source
+_rt_list_all	titles_run_exactly_those	the titles a run may name

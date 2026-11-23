@@ -2046,9 +2046,9 @@ it picks the tests whose function names a definition the change touched, those
 suite:`, which read the source only), and hands their titles back by
 `--run-tests --titles <FILE>`. The guard (`the suite: run_list_is_complete`)
 holds the run list to the test functions and `--list` to the run list. The
-links file is what opts the folder in; it waits as
-`my-tm.sh.tests.links.local` until the gate can take a tool folder that is
-its own git repository (py/my-rollout's TODO D). A test picks a definition by
+links file opts the folder in: src's pre-commit hook refuses a commit of
+my-tm's code without a passing `my-rollout gate sh/my-tm` for its bytes, run
+from /LINKS/src before the commit. A test picks a definition by
 naming it as a word, so a helper has a specific name (`run_traced`, not `run`,
 which most tests say), and no line inside a function starts at column 0 -- a
 heredoc there is `<<-` with its lines tab-indented -- since the gate reads a
